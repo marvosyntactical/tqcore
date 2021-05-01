@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 import random
 
-from tinyquant.quantizable_layer import *
+from typing import Optional
 
 def _make_divisible(v, divisor, min_value=None):
     """
@@ -28,7 +28,7 @@ def _make_divisible(v, divisor, min_value=None):
 
 class InvertedResidual(nn.Module):
     def __init__(
-            self, inp, oup, stride, expand_ratio, norm_layer, convbn=ConvBNfoldable, relutype=6):
+            self, inp, oup, stride, expand_ratio, norm_layer, convbn=None, residual=None, relutype=6):
 
         super(InvertedResidual, self).__init__()
 
@@ -77,7 +77,7 @@ class InvertedResidual(nn.Module):
         self.conv = nn.Sequential(*layers)
 
         if self.use_res_connect:
-            self.skip_add = QuantizableResConnection()
+            self.skip_add = residual()
         self.identity = nn.Identity()
 
     def forward(self, x):
@@ -105,7 +105,8 @@ class MobileNetV2(nn.Module):
         round_nearest=8,
         last_channel=1280,
         dataset_channel=1,
-        convbn=ConvBNfoldable,
+        convbn=None,
+        residual=None,
         norm_layer=nn.BatchNorm2d,
         relutype:int=6,
         ):
@@ -119,6 +120,7 @@ class MobileNetV2(nn.Module):
             round_nearest (int): Round the number of channels in each layer to be a multiple of this number
             Set to 1 to turn off rounding
         """
+        assert convbn is not None
         super(MobileNetV2, self).__init__()
         block = InvertedResidual
 
@@ -190,6 +192,7 @@ class MobileNetV2(nn.Module):
                         expand_ratio=t,
                         norm_layer=norm_layer,
                         convbn=convbn,
+                        residual=residual,
                         relutype=relutype
                     )
                 )

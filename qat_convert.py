@@ -1,5 +1,9 @@
 import torch
 
+TRANSFORMER = True
+
+if TRANSFORMER:
+    from .transformer_layers import *
 from .quantizable_layer import \
     ConvBNfoldable, \
     ConvBNnofold, \
@@ -9,7 +13,6 @@ from .quantized_layer import \
     _factory_convert_relu6_layer_forward_impl,\
     _factory_convert_relu_layer_forward_impl,\
     _factory_convert_layer_forward_impl,\
-    _factory_convert_model_forward_pre_hook,\
     _factory_convert_quantized_identity,\
     _factory_convert_quantized_add,\
     _convert_bnnofold_layer_forward,\
@@ -19,7 +22,8 @@ from .quantized_layer import \
     _factory_convert_reset,\
     _factory_convert_rescale,\
     _factory_non_quantized_pre_hook,\
-    _factory_non_quantized_post_hook
+    _factory_non_quantized_post_hook,\
+    QuantizedModel
 
 from .quantization_ema_stats import *
 from .quantization_functions import *
@@ -46,8 +50,9 @@ LAYERS = [
     nn.Conv2d,
     nn.Linear,
     QuantizableResConnection,
-    nn.modules.batchnorm._BatchNorm
+    nn.modules.batchnorm._BatchNorm,
 ] #, nn.MaxPool2d]
+
 WEIGHT_LAYERS = [nn.Conv2d, nn.Linear]
 
 def find_first_and_last_layer(module_types_dict) -> Tuple[int]:
@@ -75,34 +80,25 @@ def find_first_and_last_layer(module_types_dict) -> Tuple[int]:
     assert found_last, "did not find any implemented LAYER to pick as last layer ..."
     return (first_idx, last_idx)
 
-
-
 def convert_module(
             module: nn.Module,
             leave_first_and_last_layer=False,
             first_and_last_layer: Optional[Tuple]=None,
             inplace: bool = True,
-            qparams = None,
             _handles: Dict = None,
             _module_types: Dict = None,
             _stats = None, # TODO replace with is_root bool and just access model.stats then
         ) -> nn.Module:
     """ Convert module after QAT training has been done. """
 
+    assert False, "reminder: implement quantization of weight matrices (pos enc, linear) HERE (not in quantized_layer"
 
     module_number = module._module_number
-    # printdbg((module_number,type(module)))
 
     is_root_module = _stats is None
 
     if is_root_module:
-        assert qparams is None
-        module.__qparams__ = {"scale": float("-inf"), "zero_point": float("-inf")}
-        print("Converting model:")
-        print(module)
-    else:
-        assert type(qparams) == dict, type(qparams)
-        module.__qparams__ = qparams
+        module = QuantizedModel(module)
 
     module.register_forward_pre_hook(_debug_forward_pre_hook)
 
@@ -116,7 +112,6 @@ def convert_module(
 
     if leave_first_and_last_layer and (first_and_last_layer is None):
         first_and_last_layer = find_first_and_last_layer(_module_types)
-    # "need to run prep_module_qat before this which should set model.stats to dict of seen activ ranges"
     assert isinstance(_handles, dict) and _handles, f"'_handles' argument needs to be dict of pre/post fwd hook handles of model modules and not {type(_handles)} {_handles}"
 
     #1. convert forward passes of all internal modules to handle only quantized tensors
@@ -133,7 +128,6 @@ def convert_module(
             _module_types=_module_types,
             _stats=_stats,
             inplace=True,
-            qparams=module.__qparams__
         )
 
     # 2. convert known layer types and remove forward hooks on a basis of spaghetti
@@ -170,16 +164,16 @@ def convert_module(
 
     if is_layer:
 
-        # 0.: Find next activation
+        # 1.: Find next activation
 
         next_activation_number = search_for_next_activ(
             _module_types,
             module_number,
         )
 
-        # FIXME change to print(
         print((next_activation_number-module_number, "found next activ of type", str(_module_types[next_activation_number]).split(".")[-1], "for module of type ", str(type(module)).split(".")[-1]))
 
+        # 2.: Retrieve stats
         try:
             min_val = _stats[next_activation_number]["ema_min"]
             max_val = _stats[next_activation_number]["ema_max"]
@@ -261,46 +255,6 @@ def convert_module(
         # _convert_convbnfoldable_layer_forward(module)
         module.fold()
 
-    # 3. convert forward pass of module to dequantize at end
-    if is_root_module:
-
-        # search for tinyquant.quantization_functions.Quantization objects for the input inside of the prepared model modules
-
-        def find_first_Qinp(m):
-            quant_input = None
-            num_bits_input = None
-            for _mod in m._modules.values():
-                if hasattr(_mod, "_Qinp"):
-                    quant_input = _mod._Qinp
-                    assert hasattr(_mod, "_num_bits_inp"), f"accessed child module of qat prepped module during conversion while looking for first quantization layer; but found child._Qinp and no child_num_bits_inp: {_mod}"
-                    num_bits_input = _mod._num_bits_inp
-                else:
-                    quant_input, num_bits_input = find_first_Qinp(_mod)
-                if quant_input is not None:
-                    break
-            return quant_input, num_bits_input
-        quant_input, num_bits_input = find_first_Qinp(module)
-
-        assert quant_input is not None, f"during module conversion, no internal nn.Module with a _Qinp was found. has prep_module been called?"
-        assert num_bits_input is not None
-
-        # retrieve min and max vales for input of module itself
-        first_activation_number = search_for_next_activ(_module_types, 0)
-        min_val = _stats[first_activation_number]["ema_min"]
-        max_val = _stats[first_activation_number]["ema_max"]
-
-        model_quant_pre_hook =_factory_convert_model_forward_pre_hook(
-            quant_input,
-            min_val,
-            max_val,
-            num_bits_input
-        )
-
-        module.register_forward_pre_hook(model_quant_pre_hook)
-
-        del module.stats
-        del module.handles
-        del module.module_types
 
     return module
 

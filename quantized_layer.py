@@ -3,7 +3,8 @@ from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .quantization_functions import QTensor, Quantization
+from .qtensor import QTensor
+from .quantization_functions import Quantization
 from .quantizable_layer import *
 from .batchnorm import *
 
@@ -20,7 +21,7 @@ __DEBUG__ = False
 # helper fns
 printdbg = lambda *expr: printdbg(*expr) if __DEBUG__ else None
 tnsr_stats = lambda t, qinp: (round(t.min().item(), 3), round(t.max().item(), 3),qinp.calc_zero_point(t.min().item(), t.max().item(), 8))
-qparams_stats = lambda qparams_dict: tuple(map(lambda fl: round(fl, 3),qparams_dict.values()))
+qparams_stats = lambda qparams_dict: tuple(map(lambda fl: round(fl, 3), qparams_dict.values()))
 is_integer = lambda t: (t.round()==t).all()
 
 # contains factory functions for quantized forward passes used in .qat_convert.py:
@@ -29,39 +30,12 @@ is_integer = lambda t: (t.round()==t).all()
 
 # ============================= DEBUG ==================================
 
-def _debug_forward_pre_hook(mod, inp, function="forward"):
-    printdbg("++++")
-    printdbg(mod._module_number, type(mod))
-    printdbg("+++++++++++++++++++++++++++++++")
-    printdbg(f"DEBUG info for {str(type(mod)).split('.')[-1][:-2]} (mod #{mod._module_number}) before its {function} pass:")
-    printdbg("quantization params of input:")
-    printdbg(qparams_stats(mod.__qparams__))
-    if hasattr(mod, "_Qinp"):
-        printdbg(f"input min, max vals and ad hoc qparams:")
-        printdbg(tnsr_stats(inp[0], mod._Qinp))
-
 def _debug_forward_post_hook(mod, inp, out):
     t = out[0]
     assert (t==t.round()).all(), (type(mod), t)
     assert len(torch.unique(out)) > 1, (torch.unique(out), type(mod))
 
-
-def _factory_convert_model_forward_pre_hook(quant_input, min_val, max_val, num_bits):
-    def _converted_model_forward_pre_hook(mod, inp):
-        if isinstance(inp, QTensor):
-            qinp_torch = inp.tensor
-            mod.__qparams__["scale"]=inp.scale
-            mod.__qparams__["zero_point"]=inp.zero_point
-        else:
-            if isinstance(inp, torch.Tensor):
-                _inp = inp
-            elif isinstance(inp, tuple):
-                _inp = inp[0]
-
-            # FIXME HACK ! this updates qparams dict, and doesnt return the quantized tensor
-            _inp = quant_input.quantize_to_torch_tensor(_inp, mod.__qparams__, min_val, max_val, num_bits=num_bits) # TODO how to determine scale? do i need to get scale for inputs?
-        return _inp
-    return _converted_model_forward_pre_hook
+# ============================= PYTORCH ACTIVS ==================================
 
 def _factory_convert_relu_layer_forward_impl(module, min_val, max_val, num_bits_inp):
     def _converted_relu_layer_forward_impl(x, *args, **kwargs):
@@ -112,14 +86,13 @@ def _factory_convert_relu6_layer_forward_impl(module, min_val, max_val, num_bits
         return out
     return _converted_relu6_layer_forward_impl
 
+# ============================= PYTORCH LAYERS ==================================
+
 def _factory_convert_layer_forward_impl(module, min_val, max_val):
 
     # op-for-op implementation of quantized layers given range params a, b
 
     # TODO quantize weights and everything here!!!! not in the forward functions below (on the fly...)
-
-
-    # FIXME TODO move these checks and dicts to quantized layer factory function
 
     q_layer_fwd = _factory_quantized_layer(module)
 
@@ -166,8 +139,6 @@ def _factory_convert_layer_forward_impl(module, min_val, max_val):
         return x_q # torch.Tensor
     return _converted_layer_forward_impl
 
-# TODO add all the above factory functions to the dict in this function:
-
 def _factory_quantized_layer(module:nn.Module):
 
     def quantized_res_connection(
@@ -198,10 +169,6 @@ def _factory_quantized_layer(module:nn.Module):
 
         # FIXME testing different rescaling here:
         # instead of halfing both newer and older scale, adjust each relatively
-
-        # fraction_of_next_scale = (layer.old_scale /(layer.old_scale+qparams["scale"]))
-
-        # input(f"{x}\n(older tensor before rescale)")
 
         fraction_of_next_scale = .5
 
@@ -461,7 +428,6 @@ def _factory_quantized_layer(module:nn.Module):
             num_bits=num_bits_weight
         )
 
-
         if not is_integer(x):
             # TODO put this functionality in something like a QuantStub class
             printdbg(f"input to quantized {type(layer)} # {layer._module_number} not integer, make sure this is intended (happens after avg pool / mean operations)")
@@ -679,197 +645,5 @@ def _factory_quantized_layer(module:nn.Module):
     return fun
 
 
-def _factory_convert_cache(mod):
-    def _cache():
-        # save qparams for newer branch
-        mod.new_scale = mod.__qparams__["scale"]
-        mod.new_zero = mod.__qparams__["zero_point"]
-        return
-    return _cache
 
-def _factory_convert_reset(mod):
-    def _reset():
-        # cache qparams of old tensor
-        mod.old_scale = mod.__qparams__["scale"]
-        mod.old_zero = mod.__qparams__["zero_point"]
-
-        # reset to saved qparams; call cache before this
-        mod.__qparams__["scale"] = mod.new_scale
-        mod.__qparams__["zero_point"] = mod.new_zero
-        return
-    return _reset
-
-def _factory_convert_rescale(mod, min_val, max_val):
-    def _rescale(x):
-        # rescale old tensor, call this iff this side of the residual is just + x
-
-        scale_next, zero_point_next = mod._Qinp.calc_zero_point(
-                min_val=min_val,
-                max_val=max_val,
-                num_bits=mod._num_bits_inp
-        )
-
-        x_float = mod.new_scale * ( x - mod.new_zero)
-        x_updated = x / scale_next + zero_point_next
-
-        printdbg("quantized residual rescale rounding error:")
-        printdbg(f"avg rounding err: {(x_updated-x_updated.round()).abs().mean()}")
-        x_updated = mod._Qinp.tensor_clamp(x_updated, num_bits=mod._num_bits_inp)
-        return x_updated
-    return _rescale
-
-def _factory_convert_quantized_add(mod, min_val, max_val):
-    def quantized_add(old:torch.Tensor, new:torch.Tensor):
-        """
-        :param x: newer tensor that gets added to older other tensor
-        :param layer: the current torch layer
-        :param quant_input: Quantization function for the activations
-        :param min_val: EMA min_val for next activation
-        :param max_val: EMA max_val for next activation
-        :param num_bits_input: bit width of input
-        :param qparams: qparams for x
-        :return: QTensor: (output, output_scale, output_zero_point)
-        """
-
-        assert is_integer(old)
-        assert is_integer(new)
-
-        # adjust scale of newer tensor with QRS.identity, then older's with QRS.forward
-        sum = mod.add_impl(old, new)
-
-        scale_next, zero_point_next = mod._Qinp.calc_zero_point(
-            min_val=sum.min().item(),
-            max_val=sum.max().item(),
-            num_bits=mod._num_bits_inp
-        )
-
-        # the result must be rescaled again
-
-        # out = sum / scale_next + zero_point_next
-
-        # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        # out = mod._Qinp.tensor_clamp(sum, num_bits=mod._num_bits_inp)
-
-        assert len(torch.unique(sum)) > 1
-
-        printdbg("----------------- quantized_add info -----------------")
-        printdbg("scale_next:", mod.__qparams__["scale"])
-        printdbg("zero_point_next:", mod.__qparams__["zero_point"])
-        printdbg("scale_sum:", scale_next)
-        printdbg("zero_point_sum:", zero_point_next)
-        printdbg("scale_old:", mod.old_scale)
-        printdbg("zero_point_old:", mod.old_zero)
-        printdbg("------------------------------------------------------")
-
-        return sum
-    return quantized_add
-
-def _factory_convert_quantized_identity(mod, min_val, max_val):
-    def quantized_identity(new: torch.Tensor):
-
-        scale_next = mod.__qparams__["scale"]
-        zero_point_next = mod.__qparams__["zero_point"]
-
-        # FIXME testing different rescaling here:
-        # instead of halfing both newer and older scale, adjust each relatively
-        # input(f"{new}\n(newer tensor before rescale)")
-
-        # fraction_of_next_scale = (scale_next / (mod.old_scale + scale_next))
-        fraction_of_next_scale = .5
-
-        # new = (new-zero_point_next)
-        # new =  new + zero_point_next
-        new *= fraction_of_next_scale
-
-        printdbg("quantized residual: newer tensor (arg 1) rounding error:")
-        printdbg(f"avg rounding err: {(new-new.round()).abs().mean()}")
-        new = mod._Qinp.tensor_clamp(new, num_bits=mod._num_bits_inp-1)
-
-        return new
-    return quantized_identity
-
-
-def _factory_convert_convbnfoldable_layer_forward(mod):
-    # 1. fold weight
-    # 2. replace forward
-
-    bn = mod.bn
-
-    gamma, sigma, eps = bn.weight, bn.running_var, bn.eps
-
-    # FINALLY actually fold weights in instead of fake folds:
-    mod.conv.weight *= (gamma / torch.sqrt(sigma + eps)).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-
-    relu6_if_relu = (lambda t: mod.relu(t)) if hasattr(mod, "relu") else (lambda t: t)
-
-    def _converted_convbnfoldable_forward(x, *args, **kwargs):
-        x = mod.conv(x) # converted forward pass defined in "quantized_conv2d"
-
-        raise NotImplementedError("TODO: bias draufaddieren!")
-
-        assert is_integer(x, 0.1)
-        # woop no bn anymore :>
-        return relu6_if_relu(x)
-
-    return _converted_convbnfoldable_forward
-
-def _convert_bnnofold_layer_forward(mod):
-
-    # QAT fake quantize von batchnorm muss entsprechend angepasst werden
-
-    bnpos = "1"
-    # factor = torch.sqrt(mod._modules[bnpos].running_var + mode._modules[bnpos].eps)
-
-    # # change weights inplace (fold mov avgs):
-    # mod._modules[bnpos].weight /= factor
-    # mod._modules[bnpos].bias -= mod._modules[bnpos].running_mean * mod._modules[bnpos].weight
-
-    # # discard folded averages:
-    # # FIXME make this more efficient (but functional.batch_norm requires these?)
-    # mod._modules[bnpos].running_var *= 0
-    # mod._modules[bnpos].running_mean *= 0
-
-    mod._modules[bnpos].training = True # see .batchnorm for why
-    # delete train method
-    mod._modules[bnpos].train = lambda x: mod._modules[bnpos]
-    mod._modules[bnpos].track_running_stats = False
-
-def make_quantized_model_loadable(model:nn.Module):
-    raise NotImplementedError("TODO")
-    def _make_module_loadable(module):
-        for child in module._modules:
-            _make_module_loadable(child)
-        return module
-    return _make_module_loadable(model)
-
-def _factory_non_quantized_pre_hook(mod):
-    def non_quantized_pre_hook(mod, inp):
-        assert isinstance(inp, tuple), type(inp)
-        inp = inp[0]
-
-        # assert is_integer(inp), tnsr_stats(inp, mod._Qinp)
-        inp_rescaled = mod.__qparams__["scale"] * ( inp - mod.__qparams__["zero_point"])
-
-        return inp_rescaled
-    return non_quantized_pre_hook
-
-def _factory_non_quantized_post_hook(mod, min_val, max_val):
-    # for non quantized first/last layer
-    def non_quantized_post_hook(mod, inp, out):
-        # assert isinstance(out, tuple), type(out)
-        # out = out[0]
-
-        scale_next, zero_point_next = mod._Qinp.calc_zero_point(
-                min_val=min_val,
-                max_val=max_val,
-                num_bits=mod._num_bits_inp
-        )
-        out = out / scale_next + zero_point_next
-
-        out = mod._Qinp.tensor_clamp(out, num_bits=mod._num_bits_inp)
-
-        assert is_integer(out)
-
-        return out
-    return non_quantized_post_hook
 

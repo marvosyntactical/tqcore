@@ -87,7 +87,7 @@ def prep_module_qat(
         _stats: Dict = None,
         _handles: Dict = None,
         _module_types: Dict = None, # convenience to search for next activation during conversion
-        ) -> (nn.Module, Dict):
+    ) -> (nn.Module, Dict):
     """
     prep module for qat,
     return dict of forward hook handles to call handle.remove() on during conversion.
@@ -97,7 +97,9 @@ def prep_module_qat(
 
     nested_suffix = "_" # to disambiguate modules that have the same name as father, father gets renamed to "fathername_"; use this in conversion... FIXME BUG
 
-    if inplace == False and _stats is None:
+    is_root_module = _stats is None
+
+    if inplace == False and is_root_module:
         # deepcopy root Module but not lower ones
         module = copy.deepcopy(module)
 
@@ -146,7 +148,7 @@ def prep_module_qat(
 
     param_names = [name for name, _ in module.named_parameters()]
 
-    # ---------- PREPARE DIFFERENT MODULES CASE BY CASE --------- # FIXME despaghettify
+    # ---------- PREPARE DIFFERENT MODULES CASE BY CASE --------- #
 
     if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
 
@@ -194,7 +196,6 @@ def prep_module_qat(
         module._num_bits_bias = num_bits_bias
         module._num_bits_inp = num_bits_input
 
-
     elif isinstance(module, nn.modules.batchnorm._BatchNorm):
         pass
 
@@ -212,10 +213,8 @@ def prep_module_qat(
 
         module._Qinp = quant_input
         module._num_bits_inp = num_bits_input
-        # module._fakeQ = lambda *inputs: inputs[0] # FakeQuant.apply
         module._fakeQ = FakeQuant.apply
 
-        # module.forward = _factory_qat_activation_forward(_stats, module_number)
         post_hook_handle = module.register_forward_hook(
             _factory_qat_activation_forward_hook(_stats)
         ) # fake quantize activations
@@ -227,8 +226,14 @@ def prep_module_qat(
     else:
         is_leaf = descendants_module_number == module_number + 1
         if is_leaf:
-            print(f"Dont know how to prepare leaf module '{module_number}', an instance of {type(module)}")
-        pass
+            print(f"Don't know how to prepare leaf module '{module_number}', an instance of {type(module)}")
+
+    if is_root_module:
+        module._Qinp = quant_input
+        module._Qwt = quant_weight
+        module._num_bits_wt = num_bits_weight
+        module._num_bits_bias = num_bits_bias
+        module._num_bits_inp = num_bits_input
 
     # ---------- END PREPARE DIFFERENT MODULES CASE BY CASE ---------
 

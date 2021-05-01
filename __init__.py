@@ -1,3 +1,5 @@
+from .qtensor import *
+
 from .quantization_functions import *
 from .quantization_ema_stats import *
 

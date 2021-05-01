@@ -4,8 +4,8 @@ import torch.nn.functional as F
 
 import random
 
-from tinyquant.quantized_layer import *
-from tinyquant.quantizable_layer import *
+# from tinyquant.quantized_layer import *
+# from tinyquant.quantizable_layer import *
 
 check_integer_if_true = lambda x, b: (x==x.round()).all() if b else True
 
@@ -21,14 +21,17 @@ class Net(nn.Module):
     3. add nn.Identity() after parameterized layers without non-softmax-activations (usually last layer)
 
     """
-    def __init__(self,
+    def __init__(
+            self,
             debug=True,
             debuginfo=(8,8,32),
-            convbn=ConvBNfoldable,
+            convbn=None,
             skipconv=False,
             convblocks=1,
             blocks=1,
-            ): # set as argument to cnn.py
+        ): # set as argument to cnn.py
+
+        assert convbn is not None
 
         super(Net, self).__init__()
 
