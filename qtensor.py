@@ -28,11 +28,15 @@ class QTensor:
         self.scale = scale
         self.zero = zero
 
+    def dequantize(self) -> torch.Tensor:
+        return (self._t - self.zero) * qx.scale
+
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """
         From
         https://pytorch.org/docs/stable/notes/extending.html#extending-torch-with-a-tensor-wrapper-type
 
+        Original DocString:
         This __torch_function__ implementation wraps subclasses such that
         methods called on subclasses return a subclass instance instead of
         a ``torch.Tensor`` instance.
@@ -91,22 +95,26 @@ class QTensor:
 
     def __add__(self, other):
         assert isinstance(other, QTensor), type(other)
-        result = self._t.__add__(other._t)
 
-        new_scale = self.scale
-        new_zero = self.zero
+        # NEED TO SCALE TENSORS DOWN BEFORE CALLING THIS
 
-        return QTensor(result, scale=new_scale, zero=new_zero)
+        # actually calculate in FP (could switch to custom backend with int8 kernel here in future)
+        r = self._t + other._t
+
+        new_scale = self.scale + other.scale
+        new_zero = self.zero + other.zero
+
+        return QTensor(r, scale=new_scale, zero=new_zero)
 
     def __matmul__(self, other):
         assert isinstance(other, QTensor), type(other)
 
-        result = self._t.__matmul__(other._t)
+        r = self._t @ other._t
 
-        new_scale = self.scale
-        new_zero = self.zero
+        new_scale = self.scale + other.scale
+        new_zero = self.zero + other.zero
 
-        return QTensor(result, scale=new_scale, zero=new_zero)
+        return QTensor(r, scale=new_scale, zero=new_zero)
 
     def __deepcopy__(self, memo):
         if id(self) in memo:

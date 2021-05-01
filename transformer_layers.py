@@ -16,12 +16,10 @@ from torch.autograd import Variable
 
 from .quantizable_layer import \
         QListener, \
-        QAdd, QMatMul, QScale, \
+        QAdd, QMul, QMatMul, \
         QSoftmax
 
-
 # this file contains quantized versions of layers used in tst_pytorch/modules.py
-
 
 class QPositionalEncoding(nn.Module):
     """
@@ -85,13 +83,14 @@ class QMultiHeadedAttention(nn.Module):
         self.q_layer = nn.Linear(dim, num_heads * head_size)
         self.post_qq = QListener(self.q_layer)
 
-        self.scale = QScale()
+        self.scale = QMul()
+        self.scaleq = QListener(self.scale)
 
         self.qkMatMul = QMatMul()
 
         self.qMask = QMask()
 
-        self.qkMatMul = QMatMul()
+        self.avMatMul = QMatMul()
 
         self.qsoftmax = QSoftmax(dim=-1)
 
@@ -129,7 +128,7 @@ class QMultiHeadedAttention(nn.Module):
         q = q.view(batch_size, num_heads, -1, self.head_size)
 
         # compute scores
-        q = self.scale(q, math.sqrt(self.head_size))
+        q = self.scale(q, 1./math.sqrt(self.head_size))
 
         # batch x num_heads x query_len x key_len
         scores = self.qkMatMul(q, k)
@@ -146,7 +145,8 @@ class QMultiHeadedAttention(nn.Module):
 
         # get context vector (select values with attention) and reshape
         # back to [B, W, D]
-        context = self.vMatMul(attention, v)
+        context = self.avMatMul(attention, v)
+
         context = context.transpose(1, 2).contiguous().view(
             batch_size, -1, num_heads * self.head_size)
 
@@ -355,14 +355,17 @@ class QTSTModel(nn.Module):
             emb_dropout: float = 0.1,
             freeze: bool = False,
             activ: nn.Module = GeLU,
-            encoder: TransformerEncoder = None,
+            encoder: QTransformerEncoder = None,
             time_window: int = 24,
             task: str = "pretrain", # regression/pretraining/classification
             n_labels: int = 10, # classification only
             fc_dropout: float = 0.0,
-            **qkwargs
+            **qkwargs # settings for quantizable modules
         ):
         super().__init__()
+
+        self.quantStub = Quant(**qkwargs)
+        self.input_listener = QListener(self.quant_stub, **qkwargs)
 
         if encoder is not None:
             self.encoder = encoder
@@ -410,10 +413,17 @@ class QTSTModel(nn.Module):
             *head_list
         )
 
+        self.deQuantStub = DeQuant(**qkwargs)
+
 
     def forward(self, src, mask=None):
+        src = self.quantStub(src)
+        src = self.input_listener(src)
+
         h = self.encoder(src, mask)
         out = self.head(h)
+
+        out = self.deQuantStub(out)
         return out
 
 

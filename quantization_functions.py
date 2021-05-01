@@ -62,6 +62,12 @@ class UniformQuantization(Quantization):
     def __init__(self, nudge_zero=False):
         self.nudge_zero = nudge_zero
 
+    def _quantize_tensor_using_params(self, x:torch.Tensor, scale, zero=0, num_bits=8):
+
+        q_x = x / scale + zero
+        q_x = self.tensor_clamp(q_x, num_bits=num_bits)
+        return q_x
+
     def _quantize_tensor(self, x:torch.Tensor, min_val=None, max_val=None, num_bits=8) -> Tuple[torch.Tensor, float, float]:
 
         if not min_val and not max_val:
@@ -71,8 +77,7 @@ class UniformQuantization(Quantization):
         # scale ist real; zero ganz
         scale, zero = self.calc_params(min_val, max_val, num_bits)
 
-        q_x = x / scale + zero
-        q_x = self.tensor_clamp(q_x, num_bits=num_bits)
+        q_x = self._quantize_tensor_using_params(x, scale, zero=zero, num_bits=num_bits)
 
         return q_x, scale, zero
 
@@ -80,6 +85,12 @@ class UniformQuantization(Quantization):
 
         q_x, scale, zero =  self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
         return QTensor(q_x, scale=scale, zero=zero)
+
+    def quantize_to_qtensor_using_params(self, x, scale, zero=0, num_bits=8) -> QTensor:
+
+        q_x = self._quantize_tensor_using_params(x, scale, zero, num_bits=num_bits)
+        return QTensor(q_x, scale=scale, zero=zero)
+
 
     def quantize_to_torch_tensor(self, x, qparams, min_val=None, max_val=None, num_bits=8) -> torch.Tensor:
         # updates globally used qparams dict in place instead of returning QTensor
@@ -133,8 +144,6 @@ class UniformQuantization(Quantization):
 
         return QTensor(q_x, scale=scale, zero=zero)
 
-    def dequantize(self, qx: QTensor) -> torch.Tensor:
-        return (qx._t - qx.zero) * qx.scale
 
 
 class UniformSymmetricQuantization(Quantization):
@@ -170,9 +179,6 @@ class UniformSymmetricQuantization(Quantization):
         scale = max_val / qmax
 
         return scale, 0
-
-    def dequantize_tensor(self, q_x: QTensor):
-        return q_x.scale * (q_x._t.float())
 
     def tensor_clamp(self, x: torch.Tensor, num_bits):
         return x.round().clamp(-(2. ** (num_bits - 1) - 1), 2. ** (num_bits - 1) - 1)
