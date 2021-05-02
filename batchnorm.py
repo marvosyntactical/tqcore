@@ -4,6 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
+from .quantizable_layer import QuantizableModule
+from .qtensor import QTensor
+
 import copy
 
 # wrapped _BatchNorm interface like in the recommendation of RLisfun:
@@ -14,11 +17,101 @@ import copy
 # 2. changing bn.track_running_stats to False during eval()
 # -> wenn bn.track_running_stats False, setze kurz momentum = 0, sodass kein update passiert
 
-class _BatchNormWrap(_BatchNorm):
-    def __init__(self, *args, **kwargs):
-        super(_BatchNormWrap, self).__init__(*args, **kwargs)
+class _QBatchNorm(QuantizableModule, _BatchNorm):
+    def __init__(self, *args, **qkwargs):
+        super().__init__(*args, **qkwargs)
 
-    def forward(self, input: Tensor) -> Tensor:
+    def forward_quantized(x: QTensor) -> QTensor:
+        """
+        # NOTES for stuff to do inside qat_convert.py:
+        # rewrite/delete convbn.train und setze BN permanent auf track_running_stats=False
+        # quantisierung:
+        # 1. weight /= sigma; bias *= mu
+        # 2. weight und bias beide auf 32 quantizen
+
+        Quantized batch norm self, without folding
+
+        :param x: QTensor, quantized input data
+        """
+
+        # TODO figure out how to factor out these scales properly
+        # so I can assign these tensors permanently
+        # (this falls under optimization tho and would not appease mr knuth)
+
+        gamma = quantization_weight.quantize_to_qtensor(
+            self.weight,
+            num_bits=num_bits_weight # int8 or int32 ? TODO test
+        )
+
+        numerator_scale = x.scale * gamma.scale
+        denominator_scale = numerator_scale # ** 2
+        scale_out = math.sqrt(numerator_scale) # siehe overleaf rechnung
+        # scale_out = numerator_scale
+
+        mu = quant_weight.quantize_to_qtensor_given_scale(
+            self.running_mean,
+            x.scale,
+            0,
+            num_bits=num_bits_bias
+        )
+
+        sigma =  quant_weight.quantize_to_qtensor_given_scale(
+            self.running_var,
+            denominator_scale,
+            0,
+            num_bits=num_bits_weight
+        )
+
+        epsilon = quant_weight.quantize_to_qtensor_given_scale(
+            torch.Tensor([self.eps]),
+            denominator_scale,
+            0,
+            num_bits=num_bits_weight
+        )
+
+        if self.bias is not None:
+
+            # TODO if block removen? bn sollte immer bias haben
+            beta = quant_weight.quantize_to_qtensor_given_scale(
+                self.bias,
+                scale_out,
+                0,
+                num_bits=num_bits_bias
+            ) # as in prep
+
+            beta = beta._t
+        else:
+            beta = None
+
+        assert self.training, "batchnorm must have .training==True always, see top of batchnorm.py"
+        assert not self.track_running_stats, "see batchnorm.py"
+
+        _, exponential_average_factor = self.do_checks(x._t)
+
+        r = F.batch_norm(
+            input=x._t - x.zero,
+            running_mean=mu._t,
+            running_var=sigma._t,
+            weight=gamma._t - gamma.zero,
+            bias=beta,
+            training=bn_training,
+            momentum=exponential_average_factor,
+            eps=epsilon._t.item(),
+        )
+
+        multiplier = scale_out / self.scale_next
+
+        out = r * multiplier + self.zero_next
+
+        out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
+
+        assert is_integer(out), out
+
+        assert len(torch.unique(out)) > 1, (out.mean(), tnsr_stats(x, quant_input), multiplier, zero_point_next, out_before)
+
+        return QTensor(out, scale=self.scale_next, zero=self.zero_next)
+
+    def do_checks(self, input: Tensor) -> Tensor:
         self._check_input_dim(input)
 
         # exponential_average_factor is set to self.momentum
@@ -60,16 +153,38 @@ class _BatchNormWrap(_BatchNorm):
         """
         assert self.running_mean is None or isinstance(self.running_mean, torch.Tensor)
         assert self.running_var is None or isinstance(self.running_var, torch.Tensor)
+
+        return bn_training, exponential_average_factor
+
+    def forward_fp(self, input: Tensor) -> Tensor:
+        bn_training, exponential_average_factor = self.do_checks(input)
+
         return F.batch_norm(
-                    input,
-                    # If buffers are not to be tracked, ensure that they won't be updated
-                    self.running_mean if not self.training or self.track_running_stats else None,
-                    self.running_var if not self.training or self.track_running_stats else None,
-                    self.weight,
-                    self.bias,
-                    bn_training,
-                    exponential_average_factor,
-                    self.eps)
+            input,
+            # If buffers are not to be tracked, ensure that they won't be updated
+            self.running_mean if not self.training or self.track_running_stats else None,
+            self.running_var if not self.training or self.track_running_stats else None,
+            self.weight,
+            self.bias,
+            bn_training,
+            exponential_average_factor,
+            self.eps
+        )
+
+    def forward_qat(self, input: Tensor) -> Tensor:
+        bn_training, exponential_average_factor = self.do_checks(input)
+
+        return F.batch_norm(
+            input,
+            # If buffers are not to be tracked, ensure that they won't be updated
+            self.running_mean if not self.training or self.track_running_stats else None,
+            self.running_var if not self.training or self.track_running_stats else None,
+            self.weight,
+            self.bias,
+            bn_training,
+            exponential_average_factor,
+            self.eps
+        )
 
     def train(self, mode:bool):
 
@@ -81,13 +196,31 @@ class _BatchNormWrap(_BatchNorm):
 
         return self
 
+class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
+    def forward_fp(self, x):
+        x = torch.transpose(x,1,2)
+        x = super().forward_fp(x)
+        x = torch.transpose(x,1,2)
+        return x
 
-class BatchNorm1dWrap(_BatchNormWrap, nn.BatchNorm1d):
+    def forward_qat(self, x):
+        x = torch.transpose(x,1,2)
+        x = super().forward_qat(x)
+        x = torch.transpose(x,1,2)
+        return x
+
+    def forward_quantize(self, x):
+        x = torch.transpose(x,1,2)
+        x = super().forward_quantize(x)
+        x = torch.transpose(x,1,2)
+        return x
+
+class QBatchNorm1d(_QBatchNorm, nn.BatchNorm1d):
     pass
 
-class BatchNorm2dWrap(_BatchNormWrap, nn.BatchNorm2d):
+class QBatchNorm2d(_QBatchNorm, nn.BatchNorm2d):
     pass
 
-class BatchNorm3dWrap(_BatchNormWrap, nn.BatchNorm3d):
+class QBatchNorm3d(_QBatchNorm, nn.BatchNorm3d):
     pass
 

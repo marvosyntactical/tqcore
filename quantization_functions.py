@@ -22,9 +22,9 @@ import math
 import torch
 from .qtensor import QTensor
 
-# QTensor = namedtuple("QTensor", ("tensor", "scale", "zero"))
-
 class Quantization():
+    def __init__(self, **kwargs):
+        pass
 
     @classmethod
     def from_opt(cls):
@@ -143,8 +143,6 @@ class UniformQuantization(Quantization):
         q_x = self.tensor_clamp(q_x, num_bits=num_bits)
 
         return QTensor(q_x, scale=scale, zero=zero)
-
-
 
 class UniformSymmetricQuantization(Quantization):
     """

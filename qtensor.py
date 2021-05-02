@@ -4,6 +4,8 @@ from torch import _C
 from torch.autograd import Variable
 import torch.nn.functional as F
 
+from copy import deepcopy
+
 import logging
 logging.basicConfig(level="INFO")
 logqt = logging.getLogger("qt")
@@ -25,6 +27,8 @@ class QTensor:
 
     def __init__(self, data, scale:float, zero:int=0, **kwargs):
         self._t = torch.as_tensor(data, **kwargs)
+        # TODO remove this costly assertion after testing !!!!! FIXME:
+        assert torch.allclose(self._t,self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
         self.scale = scale
         self.zero = zero
 
@@ -153,8 +157,33 @@ if __name__ == "__main__":
     print(trans)
     print(torch.matmul(qt, trans))
     print(qt.T)
-    qt = qt.to("cuda")
+    qt = qt.to("cpu")
     print(qt)
     print(qt.device)
-    print(QParameter(qt))
+    print(deepcopy(qt))
+
+    from functools import wraps
+    import time
+
+    def timeit(my_func):
+        @wraps(my_func)
+        def timed(*args, **kw):
+
+            tstart = time.time()
+            output = my_func(*args, **kw)
+            tend = time.time()
+
+            print('"{}" took {:.3f} s to execute\n'.format(my_func.__name__, (tend - tstart)))
+            return output
+        return timed
+
+    @timeit
+    def torch_softmax(inp):
+        return inp.softmax(dim=-1)
+
+    @timeit
+    def tqcore_softmax(inp):
+        return
+
+
 
