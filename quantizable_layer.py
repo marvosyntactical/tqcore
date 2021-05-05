@@ -14,6 +14,9 @@ import copy
 from typing import Optional, Union
 from functools import partial
 
+__DEBUG__ = False
+is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
+
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 
 class QuantizableModule(nn.Module):
@@ -32,7 +35,7 @@ class QuantizableModule(nn.Module):
             nudge_zero: bool = False,
             **qkwargs,
         ):
-        super().__init__()
+        nn.Module.__init__(self) # super().__init__ somehow calls __init__ of _QBatchNorm for subclasses of it FIXME
 
         self.num_bits = num_bits
         self.quantization = quantization(nudge_zero=nudge_zero)
@@ -45,10 +48,10 @@ class QuantizableModule(nn.Module):
         return x
 
     def forward_qat(self, x: Tensor) -> Tensor:
-        raise NotImplementedError()
+        raise NotImplementedError(f"{type(self)}.forward_qat")
 
     def forward_quantized(self, x: QTensor) -> QTensor:
-        raise NotImplementedError()
+        raise NotImplementedError(f"{type(self)}.forward_quantized")
 
     def qat_prepare(self):
         self.forward = self.forward_qat
@@ -56,56 +59,40 @@ class QuantizableModule(nn.Module):
     def quantize(self):
         self.forward = self.forward_quantized
 
-        stats_dict_names = [attr[:attr.find("__stats__")] for
-            attr in dir(self) if attr.endswith("__stats__")
-        ]
-        assert stats_dict_names, f"some <name>+__stats__ of {type(self)} needs to be set by a QListener module"
-        for name in stats_dict_names:
-            stats = getattr(self, name+"__stats__")
-
-            prefix = name + "_" if name else ""
-            # prohpylactically set qparams for all QuantizableModules
-
-            scale_next, zero_next = self.quantization.calc_params(stats["ema_min"], stats["ema_max"], num_bits=self.num_bits)
-
-            setattr(self, prefix+"scale_next", scale_next)
-            setattr(self, prefix+"zero_next", zero_next)
-
 
 class Quant(QuantizableModule):
     """
     Quantizes incoming torch.Tensors into tqcore.QTensors if necessary.
     Functionality Analogous to torch.quantization.QuantStub
     """
-    def forward_quantized(self, *args, **kwargs):
-        for i, inp in enumerate(args):
-            if isinstance(inp, Tensor)\
-                    and torch.is_floating_point(inp)\
-                    and not isinstance(inp, QTensor):
-                args[i] = self.quantization.quantize_to_qtensor(
-                    inp,
-                    self.min_val,
-                    self.max_val,
-                    num_bits=self.num_bits
-                )
 
-        for key, inp in enumerate(kwargs):
-            if isinstance(inp, Tensor)\
-                    and torch.is_floating_point(inp)\
-                    and not isinstance(inp, QTensor):
-                kwargs[key] = self._Qinp.quantize_to_qtensor(
-                    inp,
-                    self.min_val,
-                    self.max_val,
-                    num_bits=self.num_bits
-                )
-        return args, kwargs
+    def forward_qat(self, x):
+        return x
+
+    def forward_quantized(self, x):
+        if isinstance(x, Tensor)\
+                and torch.is_floating_point(x)\
+                and not isinstance(x, QTensor):
+            r = self.quantization.quantize_to_qtensor(
+                x,
+                self.min_val,
+                self.max_val,
+                num_bits=self.num_bits
+            )
+        return r
 
 class DeQuant(QuantizableModule):
     """
     Dequantizes incoming torch.Tensors into tqcore.QTensors if necessary.
     Functionality Analogous to torch.quantization.QuantStub
     """
+    def __init__(self, **qkwargs):
+        super().__init__(**qkwargs)
+        self.quantize = lambda:None
+
+    def forward_qat(self, x):
+        return x
+
     def forward_quantized(self, outputs):
         if not isinstance(outputs, tuple):
             assert isinstance(outputs, Tensor), type(outputs)
@@ -116,6 +103,11 @@ class DeQuant(QuantizableModule):
         for i, out in enumerate(outputs):
             if isinstance(out, QTensor):
                 outputs[i] = out.dequantize()
+
+        if len(outputs) == 1:
+            outputs = outputs[0]
+        else:
+            outputs = tuple(outputs)
         return outputs
 
 class QListener(QuantizableModule):
@@ -124,7 +116,8 @@ class QListener(QuantizableModule):
     (no other module records stats)
     Accepts an iterable of modules for each of which the QListener sets the module.scale_next attribute and so on
     """
-    def __init__(self, *modules: nn.Module, name = None, function = None, ema_decay: float = .9999, nudge_zero: bool = False, **qkwargs):
+    def __init__(self, *modules: nn.Module, name = None, function = None, dont_fakeQ: bool = False, ema_decay: float = .9999, nudge_zero: bool = False, **qkwargs):
+
         super().__init__(**qkwargs)
 
         self.function = function # optionally apply function before collecting stats (for softmax)
@@ -133,27 +126,37 @@ class QListener(QuantizableModule):
 
         self.__stats__ = {}
         for module in modules:
-            setattr(module, self.name+"__stats__", self.__stats__)
+            exec(f"module.{self.name+'__stats__'} = self.__stats__")
+        self.mods = list(modules)
 
-        self.fake_quantize = FakeQuant.apply
+        self.dont_fakeQ = dont_fakeQ
+        if not dont_fakeQ:
+            self.fake_quantize = FakeQuant.apply
 
     def forward_qat(self, x: Tensor):
         """
         Collect stats AND fakequantize
         """
         self._update_ema_stats(x)
-        scale, zero = self.quantization.calc_params(self.stats["ema_min"], self.stats["ema_max"], num_bits=self.num_bits)
 
-        x = self.fake_quantize(
-            x,
-            self.quantization,
-            self.num_bits,
-            self.__stats__["ema_min"],
-            __stats__["ema_max"]
-        )
+        if not self.dont_fakeQ:
+            scale, zero = self.quantization.calc_params(
+                self.__stats__["ema_min"], self.__stats__["ema_max"],
+                num_bits=self.num_bits
+            )
+
+            x = self.fake_quantize(
+                x,
+                self.quantization,
+                self.num_bits,
+                self.__stats__["ema_min"],
+                self.__stats__["ema_max"]
+            )
         return x
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+        assert is_integer(x._t)
+        assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         return x
 
     def _update_ema_stats(self, x):
@@ -167,27 +170,30 @@ class QListener(QuantizableModule):
         :return: stats: updated EMA
         """
         x = x.detach()
+
         if self.function is not None:
+            cache = x
             x = self.function(x)
+            assert not torch.isinf(x).any(), f"fraction of infs: {torch.isinf(x).sum()/x.view(-1).shape[0]}, {cache.max().item()}, {cache.min().item()}"
 
         max_val = torch.max(x).item()
         min_val = torch.min(x).item()
+
+        assert not torch.isnan(x).any(), f"fraction of NaNs: {torch.isnan(x).sum()/x.view(-1).shape[0]}"
         # assert max_val != min_val, (max_val, (x==max_val).all())
 
-        # if layer not yet in dictionary: create EMA for layer
-        if key not in self.__stats__:
-            self.__stats__ = {"max": max_val, "min": min_val}
-        else:
-            curr_max = self.__stats__["max"]
-            curr_min = self.__stats__["min"]
-            self.__stats__['max'] = max(max_val, curr_max) if curr_max is not None else max_val
-            self.__stats__['min'] = max(min_val, curr_min) if curr_min is not None else min_val
+        if not self.__stats__:
+            self.__stats__ = {"ema_max": max_val, "ema_min": min_val}
+
+        curr_max = self.__stats__["ema_max"]
+        curr_min = self.__stats__["ema_min"]
+        self.__stats__['ema_max'] = max(max_val, curr_max) if curr_max is not None else max_val
+        self.__stats__['ema_min'] = max(min_val, curr_min) if curr_min is not None else min_val
 
 
         if 'ema_min' in self.__stats__:
             # self.__stats__['ema_min'] = (1.-self.ema_decay) * min_val + self.ema_decay * self.__stats__['ema_min']
             self.__stats__['ema_min'] -=  (1 - self.ema_decay) * (self.__stats__['ema_min'] - min_val)
-
         else:
             self.__stats__['ema_min'] = min_val
 
@@ -197,9 +203,44 @@ class QListener(QuantizableModule):
         else:
             self.__stats__['ema_max'] = max_val
 
+        # assert not torch.isnan(torch.Tensor([self.__stats__["ema_max"]]))
+        # assert not torch.isnan(torch.Tensor([self.__stats__["ema_min"]]))
+
+        # FIXME need to update every module's stats individually
+        # previously, it worked to just set their stats to another module's stats dict
+        # and update that. Now the id()s change when doing that and updating only
+        # the QListener dict. So now I've got to have a list with all the modules,
+        # which may be dangerous with certain other things
+        for module in self.mods:
+            exec(f"module.{self.name+'__stats__'} = self.__stats__")
+
+    def quantize(self):
+        super().quantize()
+
+        stats = self.__stats__
+
+        try:
+            scale_next, zero_next = self.quantization.calc_params(
+                stats["ema_min"], stats["ema_max"], num_bits=self.num_bits
+            )
+        except KeyError as KE:
+            if True in [isinstance(mod, QMask) or isinstance(mod, QSoftmax) for mod in self.mods]:
+                print(f"Got KeyError: {KE} during QListener conversion.")
+                return
+            else:
+                raise
+
+        prefix = self.name + "_" if self.name else ""
+
+        for mod in self.mods:
+            setattr(mod, prefix+"scale_next", scale_next)
+            setattr(mod, prefix+"zero_next", zero_next)
+            setattr(mod, prefix+"min_val", stats["ema_min"])
+            setattr(mod, prefix+"max_val", stats["ema_max"])
+
 
 def _qmul(
-        a: QTensor, b: QTensor,
+        a: QTensor, b: QTensor, s: float,
         scale_next, zero_next, torchOp,
         quantization, weight_quantization,
         num_bits, num_bits_weight):
@@ -211,7 +252,7 @@ def _qmul(
     for i, t in enumerate(ab):
         if not isinstance(t, QTensor):
             if isinstance(t, torch.Tensor):
-                if isinstance(t, torch.Parameter):
+                if isinstance(t, nn.Parameter):
                     # e.g. elementwise mul with parameter
                     t = weight_quantization.quantize_to_qtensor(
                         t,
@@ -229,22 +270,27 @@ def _qmul(
                     )
             else:
                 assert False, (t, type(t))
-                t = QTensor(torch.as_tensor(t), scale=1., zero=0.)
+                # t = QTensor(torch.as_tensor(t), scale=1., zero=0.)
+
         ab[i] = t
+
     a, b  = ab
 
-    a_zeroed = a._t - a.zero
-    b_zeroed = b._t - b.zero
+    a_zeroed = a._t - round(a.zero)
+    b_zeroed = b._t - round(b.zero)
 
     r: torch.Tensor = torchOp(a_zeroed, b_zeroed)
+    r_cached = r
 
-    multiplier = (a.scale * b.scale) / scale_next
+    multiplier = (a.scale * b.scale * s) / scale_next
     # scale result tensor back to given bit width, saturate to uint if unsigned is used:
     r = r * multiplier + zero_next
+    r_cache_2 = r
+
     # round and clamp
     r = quantization.tensor_clamp(r, num_bits=num_bits)
 
-    assert is_integer(r), r
+    assert r.min() != r.max(), (scale_next, zero_next, a._t.min(), a._t.max(), b._t.min(), b._t.max(), r_cached.min(), r_cached.max(), r_cache_2.min(), r_cache_2.max(), multiplier, s)
 
     return QTensor(r, scale=scale_next, zero=zero_next)
 
@@ -260,24 +306,25 @@ class QMul(QuantizableModule):
             a: Union[QTensor, torch.Tensor, nn.Parameter, float, int],
             b: Union[QTensor, torch.Tensor, nn.Parameter, float, int],
         ):
-        return _qmul(a, b, self.scale_next, self.zero_next, torch.mul,
+        return _qmul(a, b, 1., self.scale_next, self.zero_next, torch.mul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
 
 
 class QMatMul(QuantizableModule):
-    def __init__(self, *args, **qkwargs):
+    def __init__(self, *args, factor: float=1., **qkwargs):
         super().__init__(*args, **qkwargs)
+        self.factor = float(factor)
 
     def forward_fp(self, a, b):
-        return a @ b
+        return self.factor * ( a @ b )
 
     def forward_qat(self, a, b):
-        return a @ b
+        return self.factor * ( a @ b )
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
         return _qmul(
-                a, b, self.scale_next, self.zero_next, torch.matmul,
+                a, b, self.factor, self.scale_next, self.zero_next, torch.matmul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
 
@@ -315,16 +362,16 @@ class QAdd(QuantizableModule):
         return r
 
 class QMask(QuantizableModule):
-    def __init__(self, float_neg_val: float=float("-inf"), **qkwargs):
+    def __init__(self, fp_neg_val: float=-1e9, **qkwargs):
         super().__init__(**qkwargs)
-        self.float_neg_val = float(float_neg_val)
+        self.fp_neg_val = float(fp_neg_val)
 
     def forward_fp(self, scores, mask):
-        scores = scores.masked_fill(mask==torch.as_tensor(False), float('-inf'))
+        scores = scores.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
         return scores
 
     def forward_qat(self, scores, mask):
-        scores = scores.masked_fill(mask==torch.as_tensor(False), float('-inf'))
+        scores = scores.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
         return scores
 
     def forward_quantized(self, scores, mask):
@@ -340,7 +387,11 @@ class QSoftmax(QuantizableModule):
         self.dim = int(dim)
 
         # this records EMA stats of exponential, and has no fake quant effect
-        self.exp_listener = QListener(self, name="exp", function=torch.exp, **qkwargs)
+        self.exp_listener = QListener(
+            self,
+            name="exp", function=torch.exp, dont_fakeQ=True,
+            **qkwargs
+        )
 
         # this ALSO records stats of normed output (which will be between 0 and 1 anyway),
         # but is used mainly because of fake quantizing
@@ -348,7 +399,7 @@ class QSoftmax(QuantizableModule):
 
     def _set_exp_lkp(self, num_bits:int):
         # this range is tailored to uniformquantization
-        self.LUT = torch.exp(torch.arange(2.** num_bits)).round()
+        self.EXP_STEP_FUN = torch.exp(torch.arange(2.** num_bits)).round()
 
     def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
         return inp.softmax(dim=self.dim)
@@ -361,14 +412,21 @@ class QSoftmax(QuantizableModule):
 
     def forward_quantized(self, inp: QTensor) -> QTensor:
 
-        exponentiated: torch.Tensor = self.LUT[inp._t]
+        print(f"Softmax quantized fwd debug:")
+        print(self.exp_scale_next, self.exp_zero_next)
+        print(self.normed_scale_next, self.normed_zero_next)
+
+        exponentiated: torch.Tensor = self.EXP_STEP_FUN[inp._t.long()]
 
         numerator = QTensor(exponentiated, scale=self.exp_scale_next, zero=self.exp_zero_next)
-        denominator = QTensor(1/exponentiated.sum(dim=self.dim).unsqueeze(-1),
+        denominator = QTensor(
+            1/exponentiated.sum(dim=self.dim).unsqueeze(-1),
             scale=1/self.exp_scale_next, zero=1/self.exp_zero_next)
 
+        print("denominator: scale=",denominator.scale, "zero=",denominator.zero)
+
         r = _qmul(
-            numerator, denominator,
+            numerator, denominator, 1.,
             self.normed_scale_next, self.normed_zero_next,
             torch.mul,
             self.quantization, self.weight_quantization,
@@ -383,12 +441,15 @@ class QReLU6(QuantizableModule):
         return nn.functional.relu6(x)
 
     def forward_qat(self, x: torch.Tensor) -> torch.Tensor:
+        min_val = self.__stats__.get("ema_min", x.min().item())
+        max_val = self.__stats__.get("ema_max", x.max().item())
+
         scale, zero = self.quantization.calc_params(
-            self.__stats__["ema_min"], self.__stats__["ema_max"], num_bits=self.num_bits
+            min_val, max_val, num_bits=self.num_bits
         )
-        six = round(6 / scale_next + zero)
+        six = round(6 / scale + zero)
         out = x.clamp(min=zero, max=six)
-        return r
+        return out
 
     def forward_quantized(self, x: QTensor) -> QTensor:
 
@@ -492,8 +553,6 @@ class ConvBNfoldable(QuantizableModule):
     def quantize(self):
         super().quantize()
         self.fold()
-
-
 
     def folded_weight(self):
         # C8: w_fold = w * (gamma/sigma)

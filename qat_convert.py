@@ -76,26 +76,17 @@ def convert_module(
         ) -> nn.Module:
     """ Convert module after QAT training has been done. """
 
-    assert False, "reminder: implement quantization of weight matrices (pos enc, linear) HERE (not in quantized_layer"
-
     module_number = module._module_number
 
-    is_root_module = _stats is None
-
-    if is_root_module:
-        module = QuantizedModel(module)
-
-    module.register_forward_pre_hook(_debug_forward_pre_hook)
-
-    if inplace == False and _stats is None:
+    if inplace == False and is_root_module:
         module = deepcopy(module)
 
     # get dicts from top module if not passed down recursively in this function
     _handles = module.handles if _handles is None else _handles
     _module_types = module.module_types if _module_types is None else _module_types
 
-    if leave_first_and_last_layer and (first_and_last_layer is None):
-        first_and_last_layer = find_first_and_last_layer(_module_types)
+    if leave_first_and_last_layer and (leave_layers is None):
+        leave_layers = find_first_and_last_layer(_module_types)
 
     assert isinstance(_handles, dict) and _handles, f"'_handles' argument needs to be dict of pre/post fwd hook handles of model modules and not {type(_handles)} {_handles}"
 
@@ -105,15 +96,20 @@ def convert_module(
 
         # ===== DFS down module graph ========
 
-        convert_module(
-            layer,
-            leave_first_and_last_layer=leave_first_and_last_layer,
-            leave_layers=leave_layers,
-            _handles=_handles,
-            _module_types=_module_types,
-            is_root_module=False,
-            inplace=True
-        )
+        try:
+            convert_module(
+                layer,
+                leave_first_and_last_layer=leave_first_and_last_layer,
+                leave_layers=leave_layers,
+                _handles=_handles,
+                _module_types=_module_types,
+                is_root_module=False,
+                inplace=True
+            )
+        except KeyError as KE:
+            print(KE)
+            print(name)
+            input()
 
     # 2. convert known layer types and remove forward hooks on a basis of spaghetti
 
@@ -132,7 +128,7 @@ def convert_module(
 
     # ################  end remove pre / post hooks ###################
 
-    dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers ) # FIXME consider adding batchnorm here
+    dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
     mod_type = type(module)
 
     is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
@@ -147,10 +143,7 @@ def convert_module(
 
     elif is_layer and not dont_quantize:
 
-        # (batchnorm forward is not used in the folded variant)
-        module.forward = _factory_convert_layer_forward_impl(
-           module, min_val, max_val
-        )
+        module.forward = _factory_convert_layer_forward_impl(module)
 
     return module
 

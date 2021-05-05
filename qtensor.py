@@ -27,10 +27,11 @@ class QTensor:
 
     def __init__(self, data, scale:float, zero:int=0, **kwargs):
         self._t = torch.as_tensor(data, **kwargs)
-        # TODO remove this costly assertion after testing !!!!! FIXME:
-        assert torch.allclose(self._t,self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
         self.scale = scale
         self.zero = zero
+
+        # TODO remove this costly assertion after testing !!!!! FIXME:
+        assert torch.allclose(self._t,self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
 
     def dequantize(self) -> torch.Tensor:
         return (self._t - self.zero) * qx.scale

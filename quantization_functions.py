@@ -42,7 +42,7 @@ class Quantization():
     def calc_params(self, min_val, max_val, num_bits=8):
         pass
 
-    def dequantize_tensor(self, q_x: QTensor):
+    def dequantize_qtensor(self, q_x: QTensor):
         pass
 
     def tensor_clamp(self, x: torch.Tensor, num_bits):
@@ -127,11 +127,13 @@ class UniformQuantization(Quantization):
         else:
             if self.nudge_zero or nudge:
                 zero = round(initial_zero)
+            else:
+                zero = initial_zero
 
         return scale, zero
 
-    def dequantize_tensor(self, q_x: QTensor) -> torch.Tensor:
-        return q_x.scale * (q_x._t.float() - q_x.zero)
+    def dequantize_qtensor(self, q_x: QTensor) -> torch.Tensor:
+        return q_x.scale * (q_x._t - q_x.zero)
 
     def tensor_clamp(self, x: torch.Tensor, num_bits) -> torch.Tensor:
         return x.round().clamp(0, 2. ** num_bits - 1.)
@@ -199,8 +201,10 @@ class UniformSymmetricQuantization(Quantization):
 
         return q_x
 
-    def dequantize(self, qx: QTensor) -> torch.Tensor:
+    def dequantize_qtensor(self, qx: QTensor) -> torch.Tensor:
         return (qx._t - qx.zero) * qx.scale
+
+
 
 class FakeQuant(torch.autograd.Function):
     """
@@ -218,8 +222,11 @@ class FakeQuant(torch.autograd.Function):
         :param max_val: EMA max_val, for activation quantization with EMA, don't provide for weight quantization
         :return: x: torch tensor
         """
+        cache = x
         x = quant.quantize_to_qtensor(x, num_bits=num_bits, min_val=min_val, max_val=max_val)
-        x = quant.dequantize_tensor(x)
+        intermediate_cache = x
+        x = quant.dequantize_qtensor(x)
+        assert x is not None, (x, cache, intermediate_cache)
         return x # torch.Tensor
 
     @staticmethod

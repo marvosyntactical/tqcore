@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import copy
 from typing import Dict
 
+import warnings
+
 # custom layers impl procedure:
 
 # What needs to be implemented for any layer:
@@ -88,7 +90,6 @@ def qat_prepare(
             num_bits_bias=num_bits_bias,
             inplace=True, # only deepcopy once, at top level
             is_root_module=False,
-            _stats=_stats,
             _handles=_handles,
             _module_types=_module_types
         )
@@ -117,7 +118,7 @@ def qat_prepare(
         module._num_bits_bias = num_bits_bias
         module._fakeQ = FakeQuant.apply
 
-        # fake quantize weight
+        # fake quantize weights, bias
         pre_hook_handle = module.register_forward_pre_hook(_qat_layer_forward_pre_hook)
 
         _handles[module_number]["qat_pre"] = pre_hook_handle
@@ -136,7 +137,7 @@ def qat_prepare(
 
     elif param_names and not len(module._modules):
         # implement other layer types if this is raised, good luck
-        raise NotImplementedError(f"Dont know how to prepare parameterized leaf module '{module_number}', an instance of {type(module)}")
+        warnings.warn(f"Dont know how to prepare parameterized leaf module '{module_number}', an instance of {type(module)}")
     else:
         is_leaf = descendants_module_number == module_number + 1
         if is_leaf:

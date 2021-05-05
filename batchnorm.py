@@ -8,6 +8,7 @@ from .quantizable_layer import QuantizableModule
 from .qtensor import QTensor
 
 import copy
+from typing import Dict
 
 # wrapped _BatchNorm interface like in the recommendation of RLisfun:
 # https://github.com/pytorch/pytorch/issues/4741
@@ -18,8 +19,9 @@ import copy
 # -> wenn bn.track_running_stats False, setze kurz momentum = 0, sodass kein update passiert
 
 class _QBatchNorm(QuantizableModule, _BatchNorm):
-    def __init__(self, *args, **qkwargs):
-        super().__init__(*args, **qkwargs)
+    def __init__(self, *args, qkwargs: Dict = None, **kwargs):
+        QuantizableModule.__init__(self, **qkwargs)
+        _BatchNorm.__init__(self, *args, **kwargs)
 
     def forward_quantized(x: QTensor) -> QTensor:
         """

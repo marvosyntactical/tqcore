@@ -19,9 +19,8 @@ __DEBUG__ = False
 
 # helper fns
 printdbg = lambda *expr: printdbg(*expr) if __DEBUG__ else None
-tnsr_stats = lambda t, qinp: (round(t.min().item(), 3), round(t.max().item(), 3),qinp.calc_zero_point(t.min().item(), t.max().item(), 8))
-qparams_stats = lambda qparams_dict: tuple(map(lambda fl: round(fl, 3), qparams_dict.values()))
-is_integer = lambda t: (t.round()==t).all()
+tnsr_stats = lambda t, qinp: (round(t.min().item(), 3), round(t.max().item(), 3),qinp.calc_zero(t.min().item(), t.max().item(), 8))
+is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 
 
 
@@ -31,7 +30,7 @@ is_integer = lambda t: (t.round()==t).all()
 
 # ============================= PYTORCH OPS ==================================
 
-def _factory_convert_layer_forward_impl(module, min_val, max_val):
+def _factory_convert_layer_forward_impl(module):
 
     # op-for-op implementation of quantized layers given range params a, b
 
@@ -68,12 +67,11 @@ def _factory_convert_layer_forward_impl(module, min_val, max_val):
             layer=module,
             quant_input=module._Qinp,
             quant_weight=module._Qwt,
-            min_val=min_val,
-            max_val=max_val,
+            min_val=module.__stats__["ema_min"],
+            max_val=module.__stats__["ema_max"],
             num_bits_input=module._num_bits_inp,
             num_bits_weight=module._num_bits_wt,
             num_bits_bias=module._num_bits_bias if hasattr(module, "_num_bits_bias") else None,
-            qparams=module.__qparams__,
             **settings
         )
 
@@ -92,7 +90,6 @@ def _factory_quantized_layer(module:nn.Module):
             num_bits_weight=8,
             num_bits_input=8,
             num_bits_bias=32,
-            qparams=None,
             **kwargs):
 
         # NOTES for stuff to do inside qat_convert.py:
@@ -112,7 +109,7 @@ def _factory_quantized_layer(module:nn.Module):
         :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
-        :return: QTensor: (output, output_scale, output_zero_point)
+        :return: QTensor: (output, output_scale, output_zero)
         """
 
         # here: ganzzahliges x rescalen:
@@ -132,7 +129,7 @@ def _factory_quantized_layer(module:nn.Module):
             **kwargs
         )
 
-        out = out / self.scale_next + self.zero_point_next
+        out = out / layer.scale_next + layer.zero_next
 
         out_before_clamp = tnsr_stats(out, quant_input)
 
@@ -140,9 +137,9 @@ def _factory_quantized_layer(module:nn.Module):
 
         assert is_integer(out), out
 
-        assert len(torch.unique(out)) > 1, (out.mean(), tnsr_stats(x, quant_input),scale_next, zero_point_next, out_before_clamp)
+        assert len(torch.unique(out)) > 1, (out.mean(), tnsr_stats(x, quant_input),scale_next, zero_next, out_before_clamp)
 
-        return QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
 
     def quantized_linear(
             x:torch.Tensor,
@@ -154,7 +151,6 @@ def _factory_quantized_layer(module:nn.Module):
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
-            qparams=None,
             **kwargs):
         """
         Quantized linear layer, functionality according to https://arxiv.org/pdf/1712.05877.pdf, section 2.
@@ -169,7 +165,7 @@ def _factory_quantized_layer(module:nn.Module):
         :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
-        :return: QTensor: (output, output_scale, output_zero_point)
+        :return: QTensor: (output, output_scale, output_zero)
         """
         w = quant_weight.quantize_to_qtensor(
             layer.weight.data,
@@ -187,18 +183,18 @@ def _factory_quantized_layer(module:nn.Module):
         else:
             b = None
 
-        x_zeroed = x._t - qparams["zero_point"]
+        x_zeroed = x._t - x.zero
         w_zeroed = w._t - w.zero
 
         out = F.linear(x_zeroed,  w_zeroed, bias=b, **kwargs)
 
-        multiplier = (x.scale * w.scale) / scale_next
+        multiplier = (x.scale * w.scale) / layer.scale_next
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        out = out * multiplier + zero_point_next
+        out = out * multiplier + layer.zero_next
 
         out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
 
-        return QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
 
     def quantized_conv2d(
             x:torch.Tensor,
@@ -210,7 +206,6 @@ def _factory_quantized_layer(module:nn.Module):
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
-            qparams=None,
             **kwargs
             ):
         """
@@ -226,7 +221,7 @@ def _factory_quantized_layer(module:nn.Module):
         :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
-        :return: QTensor: (output, output_scale, output_zero_point)
+        :return: QTensor: (output, output_scale, output_zero)
         """
 
         w = quant_weight.quantize_to_qtensor(
@@ -274,7 +269,7 @@ def _factory_quantized_layer(module:nn.Module):
 
         # Update activation tensor quantization values
 
-        return QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
 
     def quantized_maxpool2d(
             x:torch.Tensor,
@@ -286,7 +281,6 @@ def _factory_quantized_layer(module:nn.Module):
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
-            qparams=None,
             **kwargs
             ):
         """
@@ -302,7 +296,7 @@ def _factory_quantized_layer(module:nn.Module):
         :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
-        :return: QTensor: (output, output_scale, output_zero_point)
+        :return: QTensor: (output, output_scale, output_zero)
         """
 
         x_zeroed = x._t - x.zero
@@ -325,7 +319,7 @@ def _factory_quantized_layer(module:nn.Module):
         multiplier = x.scale / scale_next
 
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        out = out * multiplier + zero_point_next
+        out = out * multiplier + zero_next
 
         out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
 
@@ -333,10 +327,10 @@ def _factory_quantized_layer(module:nn.Module):
 
         # Update activation tensor quantization values
 
-        return QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
 
     quantized_ops = {
-        BatchNorm1d: non_quantized_batchnorm,
+        nn.BatchNorm1d: non_quantized_batchnorm,
         nn.Linear: quantized_linear,
         nn.Conv2d: quantized_conv2d,
         nn.MaxPool2d: quantized_maxpool2d,
