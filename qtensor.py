@@ -10,7 +10,7 @@ import logging
 logging.basicConfig(level="INFO")
 logqt = logging.getLogger("qt")
 
-logqt.info("QTensor logging started")
+# logqt.info("QTensor logging started")
 
 
 class QTensor:
@@ -34,7 +34,7 @@ class QTensor:
         assert torch.allclose(self._t,self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
 
     def dequantize(self) -> torch.Tensor:
-        return (self._t - self.zero) * qx.scale
+        return (self._t - self.zero) * self.scale
 
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """

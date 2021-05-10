@@ -443,10 +443,10 @@ class QSoftmax(QuantizableModule):
 
 class NonQuantizableModuleWrap(QuantizableModule):
 
-    def __init__(self, module, *args, kwargs={}, **qkwargs):
+    def __init__(self, module, *args, **qkwargs):
         super().__init__(**qkwargs)
 
-        self.fp_module = module(*args, **kwargs)
+        self.fp_module = module
 
         self.in_listener = QListener(
             self,
@@ -472,10 +472,18 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
     def forward_quantized(self, inp: QTensor) -> QTensor:
 
-        out = self.fp_mmodule(fp_inp)
+        fp_inp = inp.dequantize()
 
+        fp_out = self.fp_module(fp_inp)
 
+        q_out = self.quantization.quantize_to_qtensor_using_params(
+            fp_out,
+            scale=self.out_scale_next,
+            zero=self.out_zero_next,
+            num_bits=self.num_bits
+        )
 
+        return q_out
 
 class QReLU6(QuantizableModule):
 

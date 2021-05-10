@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 
-from utils import noNaNs
-
 from typing import Callable, Optional, Dict
 
 from functools import partial
@@ -20,7 +18,8 @@ from .quantizable_layer import \
     QAdd, QMul, QMatMul, \
     QSoftmax, \
     QMask, \
-    QReLU6
+    QReLU6, \
+    NonQuantizableModuleWrap
 
 from .batchnorm import QBatchNorm1dTranspose
 
@@ -172,7 +171,11 @@ class QMultiHeadedAttention(nn.Module):
         self.qMask = QMask(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
-        self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        # self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        self.qsoftmax = NonQuantizableModuleWrap(
+            nn.Softmax(dim=-1),
+            **qkwargs
+        )
 
         self.avMatMul = QMatMul(**qkwargs)
         self.avl = QListener(self.avMatMul, **qkwargs)

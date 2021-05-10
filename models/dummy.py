@@ -4,9 +4,6 @@ import torch.nn.functional as F
 
 import random
 
-# from tinyquant.quantized_layer import *
-# from tinyquant.quantizable_layer import *
-
 check_integer_if_true = lambda x, b: (x==x.round()).all() if b else True
 
 # convbn = ConvBNnofold
