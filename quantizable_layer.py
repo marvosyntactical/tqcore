@@ -155,6 +155,7 @@ class QListener(QuantizableModule):
         return x
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+        assert isinstance(x, QTensor)
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         return x
@@ -375,6 +376,7 @@ class QMask(QuantizableModule):
         return scores
 
     def forward_quantized(self, scores, mask):
+        assert False, type(scores)
         scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero_next)
         return scores
 
@@ -399,6 +401,7 @@ class QSoftmax(QuantizableModule):
 
     def _set_exp_lkp(self, num_bits:int):
         # this range is tailored to uniformquantization
+        alpha=0.01
         self.EXP_STEP_FUN = torch.exp(torch.arange(2.** num_bits)).round()
 
     def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
@@ -421,7 +424,9 @@ class QSoftmax(QuantizableModule):
         numerator = QTensor(exponentiated, scale=self.exp_scale_next, zero=self.exp_zero_next)
         denominator = QTensor(
             1/exponentiated.sum(dim=self.dim).unsqueeze(-1),
-            scale=1/self.exp_scale_next, zero=1/self.exp_zero_next)
+            scale=1/self.exp_scale_next,
+            zero=torch.exp(torch.Tensor([self.exp_zero_next])).round().item()
+        )
 
         print("denominator: scale=",denominator.scale, "zero=",denominator.zero)
 
@@ -434,6 +439,43 @@ class QSoftmax(QuantizableModule):
         )
 
         return r
+
+
+class NonQuantizableModuleWrap(QuantizableModule):
+
+    def __init__(self, module, *args, kwargs={}, **qkwargs):
+        super().__init__(**qkwargs)
+
+        self.fp_module = module(*args, **kwargs)
+
+        self.in_listener = QListener(
+            self,
+            name="in",
+            dont_fakeQ=True,
+            **qkwargs
+        )
+        self.out_listener = QListener(
+            self,
+            name="out",
+            dont_fakeQ=True,
+            **qkwargs
+        )
+
+    def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.fp_module(inp)
+
+    def forward_qat(self, inp: torch.Tensor) -> torch.Tensor:
+        self.in_listener(inp)
+        out =  self.fp_module(inp)
+        self.out_listener(out)
+        return out
+
+    def forward_quantized(self, inp: QTensor) -> QTensor:
+
+        out = self.fp_mmodule(fp_inp)
+
+
+
 
 class QReLU6(QuantizableModule):
 

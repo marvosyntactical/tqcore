@@ -164,7 +164,9 @@ class QMultiHeadedAttention(nn.Module):
         self.q_layer = nn.Linear(dim, num_heads * head_size)
         self.post_ql = QListener(self.q_layer, **qkwargs)
 
-        self.qkMatMul = QMatMul(factor=1./self.head_size**2, **qkwargs)
+        scale = 1./head_size**6
+        # scale = 1./math.sqrt(self.head_size)
+        self.qkMatMul = QMatMul(factor=scale, **qkwargs)
         self.qkl = QListener(self.qkMatMul, **qkwargs)
 
         self.qMask = QMask(**qkwargs)
@@ -212,7 +214,7 @@ class QMultiHeadedAttention(nn.Module):
         # compute scores
         # batch x num_heads x query_len x key_len
         scores = self.qkMatMul(q, k)
-        input(f"Scores stats (please be smol in magnitude): {scores.min().item()}, {scores.max().item()}")
+        # input(f"Scores stats (please be smol in magnitude): {scores.min().item()}, {scores.max().item()}")
         scores = self.qkl(scores)
 
         # apply the mask (if we have one)
