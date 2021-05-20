@@ -5,10 +5,13 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 
 from copy import deepcopy
+from typing import Callable
 
 import logging
 logging.basicConfig(level="INFO")
 logqt = logging.getLogger("qt")
+
+logging.disable()
 
 # logqt.info("QTensor logging started")
 
@@ -31,7 +34,7 @@ class QTensor:
         self.zero = zero
 
         # TODO remove this costly assertion after testing !!!!! FIXME:
-        assert torch.allclose(self._t,self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
+        assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
 
     def dequantize(self) -> torch.Tensor:
         return (self._t - self.zero) * self.scale
@@ -89,8 +92,24 @@ class QTensor:
     def __getattr__(self, attr):
         # for transpose, data, etc
         tensor_attr = getattr(self._t, attr)
+
         if isinstance(tensor_attr, torch.Tensor):
             return QTensor(tensor_attr, scale=self.scale, zero=self.zero)
+        elif isinstance(tensor_attr, Callable):
+            # NOTE: assuming all Tensor methods return Tensors
+            # (this assumption may be wrong, 
+            # => look out for counterexamples and implement them as a method of QTensor separately)
+
+            # list of methods that dont return Tensor:
+            # Tensor.size(dim) -> int (use Tensor.shape instead)
+
+            logqt.warning("VVVVV Invoked QTensor.__getattr__ with unkown Tensor method VVVVV\n")
+            logqt.warning(attr)
+            logqt.warning("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+
+            method_returning_qtensor = lambda *args, **kwargs: \
+                QTensor(tensor_attr(*args, **kwargs), scale=self.scale, zero=self.zero)
+            return method_returning_qtensor
         else:
             return tensor_attr
 

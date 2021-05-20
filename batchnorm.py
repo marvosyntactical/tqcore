@@ -9,6 +9,10 @@ from .qtensor import QTensor
 
 import copy
 from typing import Dict
+import math
+
+__DEBUG__ = True
+is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 
 # wrapped _BatchNorm interface like in the recommendation of RLisfun:
 # https://github.com/pytorch/pytorch/issues/4741
@@ -23,7 +27,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         QuantizableModule.__init__(self, **qkwargs)
         _BatchNorm.__init__(self, *args, **kwargs)
 
-    def forward_quantized(x: QTensor) -> QTensor:
+    def forward_quantized(self, x: QTensor) -> QTensor:
         """
         # NOTES for stuff to do inside qat_convert.py:
         # rewrite/delete convbn.train und setze BN permanent auf track_running_stats=False
@@ -40,9 +44,9 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         # so I can assign these tensors permanently
         # (this falls under optimization tho and would not appease mr knuth)
 
-        gamma = quantization_weight.quantize_to_qtensor(
+        gamma = self.weight_quantization.quantize_to_qtensor(
             self.weight,
-            num_bits=num_bits_weight # int8 or int32 ? TODO test
+            num_bits=self.num_bits_weight # int8 or int32 ? TODO test
         )
 
         numerator_scale = x.scale * gamma.scale
@@ -50,48 +54,48 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         scale_out = math.sqrt(numerator_scale) # siehe overleaf rechnung
         # scale_out = numerator_scale
 
-        mu = quant_weight.quantize_to_qtensor_given_scale(
+        mu = self.weight_quantization.quantize_to_qtensor_given_scale(
             self.running_mean,
             x.scale,
             0,
-            num_bits=num_bits_bias
+            num_bits=self.num_bits_bias
         )
 
-        sigma =  quant_weight.quantize_to_qtensor_given_scale(
+        sigma =  self.weight_quantization.quantize_to_qtensor_given_scale(
             self.running_var,
             denominator_scale,
             0,
-            num_bits=num_bits_weight
+            num_bits=self.num_bits_weight
         )
 
-        epsilon = quant_weight.quantize_to_qtensor_given_scale(
+        epsilon = self.weight_quantization.quantize_to_qtensor_given_scale(
             torch.Tensor([self.eps]),
             denominator_scale,
             0,
-            num_bits=num_bits_weight
+            num_bits=self.num_bits_weight
         )
 
         if self.bias is not None:
-
             # TODO if block removen? bn sollte immer bias haben
-            beta = quant_weight.quantize_to_qtensor_given_scale(
+            beta = self.weight_quantization.quantize_to_qtensor_given_scale(
                 self.bias,
                 scale_out,
                 0,
-                num_bits=num_bits_bias
+                num_bits=self.num_bits_bias
             ) # as in prep
 
             beta = beta._t
         else:
             beta = None
 
-        assert self.training, "batchnorm must have .training==True always, see top of batchnorm.py"
-        assert not self.track_running_stats, "see batchnorm.py"
+        assert not self.track_running_stats, "<-- this attr indicates whether we are training; forward_quantized is for inference only"
 
-        _, exponential_average_factor = self.do_checks(x._t)
+        x_tensor = x._t
+
+        bn_training, exponential_average_factor = self.do_checks(x_tensor)
 
         r = F.batch_norm(
-            input=x._t - x.zero,
+            input=x_tensor - x.zero,
             running_mean=mu._t,
             running_var=sigma._t,
             weight=gamma._t - gamma.zero,
@@ -105,11 +109,11 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         out = r * multiplier + self.zero_next
 
-        out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
+        out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
         assert is_integer(out), out
 
-        assert len(torch.unique(out)) > 1, (out.mean(), tnsr_stats(x, quant_input), multiplier, zero_point_next, out_before)
+        assert len(torch.unique(out)) > 1, (out.min(), x.min(), x.max(), multiplier, self.zero_next, self.scale_next)
 
         return QTensor(out, scale=self.scale_next, zero=self.zero_next)
 
@@ -201,19 +205,19 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
     def forward_fp(self, x):
         x = torch.transpose(x,1,2)
-        x = super().forward_fp(x)
+        x = _QBatchNorm.forward_fp(self, x)
         x = torch.transpose(x,1,2)
         return x
 
     def forward_qat(self, x):
         x = torch.transpose(x,1,2)
-        x = super().forward_qat(x)
+        x = _QBatchNorm.forward_qat(self, x)
         x = torch.transpose(x,1,2)
         return x
 
-    def forward_quantize(self, x):
+    def forward_quantized(self, x):
         x = torch.transpose(x,1,2)
-        x = super().forward_quantize(x)
+        x = _QBatchNorm.forward_quantized(self, x)
         x = torch.transpose(x,1,2)
         return x
 

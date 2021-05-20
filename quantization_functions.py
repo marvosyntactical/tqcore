@@ -59,7 +59,7 @@ class UniformQuantization(Quantization):
     Code a la
     https://github.com/google/gemmlowp/blob/master/doc/quantization_example.cc
     """
-    def __init__(self, nudge_zero=False):
+    def __init__(self, nudge_zero=True):
         self.nudge_zero = nudge_zero
 
     def _quantize_tensor_using_params(self, x:torch.Tensor, scale, zero=0, num_bits=8):
@@ -102,7 +102,7 @@ class UniformQuantization(Quantization):
 
         return q_x
 
-    def calc_params(self, min_val, max_val, num_bits=8, nudge=False):
+    def calc_params(self, min_val, max_val, num_bits=8, nudge=True):
         qmin = 0.
         qmax = 2. ** num_bits - 1.
 
@@ -222,11 +222,8 @@ class FakeQuant(torch.autograd.Function):
         :param max_val: EMA max_val, for activation quantization with EMA, don't provide for weight quantization
         :return: x: torch tensor
         """
-        cache = x
         x = quant.quantize_to_qtensor(x, num_bits=num_bits, min_val=min_val, max_val=max_val)
-        intermediate_cache = x
         x = quant.dequantize_qtensor(x)
-        assert x is not None, (x, cache, intermediate_cache)
         return x # torch.Tensor
 
     @staticmethod

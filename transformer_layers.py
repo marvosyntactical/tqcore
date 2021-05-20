@@ -171,11 +171,11 @@ class QMultiHeadedAttention(nn.Module):
         self.qMask = QMask(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
-        # self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
-        self.qsoftmax = NonQuantizableModuleWrap(
-            nn.Softmax(dim=-1),
-            **qkwargs
-        )
+        self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        # self.qsoftmax = NonQuantizableModuleWrap(
+        #     nn.Softmax(dim=-1),
+        #     **qkwargs
+        # )
 
         self.avMatMul = QMatMul(**qkwargs)
         self.avl = QListener(self.avMatMul, **qkwargs)
@@ -193,7 +193,7 @@ class QMultiHeadedAttention(nn.Module):
         :param mask: optional mask [B, 1, W]
         :return:
         """
-        batch_size = k.size(0)
+        batch_size = k.shape[0]
         num_heads = self.num_heads
 
         # project the queries (q), keys (k), and values (v)
@@ -367,18 +367,20 @@ class QTransformerEncoder(nn.Module):
     From https://github.com/joeynmt/joeynmt/blob/master/joeynmt/encoders.py
     """
 
-    def __init__(self,
-                 src_dim: int = 187,
-                 dim: int = 512,
-                 ff_size: int = 2048,
-                 num_layers: int = 8,
-                 num_heads: int = 4,
-                 dropout: float = 0.1,
-                 emb_dropout: float = 0.1,
-                 freeze: bool = False,
-                 time_window: int = 24,
-                 activ: str = "nn.ReLU6",
-                 qkwargs: Dict = None):
+    def __init__(
+             self,
+             src_dim: int = 187,
+             dim: int = 512,
+             ff_size: int = 2048,
+             num_layers: int = 8,
+             num_heads: int = 4,
+             dropout: float = 0.1,
+             emb_dropout: float = 0.1,
+             freeze: bool = False,
+             time_window: int = 24,
+             activ: str = "nn.ReLU6",
+             qkwargs: Dict = None
+        ):
         """
         Initializes the Transformer. NOTE: you still have to set self.mu, self.sigma later!
         :param src_dim: dimensionality of data
