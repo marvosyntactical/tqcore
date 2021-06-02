@@ -1,5 +1,6 @@
 import torch
 from torch import Tensor
+from torch.fft import fft
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -157,12 +158,15 @@ class QListener(QuantizableModule):
                 self.__stats__["ema_min"],
                 self.__stats__["ema_max"]
             )
+        print("listener qat output type: ",type(x))
         return x
 
     def forward_quantized(self, x: QTensor) -> QTensor:
         assert isinstance(x, QTensor)
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
+        assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
+        print("asserted stuff;", len(torch.unique(x._t)))
         return x
 
     def _update_ema_stats(self, x):
@@ -247,7 +251,7 @@ class QListener(QuantizableModule):
 
 def _qmul(
         a: QTensor, b: QTensor, factor: float,
-        scale_next, zero_next, torchOp,
+        scale_next, zero_next, op,
         quantization, weight_quantization,
         num_bits, num_bits_weight
     ) -> QTensor:
@@ -286,7 +290,7 @@ def _qmul(
     a_zeroed = a._t - round(a.zero)
     b_zeroed = b._t - round(b.zero)
 
-    r: torch.Tensor = torchOp(a_zeroed, b_zeroed)
+    r: torch.Tensor = op(a_zeroed, b_zeroed)
     r_float = r
 
     multiplier = (a.scale * b.scale * factor) / scale_next
@@ -297,6 +301,7 @@ def _qmul(
     # round and clamp
     r = quantization.tensor_clamp(r, num_bits=num_bits)
 
+    # Make sure we didnt move outside of EMA range:
     assert r.min() != r.max(), \
         (scale_next, zero_next, r.min(), a._t.min(), a._t.max(), b._t.min(), b._t.max(), r_float.min(), r_float.max(), r_unclamped.min(), r_unclamped.max(), multiplier, factor)
 
@@ -384,8 +389,6 @@ class QMask(QuantizableModule):
 
     def forward_quantized(self, scores, mask):
         scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero_next)
-        print(self.zero_next)
-
         return scores
 
 class QSoftmax(QuantizableModule):
@@ -420,7 +423,8 @@ class QSoftmax(QuantizableModule):
     def _scaled_exp(self, inp: torch.Tensor):
         # (differentiable)
         exponent = self.alpha * inp
-        out = torch.exp(exponent.clamp(max=78.))
+        # out = torch.exp(exponent.clamp(max=78.))
+        out = torch.exp(exponent)
 
         assert not torch.isinf(out).sum(), f"QSoftmax._scaled_exp produced a ratio of {torch.isinf(out).sum()/(out==out).sum()} infs"
         return out
@@ -429,22 +433,27 @@ class QSoftmax(QuantizableModule):
         # this range is tailored to uniformquantization
         self.EXP_STEP_FUN = self._scaled_exp(torch.arange(2.**self.num_bits)).round()
 
-    def _exp_lkp(self, long_tensor):
+    def _exp_lkp(self, long_tensor: torch.LongTensor):
         # (not differentiable)
         return QTensor(self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale_next, zero=self.exp_zero_next)
 
     def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
-        return inp.softmax(dim=self.dim)
+        out = inp.softmax(dim=self.dim)
+        # print("Softmax return:")
+        # print(torch.unique(out))
+        return out
 
     def forward_qat(self, inp: torch.Tensor) -> torch.Tensor:
         self.exp_listener(inp)
 
-        print(inp.min(), inp.max())
-        
+        # LogSumExp trick:
         numerator = self._scaled_exp(inp-inp.max())
         out = numerator/numerator.sum(dim=self.dim).unsqueeze(self.dim)
 
         out = self.norm_listener(out)
+
+        # print("Softmax return:")
+        # print(torch.unique(out))
         return out
 
     def quantize(self):
@@ -465,6 +474,9 @@ class QSoftmax(QuantizableModule):
         M = exponentiated.scale / (self.normed_scale_next * self.alpha)
         normed_exp = (zeroed_exp * M) + self.normed_zero_next
         r = self.quantization.tensor_clamp(normed_exp, num_bits=self.num_bits)
+
+        # print("Softmax return:")
+        # print(torch.unique(r))
 
         # NOTE: v Dequantized Implementation, leads to random performance after quantizing
         # r: torch.Tensor = (QTensor(inp._t * self.alpha, scale=inp.scale, zero=inp.zero)).dequantize().softmax(dim=self.dim)
@@ -515,13 +527,15 @@ class NonQuantizableModuleWrap(QuantizableModule):
             **qkwargs
         )
 
-    def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
-        return self.fp_module(inp)
+    def forward_fp(self, inp: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        return self.fp_module(inp, *args, **kwargs)
 
-    def forward_qat(self, inp: torch.Tensor) -> torch.Tensor:
+    def forward_qat(self, inp: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         # dequantize fake quantized torch.Tensor, do fp fwd pass, and re-fakequantize
 
-        assert False, f"fix fwd qat of nonquantmodule: dont know how to rescale tensor to be of float scale"
+        # FIXME FIXME FIXME TODO FIXME FIXME FIXME
+        # assert False, f"fix fwd qat of nonquantmodule: dont know how to rescale tensor to be of float scale"
+        print(inp, inp.dtype)
 
         fakeq_inp = self.in_listener(inp)
 
@@ -535,17 +549,17 @@ class NonQuantizableModuleWrap(QuantizableModule):
         #     inp.round(), scale=in_scale, zero=in_zero
         # ).dequantize()
 
-        out = self.fp_module(fakeq_inp)
+        out = self.fp_module(fakeq_inp, *args, **kwargs)
 
         fakeq_out = self.out_listener(out)
 
         return fakeq_out
 
-    def forward_quantized(self, inp: QTensor) -> QTensor:
+    def forward_quantized(self, inp: QTensor, *args, **kwargs) -> QTensor:
 
         fp_inp = inp.dequantize()
 
-        fp_out = self.fp_module(fp_inp)
+        fp_out = self.fp_module(fp_inp, *args, **kwargs)
 
         q_out = self.quantization.quantize_to_qtensor_using_params(
             fp_out,
@@ -745,6 +759,24 @@ class ConvBNfoldable(QuantizableModule):
         if self.has_relu:
             x = self.relu(x)
 
+        return x
+
+class FFT(nn.Module):
+    # move this to ..modules.py
+
+    # TODO implement init and make quantizable FIXME
+
+    # TODO figure out mask
+
+    # figure out whether to orthonormalize (scale by 1/sqrt(n))
+    # paper: vandermonde matrix has normalization
+    # third party code. no normalization
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        x = fft(fft(x, dim=-1), dim=-2).real
         return x
 
 

@@ -19,6 +19,7 @@ from .quantizable_layer import \
     QSoftmax, \
     QMask, \
     QReLU6, \
+    FFT, \
     NonQuantizableModuleWrap
 
 from .batchnorm import QBatchNorm1dTranspose
@@ -172,10 +173,6 @@ class QMultiHeadedAttention(nn.Module):
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
         self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
-        # self.qsoftmax = NonQuantizableModuleWrap(
-        #     nn.Softmax(dim=-1),
-        #     **qkwargs
-        # )
 
         self.avMatMul = QMatMul(**qkwargs)
         self.avl = QListener(self.avMatMul, **qkwargs)
@@ -225,7 +222,9 @@ class QMultiHeadedAttention(nn.Module):
         if mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(1)
             scores = self.qMask(scores, mask)
-            self.qMaskl(scores)
+            print(f"Got mask={mask!=0}")
+            print(f"qMaskl was activated!!! qMaskl.__stats__: {self.qMaskl.__stats__}")
+        self.qMaskl(scores)
 
         # normalize context vectors.
         attention = self.qsoftmax(scores)
@@ -291,6 +290,7 @@ class QTransformerEncoderLayer(nn.Module):
              time_window: int = 50,
              bn_mom: float = 0.9,
              activ: str = "nn.ReLU6",
+             fft: bool = False,
              qkwargs: Dict = None,
              **kwargs
         ):
@@ -304,14 +304,22 @@ class QTransformerEncoderLayer(nn.Module):
         """
         super().__init__()
 
-        self.src_src_att = QMultiHeadedAttention(
-            num_heads, dim,
-            dropout=dropout, **qkwargs)
+        if not fft:
+            self.src_src_att = QMultiHeadedAttention(
+                num_heads, dim,
+                dropout=dropout, **qkwargs)
+            mixer_output_layer = [self.src_src_att.output_layer]
+            self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
+        else:
+            self.fft = NonQuantizableModuleWrap(FFT(), **qkwargs)
+            mixer_output_layer = []
+            self.mixer = lambda x, mask: self.fft(x, mask)
+
+
         self.dropout1 = nn.Dropout(dropout)
         self.add1 = QAdd(**qkwargs)
         self.qRes1 = QListener(
-            self.add1,
-            self.src_src_att.output_layer,
+            * [self.add1] + mixer_output_layer,
             **qkwargs)
 
         self.norm1 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
@@ -344,7 +352,7 @@ class QTransformerEncoderLayer(nn.Module):
         :return: output tensor
         """
 
-        h = self.src_src_att(x, x, x, mask)
+        h = self.mixer(x, mask)
 
         sum1 = self.add1(h, self.dropout1(x))
         sum1 = self.qRes1(sum1)
@@ -379,6 +387,7 @@ class QTransformerEncoder(nn.Module):
              freeze: bool = False,
              time_window: int = 24,
              activ: str = "nn.ReLU6",
+             fft: bool = False,
              qkwargs: Dict = None
         ):
         """
@@ -408,7 +417,7 @@ class QTransformerEncoder(nn.Module):
         self.layers = nn.ModuleList([
             QTransformerEncoderLayer(dim=dim, ff_size=ff_size,
                 num_heads=num_heads, dropout=dropout,
-                time_window=time_window, activ=activ, qkwargs=qkwargs)
+                time_window=time_window, activ=activ, fft=fft, qkwargs=qkwargs)
             for _ in range(num_layers)])
 
         if freeze:
@@ -448,9 +457,16 @@ class QTransformerEncoder(nn.Module):
         return x
 
     def __repr__(self):
-        return "%s(num_layers=%r, num_heads=%r)" % (
-            self.__class__.__name__, len(self.layers),
-            self.layers[0].src_src_att.num_heads)
+        if hasattr(self.layers[0], "src_src_att"):
+            s = "%s(num_layers=%r, num_heads=%r)" % (
+                self.__class__.__name__, len(self.layers),
+                self.layers[0].src_src_att.num_heads
+            )
+        else:
+            s = "%s(num_layers=%r, fft=True)" % (
+                self.__class__.__name__, len(self.layers)
+            )
+        return s
 
 class QTSTModel(nn.Module):
     """
@@ -472,6 +488,7 @@ class QTSTModel(nn.Module):
             task: str = "pretrain", # regression/pretraining/classification
             n_labels: int = 10, # classification only
             fc_dropout: float = 0.0,
+            fft: bool = False,
             qkwargs: Dict = None,
             **kwargs # settings for quantizable modules
         ):
@@ -491,6 +508,7 @@ class QTSTModel(nn.Module):
                 freeze=freeze,
                 time_window=time_window,
                 activ=activ,
+                fft=fft,
                 qkwargs=qkwargs,
             )
 
