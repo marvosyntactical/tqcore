@@ -762,7 +762,7 @@ class ConvBNfoldable(QuantizableModule):
         return x
 
 class FFT(nn.Module):
-    # move this to ..modules.py
+    # TODO move this to ..modules.py
 
     # TODO implement init and make quantizable FIXME
 
