@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from torch.fft import fft
+from torch.fft import fft, fft2
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -761,6 +761,14 @@ class ConvBNfoldable(QuantizableModule):
 
         return x
 
+
+def DiscreteHartleyTransform(input):
+    # from https://github.com/AlbertZhangHIT/Hartley-spectral-pooling/blob/master/spectralpool.py
+    # TODO test as alternative
+    fft = torch.rfft(input, 2, normalized=True, onesided=False)
+    dht = fft[:, :, :, :, -2] - fft[:, :, :, :, -1]
+    return dht
+
 class FFT(nn.Module):
     # move this to ..modules.py
 
@@ -776,7 +784,10 @@ class FFT(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        x = fft(fft(x, dim=-1), dim=-2).real
+
+        # x = fft(fft(x, dim=-1), dim=-2).real
+        x = fft2(x)
+        x = x.real #  + x.imag
         return x
 
 
