@@ -19,10 +19,14 @@ from .quantizable_layer import \
     QSoftmax, \
     QMask, \
     QReLU6, \
+    QFFT, \
     FFT, \
     NonQuantizableModuleWrap
 
 from .batchnorm import QBatchNorm1dTranspose
+
+# FIXME remove this: (should have no dependency on tst)
+from tst.modules import MultiHeadedAttention
 
 # this file contains quantized versions of layers used in tst_pytorch/modules.py
 
@@ -166,6 +170,8 @@ class QMultiHeadedAttention(nn.Module):
 
         scale = 1./head_size**6
         # scale = 1./math.sqrt(self.head_size)
+        assert False, "remember to correct scale"
+
         self.qkMatMul = QMatMul(factor=scale, **qkwargs)
         self.qkl = QListener(self.qkMatMul, **qkwargs)
 
@@ -295,23 +301,32 @@ class QTransformerEncoderLayer(nn.Module):
              **kwargs
         ):
         """
-        A single Transformer layer.
+        A single quantizable Transformer layer.
         :param dim:
         :param ff_size:
         :param num_heads:
         :param dropout:
-        :param qkwargs: keyword args QListener
+        :param qkwargs: keyword args for QListener
         """
         super().__init__()
 
         if not fft:
-            self.src_src_att = QMultiHeadedAttention(
-                num_heads, dim,
-                dropout=dropout, **qkwargs)
-            mixer_output_layer = [self.src_src_att.output_layer]
+            # self.src_src_att = QMultiHeadedAttention(
+            #     num_heads, dim,
+            #     dropout=dropout, **qkwargs)
+            self.src_src_att = NonQuantizableModuleWrap(
+                MultiHeadedAttention(
+                    num_heads, dim, dropout=dropout
+                ), **qkwargs
+            )
+
+            mixer_output_layer = [self.src_src_att.fp_module.output_layer]
+            # mixer_output_layer = [self.src_src_att.output_layer]
             self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
         else:
             self.fft = NonQuantizableModuleWrap(FFT(), **qkwargs)
+            # self.fft = QFFT(**qkwargs)
+
             mixer_output_layer = []
             self.mixer = lambda x, mask: self.fft(x, mask)
 
@@ -395,7 +410,7 @@ class QTransformerEncoder(nn.Module):
         :param src_dim: dimensionality of data
         :param dim: hidden size and size of embeddings
         :param ff_size: position-wise feed-forward layer size.
-          (Typically this is 2*dim.)
+          (Typically this is 2*dim)
         :param num_layers: number of layers
         :param num_heads: number of heads for multi-headed attention
         :param dropout: dropout probability for Transformer layers
@@ -411,7 +426,6 @@ class QTransformerEncoder(nn.Module):
 
         self.quantStub = Quant(**qkwargs)
         self.input_listener = QListener(self.quantStub, **qkwargs)
-        # assert False, (id(self.quantStub.__stats__), id(self.input_listener.__stats__))
 
         # build all (num_layers) layers
         self.layers = nn.ModuleList([
@@ -460,7 +474,8 @@ class QTransformerEncoder(nn.Module):
         if hasattr(self.layers[0], "src_src_att"):
             s = "%s(num_layers=%r, num_heads=%r)" % (
                 self.__class__.__name__, len(self.layers),
-                self.layers[0].src_src_att.num_heads
+                self.layers[0].src_src_att.fp_module.num_heads
+                # self.layers[0].src_src_att.num_heads
             )
         else:
             s = "%s(num_layers=%r, fft=True)" % (

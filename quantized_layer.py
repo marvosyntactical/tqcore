@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from .qtensor import QTensor
 from .quantization_functions import Quantization
 from .batchnorm import *
+from .quantizable_layer import NonQuantizableModuleWrap
 
 import math
 
@@ -347,6 +348,10 @@ OPS = [
     nn.MaxPool2d
 ]
 
+# ignore subclasses of these:
+NONQUANT = [
+    NonQuantizableModuleWrap
+]
 
 
 

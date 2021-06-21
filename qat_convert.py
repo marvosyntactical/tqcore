@@ -12,7 +12,8 @@ if TRANSFORMER:
 
 from .quantizable_layer import *
 
-from .quantized_layer import _factory_convert_layer_forward_impl, OPS
+from .quantized_layer import _factory_convert_layer_forward_impl, \
+        OPS, NONQUANT
 
 from .quantization_functions import *
 
@@ -90,26 +91,29 @@ def convert_module(
 
     assert isinstance(_handles, dict) and _handles, f"'_handles' argument needs to be dict of pre/post fwd hook handles of model modules and not {type(_handles)} {_handles}"
 
+    mod_type = type(module)
+
+    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+
+    if is_nonquantizable:
+        # do not recurse to children
+        return module
+
     #1. convert forward passes of all internal modules to handle only quantized tensors
 
     for name, layer in module.named_children():
 
         # ===== DFS down module graph ========
 
-        try:
-            convert_module(
-                layer,
-                leave_first_and_last_layer=leave_first_and_last_layer,
-                leave_layers=leave_layers,
-                _handles=_handles,
-                _module_types=_module_types,
-                is_root_module=False,
-                inplace=True
-            )
-        except KeyError as KE:
-            print(KE)
-            print(name)
-            input()
+        convert_module(
+            layer,
+            leave_first_and_last_layer=leave_first_and_last_layer,
+            leave_layers=leave_layers,
+            _handles=_handles,
+            _module_types=_module_types,
+            is_root_module=False,
+            inplace=True
+        )
 
     # 2. convert known layer types and remove forward hooks on a basis of spaghetti
 
@@ -129,7 +133,6 @@ def convert_module(
     # ################  end remove pre / post hooks ###################
 
     dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
-    mod_type = type(module)
 
     is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
 

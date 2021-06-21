@@ -74,8 +74,19 @@ def qat_prepare(
         module.module_types = {}
         _module_types = module.module_types
 
-    # increment DFS counter by 1 for current module before diving down further
+    mod_type = type(module)
+
     descendants_module_number = module_number + 1
+
+    module._module_number = module_number
+    module._parent_number = parent_number
+
+    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+    if is_nonquantizable:
+        # do not recurse to children
+        return module, descendants_module_number
+
+    # increment DFS counter by 1 for current module before diving down further
     for name, layer in module.named_children():
 
         # ===== DFS down module graph ========
@@ -94,14 +105,12 @@ def qat_prepare(
             _module_types=_module_types
         )
 
-    module._module_number = module_number
-    module._parent_number = parent_number
+    # ---------- PREPARE DIFFERENT MODULES CASE BY CASE --------- #
+
     _handles[module_number] = dict()
     _module_types[module_number] = type(module)
-
     param_names = [name for name, _ in module.named_parameters()]
 
-    # ---------- PREPARE DIFFERENT MODULES CASE BY CASE --------- #
 
     if isinstance(module, QuantizableModule):
         # most custom modules in .quantizable_layer; _QBatchNorm in .batchnorm

@@ -122,7 +122,7 @@ class QListener(QuantizableModule):
     (no other module records stats)
     Accepts an iterable of modules for each of which the QListener sets the module.scale_next attribute and so on
     """
-    def __init__(self, *modules: nn.Module, name = None, function = None, dont_fakeQ: bool = False, ema_decay: float = .9999, nudge_zero: bool = False, **qkwargs):
+    def __init__(self, *modules: nn.Module, name = None, function = None, dont_fakeQ: bool = False, ema_decay: float = .9999, nudge_zero: bool = False, collect_during_fp: bool = False, **qkwargs):
 
         super().__init__(**qkwargs)
 
@@ -139,7 +139,13 @@ class QListener(QuantizableModule):
         if not dont_fakeQ:
             self.fake_quantize = FakeQuant.apply
 
-    def forward_qat(self, x: Tensor):
+        # what phase to collect stats in:
+        self.collect_during_fp = bool(collect_during_fp)
+        # should be left at False always except for
+        # the QListener of NonQuantizableModule
+        self._ranges_set = False
+
+    def _forward(self, x: Tensor):
         """
         Collect stats AND fakequantize
         """
@@ -158,15 +164,32 @@ class QListener(QuantizableModule):
                 self.__stats__["ema_min"],
                 self.__stats__["ema_max"]
             )
-        print("listener qat output type: ",type(x))
+        # print("QListener stat aware output type: ",type(x))
+        return x
+
+    def forward_fp(self, x: Tensor):
+        if self.collect_during_fp:
+            x = self._forward(x)
+        return x
+
+    def forward_qat(self, x: Tensor):
+        if not self.collect_during_fp:
+            x = self._forward(x)
+        else:
+            # collected stats during fp (for NonQuantizableModule)
+            # set ranges now if not existent
+            if not self._ranges_set:
+                self.set_ranges()
         return x
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+
         assert isinstance(x, QTensor)
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
         print("asserted stuff;", len(torch.unique(x._t)))
+
         return x
 
     def _update_ema_stats(self, x):
@@ -225,8 +248,10 @@ class QListener(QuantizableModule):
             exec(f"module.{self.name+'__stats__'} = self.__stats__")
 
     def quantize(self):
-        super().quantize()
+        self.set_ranges()
+        return super().quantize()
 
+    def set_ranges(self):
         stats = self.__stats__
 
         try:
@@ -247,6 +272,8 @@ class QListener(QuantizableModule):
             setattr(mod, prefix+"zero_next", zero_next)
             setattr(mod, prefix+"min_val", stats["ema_min"])
             setattr(mod, prefix+"max_val", stats["ema_max"])
+
+        self._ranges_set = True
 
 
 def _qmul(
@@ -507,7 +534,6 @@ class QSoftmax(QuantizableModule):
 
         return r
 
-
 class NonQuantizableModuleWrap(QuantizableModule):
 
     def __init__(self, module, *args, **qkwargs):
@@ -515,56 +541,82 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         self.fp_module = module
 
-        self.in_listener = QListener(
+        self.in_fp_listener = QListener(
             self,
-            name="in",
+            name="in_fp",
+            dont_fakeQ=True,
+            collect_during_fp=True,
+            **qkwargs
+        )
+
+        self.out_fp_listener = QListener(
+            self,
+            name="out_fp",
+            dont_fakeQ=True,
+            collect_during_fp=True,
+            **qkwargs
+        )
+
+        self.in_qat_listener = QListener(
+            self,
+            name="in_qat",
             dont_fakeQ=True,
             **qkwargs
         )
-        self.out_listener = QListener(
+
+        self.out_qat_listener = QListener(
             self,
-            name="out",
+            name="out_qat",
+            dont_fakeQ=False,
             **qkwargs
         )
 
     def forward_fp(self, inp: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.fp_module(inp, *args, **kwargs)
+
+        self.in_fp_listener(inp)
+        r = self.fp_module(inp, *args, **kwargs)
+        self.out_fp_listener(inp)
+
+        return r
 
     def forward_qat(self, inp: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         # dequantize fake quantized torch.Tensor, do fp fwd pass, and re-fakequantize
 
-        # FIXME FIXME FIXME TODO FIXME FIXME FIXME
-        # assert False, f"fix fwd qat of nonquantmodule: dont know how to rescale tensor to be of float scale"
-        print(inp, inp.dtype)
+        self.in_fp_listener(inp)
 
-        fakeq_inp = self.in_listener(inp)
+        self.in_qat_listener(inp)
 
-        # min_val = self.in_listener.__stats__.get("ema_min")
-        # max_val = self.in_listener.__stats__.get("ema_max")
+        qmin_val = self.in_qat_listener.__stats__.get("ema_min")
+        qmax_val = self.in_qat_listener.__stats__.get("ema_max")
 
-        # in_scale, in_zero = self.quantization.calc_params(
-        #     min_val, max_val, num_bits=self.num_bits
-        # )
-        # fp_inp = QTensor(
-        #     inp.round(), scale=in_scale, zero=in_zero
-        # ).dequantize()
+        qin_scale, qin_zero = self.quantization.calc_params(
+            qmin_val, qmax_val, num_bits=self.num_bits
+        )
 
-        out = self.fp_module(fakeq_inp, *args, **kwargs)
+        dequantized = (inp - qin_zero) * qin_scale
+        print(f"nonQ QAT params: {qin_zero}, {qin_scale}")
 
-        fakeq_out = self.out_listener(out)
+        fp_inp = dequantized / self.in_fp_scale_next + self.in_fp_zero_next
+
+        fp_out = self.fp_module(fp_inp, *args, **kwargs)
+
+        fakeq_out = self.out_qat_listener(fp_out)
 
         return fakeq_out
 
     def forward_quantized(self, inp: QTensor, *args, **kwargs) -> QTensor:
+        print(f"nonQ QAT params: {inp.zero}, {inp.scale}")
 
         fp_inp = inp.dequantize()
+
+        fp_inp = fp_inp / self.in_fp_scale_next + self.in_fp_zero_next
 
         fp_out = self.fp_module(fp_inp, *args, **kwargs)
 
         q_out = self.quantization.quantize_to_qtensor_using_params(
             fp_out,
-            scale=self.out_scale_next,
-            zero=self.out_zero_next,
+            scale=self.out_qat_scale_next,
+            zero=self.out_qat_zero_next,
             num_bits=self.num_bits
         )
 
@@ -772,13 +824,11 @@ def DiscreteHartleyTransform(input):
 class FFT(nn.Module):
     # TODO move this to ..modules.py
 
-    # TODO implement init and make quantizable FIXME
-
     # TODO figure out mask
 
     # figure out whether to orthonormalize (scale by 1/sqrt(n))
     # paper: vandermonde matrix has normalization
-    # third party code. no normalization
+    # third party code: no normalization
 
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -789,5 +839,38 @@ class FFT(nn.Module):
         x = fft2(x)
         x = x.real #  + x.imag
         return x
+
+class QFFT(QuantizableModule):
+    # TODO figure out mask
+
+    # figure out whether to orthonormalize (scale by 1/sqrt(n))
+    # paper: vandermonde matrix has normalization
+    # third party code: no normalization
+
+    def __init__(self, *args, **kwargs):
+        assert False, NotImplemented
+        super().__init__()
+
+    def forward_fp(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        assert False, NotImplemented
+
+        # x = fft(fft(x, dim=-1), dim=-2).real
+        x = fft2(x)
+        x = x.real #  + x.imag
+        return x
+
+    def forward_qat(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        assert False, NotImplemented
+        x = fft2(x)
+        x = x.real #  + x.imag
+        return x
+
+    def forward_quantized(self, x: QTensor, mask: Optional[torch.Tensor] = None):
+        assert False, NotImplemented
+        x = fft2(x)
+        x = x.real #  + x.imag
+        return x
+
+
 
 
