@@ -35,10 +35,14 @@ def _qat_layer_forward_pre_hook(mod:nn.Module, inp:torch.Tensor) -> None:
     # use for linear, conv, batchnorm
 
     # weights are not clamped to range (hence None, None for min_val, max_val)
-    mod.weight.data = mod._fakeQ(mod.weight.data, mod._Qwt, mod._num_bits_wt, None, None)
+    mod.weight.data = mod._fakeQ(
+        mod.weight.data, mod._Qwt, mod._num_bits_wt, None, None, False
+    )
 
     if mod.bias is not None:
-        mod.bias.data = mod._fakeQ(mod.bias.data, mod._Qwt, mod._num_bits_bias, None, None)
+        mod.bias.data = mod._fakeQ(
+            mod.bias.data, mod._Qwt, mod._num_bits_bias, None, None, False
+        )
 
 def qat_prepare(
         module: nn.Module,

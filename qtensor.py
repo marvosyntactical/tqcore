@@ -15,7 +15,6 @@ logging.disable()
 
 # logqt.info("QTensor logging started")
 
-
 class QTensor:
     r"""
     A duck typed Tensor wrapper.
@@ -28,15 +27,18 @@ class QTensor:
     because you still need to reimplement everything used).
     """
 
-    def __init__(self, data, scale:float, zero:int=0, **kwargs):
+    def __init__(self, data, scale:float, zero:int=0, quantized=True, **kwargs):
         self._t = torch.as_tensor(data, **kwargs)
         self.scale = scale
         self.zero = zero
+        self.quantized = bool(quantized)
 
-        # TODO remove this costly assertion after testing !!!!! FIXME:
-        assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
+        if self.quantized:
+            # TODO remove this costly assertion after testing !!!!! FIXME:
+            assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
 
     def dequantize(self) -> torch.Tensor:
+        assert not self.quantized
         return (self._t - self.zero) * self.scale
 
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -57,11 +59,14 @@ class QTensor:
         if kwargs is None:
             kwargs = {}
 
+        quantized_or_not = [a.quantized if isinstance(a, QTensor) else (False if isinstance(a,Tensor) else True) for a in args]
+        assert len(set(quantized_or_not)) == 1, [type(a) for a in args] # either all quantized or none quantized
+
         if func in HANDLED_FUNCTIONS and all(
                 issubclass(t, (torch.Tensor, QTensor))
                 for t in types
             ):
-                logqt.info("VVVVV Invoked __torch_function__ with known func VVVVV\n")
+                logqt.info("VVVVV Invoked QTensor __torch_function__ with known func VVVVV\n")
                 logqt.info(func)
                 logqt.info(types)
                 logqt.info("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
@@ -69,25 +74,29 @@ class QTensor:
                 return HANDLED_FUNCTIONS[func](*args, **kwargs)
         else:
 
-            logqt.warning("VVVVV Invoked __torch_function__ with unkown func VVVVV\n")
+            logqt.warning("VVVVV Invoked QTensor __torch_function__ with unkown func VVVVV\n")
             logqt.warning(func)
             logqt.warning(types)
             logqt.warning("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
             tensor_args = [a._t if isinstance(a, QTensor) else a for a in args]
             ret = func(*tensor_args, **kwargs)
-            return QTensor(ret, scale=args[0].scale, zero=args[0].zero)
+            return QTensor(ret, scale=args[0].scale, zero=args[0].zero,
+                    quantized=args[0].quantized)
 
 
     # ----------------- item methods for slicing ---------------
     def __delitem__(self, *args, **kwargs):
-        return QTensor(self._t.__delitem__(*args, **kwargs), self.scale, self.zero)
+        return QTensor(self._t.__delitem__(*args, **kwargs), self.scale, self.zero,
+                quantized=self.quantized)
 
     def __getitem__(self, *args, **kwargs):
-        return QTensor(self._t.__getitem__(*args, **kwargs), self.scale, self.zero)
+        return QTensor(self._t.__getitem__(*args, **kwargs), self.scale, self.zero,
+                quantized=self.quantized)
 
     def __setitem__(self, *args, **kwargs):
-        return QTensor(self._t.__setitem__(*args, **kwargs), self.scale, self.zero)
+        return QTensor(self._t.__setitem__(*args, **kwargs), self.scale, self.zero,
+                quantized=self.quantized)
 
     def __getattr__(self, attr):
         # for transpose, data, etc
@@ -97,7 +106,7 @@ class QTensor:
             return QTensor(tensor_attr, scale=self.scale, zero=self.zero)
         elif isinstance(tensor_attr, Callable):
             # NOTE: assuming all Tensor methods return Tensors
-            # (this assumption may be wrong, 
+            # (this assumption may be wrong,
             # => look out for counterexamples and implement them as a method of QTensor separately)
 
             # list of methods that dont return Tensor:
@@ -108,7 +117,8 @@ class QTensor:
             logqt.warning("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
             method_returning_qtensor = lambda *args, **kwargs: \
-                QTensor(tensor_attr(*args, **kwargs), scale=self.scale, zero=self.zero)
+                QTensor(tensor_attr(*args, **kwargs), scale=self.scale, zero=self.zero,
+                        quantized=self.quantized)
             return method_returning_qtensor
         else:
             return tensor_attr
@@ -128,7 +138,8 @@ class QTensor:
         new_scale = self.scale + other.scale
         new_zero = self.zero + other.zero
 
-        return QTensor(r, scale=new_scale, zero=new_zero)
+        return QTensor(r, scale=new_scale, zero=new_zero,
+                quantized=self.quantized)
 
     def __matmul__(self, other):
         assert isinstance(other, QTensor), type(other)
@@ -138,7 +149,8 @@ class QTensor:
         new_scale = self.scale + other.scale
         new_zero = self.zero + other.zero
 
-        return QTensor(r, scale=new_scale, zero=new_zero)
+        return QTensor(r, scale=new_scale, zero=new_zero,
+                quantized=self.quantized)
 
     def __deepcopy__(self, memo):
         if id(self) in memo:
@@ -157,7 +169,8 @@ class QTensor:
         return  string
 
     def to(self, *args, **kwargs):
-        return QTensor(self._t.to(*args, **kwargs), scale=self.scale, zero=self.zero)
+        return QTensor(self._t.to(*args, **kwargs), scale=self.scale, zero=self.zero,
+                quantized=self.quantized)
 
 
 HANDLED_FUNCTIONS = {

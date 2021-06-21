@@ -17,7 +17,7 @@ https://github.com/eladhoffer/utils.pytorch/blob/master/quantize.py
 """
 
 from collections import namedtuple
-from typing import Tuple
+from typing import Tuple, Union
 import math
 import torch
 from .qtensor import QTensor
@@ -83,7 +83,9 @@ class UniformQuantization(Quantization):
 
     def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
 
-        q_x, scale, zero =  self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
+        q_x, scale, zero =  self._quantize_tensor(
+            x, min_val=min_val, max_val=max_val, num_bits=num_bits
+        )
         return QTensor(q_x, scale=scale, zero=zero)
 
     def quantize_to_qtensor_using_params(self, x, scale, zero=0, num_bits=8) -> QTensor:
@@ -213,7 +215,7 @@ class FakeQuant(torch.autograd.Function):
     can then be used normally in dense/conv layer.
     """
     @staticmethod
-    def forward(ctx, x: torch.Tensor, quant: Quantization, num_bits: int, min_val: float, max_val: float) -> torch.Tensor:
+    def forward(ctx, x: Union[QTensor, torch.Tensor], quant: Quantization, num_bits: int, min_val: float, max_val: float, handling_qtensors=True) -> Union[QTensor, torch.Tensor]:
         """
         :param x: torch tensor to quantize
         :param quant: quantization class for tensor
@@ -222,14 +224,37 @@ class FakeQuant(torch.autograd.Function):
         :param max_val: EMA max_val, for activation quantization with EMA, don't provide for weight quantization
         :return: x: torch tensor
         """
-        x = quant.quantize_to_qtensor(x, num_bits=num_bits, min_val=min_val, max_val=max_val)
-        x = quant.dequantize_qtensor(x)
-        return x # torch.Tensor
+        # NOTE:
+        # This forward pass does NOT change the scale or zero point.
+        # it only rounds in after affinely transforming to the new scale, new zero
+        # but affinely transforms back again (dequantize).
+        # The new scale, new zero are given for NonQuantizableModule to access this info
+        # (NonQuantizableModule already needs qparams info during QAT)
+        if handling_qtensors:
+            x = x._t
+
+        if min_val is None or max_val is None:
+            min_val, max_val = x.min().item(), x.max().item()
+
+        new_scale, new_zero = quant.calc_params(min_val, max_val, num_bits=num_bits)
+
+        # affine trafo and round there to simulate error appropriately
+        qx = quant.quantize_to_qtensor_given_scale(
+            x, num_bits=num_bits, scale=new_scale, zero=new_zero
+        )
+        # affinely transform back
+        out = quant.dequantize_qtensor(qx)
+
+        if handling_qtensors:
+            # scale did not actually change, but need to give QTensor these qparams
+            # for them to be accessible by NonQuantized layers
+            out = QTensor(out, new_scale, new_zero, quantized=False)
+        return out
 
     @staticmethod
     def backward(ctx, grad_output):
         """ Straight Through Estimator """
-        return grad_output, None, None, None, None
+        return grad_output, None, None, None, None, None
 
 
 str2quant = {"uniform": UniformQuantization, "uniform_sym": UniformSymmetricQuantization}
