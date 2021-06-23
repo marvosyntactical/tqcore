@@ -228,6 +228,7 @@ class FakeQuant(torch.autograd.Function):
         #     print(args)
         #     print("exception gotten:")
         #     print(f"{type(e)}:{e}")
+        scale, zero = scale.item(), zero.item()
 
         if handling_qtensors:
             # scale did not actually change, but need to give QTensor these qparams
@@ -274,7 +275,7 @@ class FakeQuant(torch.autograd.Function):
         return out, torch.Tensor([new_scale]), torch.Tensor([new_zero])
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, scale, zero):
         """ Straight Through Estimator """
         return grad_output, None, None, None, None
 

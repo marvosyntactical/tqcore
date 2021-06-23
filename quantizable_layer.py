@@ -12,8 +12,23 @@ from torch.nn.modules.utils import _pair
 
 import math
 import copy
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 from functools import partial
+
+def print_qt_stats(name, qtnsr):
+    data, scale, zero = qtnsr._t, qtnsr.scale, qtnsr.zero
+    vmin, vmax = data.min(), data.max()
+
+    num_bits = 8
+    through = len(torch.unique(data))
+    through_ratio = through/min(2**num_bits, data.nelement())
+
+    fstr = f"STATS({name}):\nSCALE={scale},\nZERO={zero}"
+    fstr += f";\nMIN={vmin}, MAX={vmax};"
+    fstr += f"\nTHROUGHPUT: {through} ({through_ratio}%)"
+    fstr += f"\nDATA={data}"
+    print(fstr)
+
 
 __DEBUG__ = True
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
@@ -56,7 +71,8 @@ class QuantizableModule(nn.Module):
         self.weight_quantization = weight_quantization(nudge_zero=nudge_zero)
         self.num_bits_bias = num_bits_bias
 
-        self.forward = self.forward_fp
+        self.stage = 0 # 0 == FP32; 1 == QAT; 2 == Quantized
+        self.forward = self.forward_fp # changes from stage to stage
 
     def forward_fp(self, x: Tensor) -> Tensor:
         return x
@@ -68,9 +84,11 @@ class QuantizableModule(nn.Module):
         raise NotImplementedError(f"{type(self)}.forward_quantized")
 
     def qat_prepare(self):
+        self.stage = 1
         self.forward = self.forward_qat
 
     def quantize(self):
+        self.stage = 2
         self.forward = self.forward_quantized
 
 
@@ -127,14 +145,15 @@ class DeQuant(QuantizableModule):
             outputs = outputs[0]
         else:
             outputs = tuple(outputs)
+        return outputs
 
-    def forward_qat(self, x: QTensor):
+    def forward_qat(self, outputs: Union[QTensor, Tuple[QTensor]]):
         f = lambda qt: qt._t
-        return self._process_outputs(outputs)
+        return self._process_outputs(outputs, f)
 
-    def forward_quantized(self, outputs):
+    def forward_quantized(self, outputs: Union[QTensor, Tuple[QTensor]]):
         f = lambda qt: qt.dequantize()
-        return self._process_outputs(outputs)
+        return self._process_outputs(outputs, f)
 
 class QListener(QuantizableModule):
     """
@@ -194,11 +213,14 @@ class QListener(QuantizableModule):
 
     def forward_quantized(self, x: QTensor) -> QTensor:
 
+        # costly! remove these! TODO FIXME
+
         assert isinstance(x, QTensor)
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
-        print("asserted stuff;", len(torch.unique(x._t)))
+        print(f"CHECKS PASSED;\n {type(self.mods[0])}")
+        print_qt_stats(type(self.mods[0]), x)
 
         return x
 
@@ -286,15 +308,10 @@ class QListener(QuantizableModule):
         self._ranges_set = True
 
 
-def _qmul(
-        a: QTensor, b: QTensor, factor: float,
-        scale_next, zero_next, op,
-        quantization, weight_quantization,
-        num_bits, num_bits_weight
-    ) -> QTensor:
-    # kernel for mul and matmul
-    # TODO future:
-    # replace this and QAdd.forward_quantized by gemmlowp (possibly <) 8 bit kernel
+def _convert_to_qtensor_for_kernel(
+        a, b,
+        quantization, weight_quantization
+    ) -> Tuple[torch.Tensor]:
 
     ab = [a,b]
     for i, t in enumerate(ab):
@@ -322,7 +339,63 @@ def _qmul(
 
         ab[i] = t
 
-    a, b  = ab
+    return tuple(ab)
+
+
+
+def _qadd(
+        a, b, factor: float,
+        scale_next, zero_next, op,
+        quantization, weight_quantization,
+        num_bits, num_bits_weight
+    ) -> QTensor:
+    # mock low bit addition kernel
+
+    # tensor wrapper version of the earlier "globalparams" implementation:
+    # https://cegit.ziti.uni-heidelberg.de/mkoss/tqcore/-/blob/globalparams/quantized_layer.py#L206
+
+    a, b = _convert_to_qtensor_for_kernel(
+        a, b, quantization, weight_quantization
+    )
+
+    a_requantized = quantization.quantize_to_qtensor_using_params(
+        a.dequantize() * factor,
+        scale=.5*scale_next,
+        zero=zero_next,
+        num_bits=num_bits # half the scale
+    )
+    b_requantized = quantization.quantize_to_qtensor_using_params(
+        b.dequantize() * factor,
+        scale=.5*scale_next,
+        zero=zero_next,
+        num_bits=num_bits # half the scale
+    )
+
+    r = a_requantized._t + b_requantized._t
+    r = r.clamp(0., (2.**num_bits)-1.)
+    r = QTensor(r, scale=scale_next, zero=zero_next)
+
+    print_qt_stats("qadd result", r)
+
+    assert is_integer(r._t), r
+
+    return r
+
+
+
+def _qmul(
+        a, b, factor: float,
+        scale_next, zero_next, op,
+        quantization, weight_quantization,
+        num_bits, num_bits_weight
+    ) -> QTensor:
+    # mock low bitwidth kernel for mul and matmul
+
+    # TODO future:
+    # replace this and _qadd by gemmlowp (possibly <) 8 bit kernel
+    a, b = _convert_to_qtensor_for_kernel(
+        a, b, quantization, weight_quantization
+    )
 
     a_zeroed = a._t - round(a.zero)
     b_zeroed = b._t - round(b.zero)
@@ -397,27 +470,12 @@ class QAdd(QuantizableModule):
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
-        # wrapped version of the earlier "globalparams" implementation:
-        # https://cegit.ziti.uni-heidelberg.de/mkoss/tqcore/-/blob/globalparams/quantized_layer.py#L206
-
-        a_requantized = self.quantization.quantize_to_qtensor_using_params(
-            a.dequantize(),
-            scale=1/(.5*self.scale_next),
-            zero=.5*self.zero_next,
-            num_bits=self.num_bits-1
+        return _qadd(
+            a, b, 1.,
+            self.scale_next, self.zero_next, torch.add,
+            self.quantization, self.weight_quantization,
+            self.num_bits, self.num_bits_weight
         )
-        b_requantized = self.quantization.quantize_to_qtensor_using_params(
-            b.dequantize(),
-            scale=1/(.5*self.scale_next),
-            zero=.5*self.zero_next,
-            num_bits=self.num_bits-1
-        )
-
-        r = a_requantized + b_requantized
-
-        assert is_integer(r._t), r
-
-        return r
 
 class QMask(QuantizableModule):
     def __init__(self, fp_neg_val: float=-1e5, **qkwargs):
@@ -596,7 +654,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
             for fp_o in fp_out
         ]
 
-        return tuple(fakeq_out) if len(fakeq_out) else fakeq_out[0]
+        return tuple(fakeq_out) if len(fakeq_out) > 1 else fakeq_out[0]
 
     def forward_quantized(self, inp: QTensor, *args, **kwargs) -> QTensor:
         print(f"nonQ QAT params: {inp.zero}, {inp.scale}")
@@ -615,7 +673,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
             num_bits=self.num_bits
         ) if is_q[i] else fp_out for i, fp_out in enumerate(fp_outs)]
 
-        return tuple(q_outs) if len(q_outs) else q_outs[0]
+        return tuple(q_outs) if len(q_outs) > 1 else q_outs[0]
 
 class QReLU6(QuantizableModule):
 
@@ -742,12 +800,12 @@ class ConvBNfoldable(QuantizableModule):
 
     def folded_weight(self):
         # C8: w_fold = w * (gamma/sigma)
-        folded_weight = (self.conv.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).unsqueeze(1).unsqueeze(1).unsqueeze(1))
+        folded_weight = self.conv.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).unsqueeze(1).unsqueeze(1).unsqueeze(1)
         return folded_weight
 
     def folded_bias(self):
         # C8: bias = beta - gamma * mu / sigma
-        folded_bias = (self.bn.bias - ( (self.bn.weight * self.bn.running_mean) / torch.sqrt(self.bn.running_var + self.bn.eps)))
+        folded_bias = self.bn.bias -  (self.bn.weight * self.bn.running_mean) / torch.sqrt(self.bn.running_var + self.bn.eps)
         return folded_bias
 
     def fold(self):
@@ -842,7 +900,7 @@ class FFT(nn.Module):
 class QFFT(QuantizableModule):
     # TODO figure out mask
 
-    # figure out whether to orthonormalize (scale by 1/sqrt(n))
+    # figure out whether to use kwarg "normalize" (scale by 1/sqrt(n))
     # paper: vandermonde matrix has normalization
     # third party code: no normalization
 
@@ -869,7 +927,5 @@ class QFFT(QuantizableModule):
         x = fft2(x)
         x = x.real #  + x.imag
         return x
-
-
 
 

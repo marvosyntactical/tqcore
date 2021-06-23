@@ -21,12 +21,14 @@ from .quantizable_layer import \
     QReLU6, \
     QFFT, \
     FFT, \
-    NonQuantizableModuleWrap
+    NonQuantizableModuleWrap, \
+    print_qt_stats
 
 from .batchnorm import QBatchNorm1dTranspose
 
 # FIXME remove this: (should have no dependency on tst)
 from tst.modules import MultiHeadedAttention
+
 
 # this file contains quantized versions of layers used in tst_pytorch/modules.py
 
@@ -310,35 +312,43 @@ class QTransformerEncoderLayer(nn.Module):
         """
         super().__init__()
 
-        if not fft:
-            # self.src_src_att = QMultiHeadedAttention(
-            #     num_heads, dim,
-            #     dropout=dropout, **qkwargs)
-            self.src_src_att = NonQuantizableModuleWrap(
-                MultiHeadedAttention(
-                    num_heads, dim, dropout=dropout
-                ), **qkwargs
-            )
+        # NOTE DEBUG TODO: add these as cfg params
+        self.has_bn = True
+        self.has_res = False # debug: no residuals/adding/dropout
+        self.has_mix = False
 
-            mixer_output_layer = [] # layer that should be updated by next listener
-            # mixer_output_layer = [self.src_src_att.output_layer]
-            self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
-        else:
-            self.fft = NonQuantizableModuleWrap(FFT(), **qkwargs)
-            # self.fft = QFFT(**qkwargs)
+        if self.has_mix:
+            if not fft:
+                # self.src_src_att = QMultiHeadedAttention(
+                #     num_heads, dim,
+                #     dropout=dropout, **qkwargs)
+                self.src_src_att = NonQuantizableModuleWrap(
+                    MultiHeadedAttention(
+                        num_heads, dim, dropout=dropout
+                    ), **qkwargs
+                )
 
-            mixer_output_layer = []
-            self.mixer = lambda x, mask: self.fft(x, mask)
+                mixer_output_layer = [] # layer that should be updated by next listener
+                # mixer_output_layer = [self.src_src_att.output_layer]
+                self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
+            else:
+                self.fft = NonQuantizableModuleWrap(FFT(), **qkwargs)
+                # self.fft = QFFT(**qkwargs)
+
+                mixer_output_layer = []
+                self.mixer = lambda x, mask: self.fft(x, mask)
 
 
-        self.dropout1 = nn.Dropout(dropout)
-        self.add1 = QAdd(**qkwargs)
-        self.add1l = QListener(
-            * [self.add1] + mixer_output_layer,
-            **qkwargs)
+        if self.has_res:
+            self.dropout1 = nn.Dropout(dropout)
+            self.add1 = QAdd(**qkwargs)
+            self.add1l = QListener(
+                * [self.add1] + mixer_output_layer,
+                **qkwargs)
 
-        self.norm1 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-        self.norm1l = QListener(self.norm1, **qkwargs)
+        if self.has_bn:
+            self.norm1 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
+            self.norm1l = QListener(self.norm1, **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim, ff_size=ff_size,
@@ -347,14 +357,16 @@ class QTransformerEncoderLayer(nn.Module):
             activ=activ,
             **qkwargs)
 
-        self.dropout2 = nn.Dropout(dropout)
-        self.add2 = QAdd(**qkwargs)
-        self.add2l = QListener(
-                self.add2,
-                self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
-                **qkwargs)
-        self.norm2 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-        self.norm2l = QListener(self.norm2, **qkwargs)
+        if self.has_res:
+            self.dropout2 = nn.Dropout(dropout)
+            self.add2 = QAdd(**qkwargs)
+            self.add2l = QListener(
+                    self.add2,
+                    self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
+                    **qkwargs)
+        if self.has_bn:
+            self.norm2 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
+            self.norm2l = QListener(self.norm2, **qkwargs)
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         """
@@ -368,22 +380,43 @@ class QTransformerEncoderLayer(nn.Module):
         :return: output tensor
         """
 
-        h = self.mixer(x, mask)
+        if self.has_mix:
+            h = self.mixer(x, mask)
+        else:
+            h = x
 
-        res1 = self.add1(h, self.dropout1(x))
-        print("res1 output type:",type(res1))
-        res1 = self.add1l(res1)
+        if self.has_res:
+            res1 = self.add1(h, self.dropout1(x))
+            # print("res1 output type:",type(res1))
+            res1 = self.add1l(res1)
+            if hasattr(self, "__is_quantized__"):
+                print_qt_stats("res1", res1)
+        else:
+            res1 = h
 
-        h = self.norm1(res1)
-        h = self.norm1l(h)
+        if self.has_bn:
+            h = self.norm1(res1)
+            h = self.norm1l(h)
+            if hasattr(self, "__is_quantized__"):
+                print_qt_stats("norm2", h)
+        else:
+            h = res1
 
         ff_out = self.feed_forward(h)
 
-        res2 = self.add2(ff_out, self.dropout2(h))
-        res2 = self.add2l(res2)
+        if self.has_res:
+            res2 = self.add2(ff_out, self.dropout2(h))
+            res2 = self.add2l(res2)
+        else:
+            res2 = ff_out
 
-        o = self.norm2(res2)
-        h = self.norm2l(h)
+        if self.has_bn:
+            o = self.norm2(res2)
+            h = self.norm2l(h)
+            if hasattr(self, "__is_quantized__"):
+                print_qt_stats("norm2", h)
+        else:
+            o = res2
 
         return o
 
@@ -442,7 +475,7 @@ class QTransformerEncoder(nn.Module):
             raise NotImplementedError("TODO Implement Freezing everything but head as in TST paper")
 
     def forward(self,
-                src: Tensor,
+                x: Tensor,
                 mask: Optional[Tensor] = None,
                 **kwargs) -> (Tensor, Tensor):
         """
@@ -451,7 +484,7 @@ class QTransformerEncoder(nn.Module):
         The input mini-batch x needs to be sorted by src length.
         x and mask should have the same dimensions [batch, time, dim].
 
-        :param src: embedded src inputs,
+        :param x: non-embedded src inputs,
             shape (batch_size, src_len, embed_size)
         :param mask: indicates padding areas (zeros where padding), shape
             (batch_size, 1, src_len)
@@ -462,8 +495,8 @@ class QTransformerEncoder(nn.Module):
                 shape (batch_size, directions*hidden)
         """
 
-        src_embedded = self.embedding(src)
-        x = self.pe(src_embedded)  # add position encoding to word embeddings
+        x = self.embedding(x)
+        x = self.pe(x)  # add position encoding to word embeddings
         x = self.emb_dropout(x)
 
         x = self.quantStub(x)

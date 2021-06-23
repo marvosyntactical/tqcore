@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-TRANSFORMER = True
+TRANSFORMER = True # TODO add as option in entry points if necessary
 
 if TRANSFORMER:
     from .transformer_layers import *
@@ -94,6 +94,8 @@ def convert_module(
     mod_type = type(module)
 
     is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+
+    module.__is_quantized__ = 1
 
     if is_nonquantizable:
         # do not recurse to children

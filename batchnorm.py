@@ -4,11 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from .quantizable_layer import QuantizableModule
+from .quantizable_layer import QuantizableModule, _qmul, _qadd, print_qt_stats
 from .qtensor import QTensor
 
 import copy
-from typing import Dict
+from typing import Dict, Optional
 import math
 
 __DEBUG__ = True
@@ -23,6 +23,72 @@ is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 # -> wenn bn.track_running_stats False, setze kurz momentum = 0, sodass kein update passiert
 
 class _QBatchNorm(QuantizableModule, _BatchNorm):
+    def batch_norm_fun(
+            self,
+            input: torch.Tensor,
+            running_mean: Optional[Tensor],
+            running_var: Optional[Tensor],
+            weight: Optional[Tensor] = None,
+            bias: Optional[Tensor] = None,
+            training: bool = None,
+            momentum: float = 0.1,
+            eps: float = 1e-5,
+        ) -> Tensor:
+
+
+        if self.stage == 2:
+
+            # in low bitwidth.
+            # running_var is denominator already inversed; eps can be ignored; just multiply
+            running_mean = running_mean.unsqueeze(1).unsqueeze(0)
+            running_var = running_var.unsqueeze(1).unsqueeze(0)
+
+            weight = weight.unsqueeze(1).unsqueeze(0)
+            bias = bias.unsqueeze(1).unsqueeze(0)
+            print(f"input={input.shape}; mean={running_mean.shape}")
+            centered_inp = _qadd(
+                input, running_mean, 1.,
+                bias.scale, 0, torch.add,
+                self.quantization, self.weight_quantization,
+                self.num_bits, self.num_bits_weight
+            )
+            print_qt_stats("centered input", centered_inp)
+            print(f"weight={weight.shape}; var={running_var.shape}")
+            weightvar = _qmul(
+                running_var, weight, 1.,
+                self.scale_next, self.zero_next, torch.mul,
+                self.quantization, self.weight_quantization,
+                self.num_bits, self.num_bits_weight
+            )
+            print(f"weightvar={weightvar.shape}; centered_inp={centered_inp.shape}")
+            lhs = _qmul(
+                weightvar, centered_inp, 1.,
+                self.scale_next, self.zero_next, torch.mul,
+                self.quantization, self.weight_quantization,
+                self.num_bits, self.num_bits_weight
+            )
+            print(f"lhs={lhs.shape}; bias={bias.shape}")
+            r = _qadd(
+                lhs, bias, 1.,
+                self.scale_next, self.zero_next, torch.add,
+                self.quantization, self.weight_quantization,
+                self.num_bits, self.num_bits_weight
+            )
+
+        else:
+            r = F.batch_norm(
+                input=input,
+                running_mean=running_mean,
+                running_var=running_var,
+                weight=weight,
+                bias=bias,
+                training=training,
+                momentum=momentum,
+                eps=eps,
+            )
+
+        return r
+
     def __init__(self, *args, qkwargs: Dict = None, **kwargs):
         QuantizableModule.__init__(self, **qkwargs)
         _BatchNorm.__init__(self, *args, **kwargs)
@@ -50,26 +116,26 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
 
         numerator_scale = x.scale * gamma.scale
-        denominator_scale = numerator_scale # ** 2
-        scale_out = math.sqrt(numerator_scale) # siehe overleaf rechnung
+        scale_out = math.sqrt(numerator_scale)
         # scale_out = numerator_scale
+        denominator_scale = 1/scale_out
 
         mu = self.weight_quantization.quantize_to_qtensor_given_scale(
-            self.running_mean,
+            - self.running_mean,
             x.scale,
             0,
             num_bits=self.num_bits_bias
         )
 
         sigma =  self.weight_quantization.quantize_to_qtensor_given_scale(
-            self.running_var,
+            self.inv_running_std,
             denominator_scale,
             0,
             num_bits=self.num_bits_weight
         )
 
         epsilon = self.weight_quantization.quantize_to_qtensor_given_scale(
-            torch.Tensor([self.eps]),
+            self.eps,
             denominator_scale,
             0,
             num_bits=self.num_bits_weight
@@ -84,32 +150,43 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
                 num_bits=self.num_bits_bias
             ) # as in prep
 
-            beta = beta._t
+            beta = beta
         else:
             beta = None
 
         assert not self.track_running_stats, "<-- this attr indicates whether we are training; forward_quantized is for inference only"
 
-        x_tensor = x._t
+        x_zeroed = x._t - x.zero
+        gamma_zeroed = gamma._t - gamma.zero
 
-        bn_training, exponential_average_factor = self.do_checks(x_tensor)
+        bn_training, exponential_average_factor = self.do_checks(x_zeroed)
 
-        r = F.batch_norm(
-            input=x_tensor - x.zero,
-            running_mean=mu._t,
-            running_var=sigma._t,
-            weight=gamma._t - gamma.zero,
+        r = self.batch_norm_fun(
+            input=x,
+            running_mean=mu,
+            running_var=sigma,
+            weight=gamma,
             bias=beta,
             training=bn_training,
             momentum=exponential_average_factor,
             eps=epsilon._t.item(),
         )
 
-        multiplier = scale_out / self.scale_next
+        # r = self.batch_norm_fun(
+        #     input=x_zeroed,
+        #     running_mean=mu._t,
+        #     running_var=sigma._t,
+        #     weight=gamma_zeroed,
+        #     bias=beta._t,
+        #     training=bn_training,
+        #     momentum=exponential_average_factor,
+        #     eps=epsilon._t.item(),
+        # )
+        # multiplier = scale_out / self.scale_next
 
-        out = r * multiplier + self.zero_next
+        # out = r * multiplier + self.zero_next
 
-        out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
+        # out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
         assert is_integer(out), out
 
@@ -165,7 +242,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
     def forward_fp(self, input: Tensor) -> Tensor:
         bn_training, exponential_average_factor = self.do_checks(input)
 
-        return F.batch_norm(
+        return self.batch_norm_fun(
             input,
             # If buffers are not to be tracked, ensure that they won't be updated
             self.running_mean if not self.training or self.track_running_stats else None,
@@ -180,7 +257,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
     def forward_qat(self, input: Tensor) -> Tensor:
         bn_training, exponential_average_factor = self.do_checks(input)
 
-        return F.batch_norm(
+        return self.batch_norm_fun(
             input,
             # If buffers are not to be tracked, ensure that they won't be updated
             self.running_mean if not self.training or self.track_running_stats else None,
@@ -191,6 +268,15 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             exponential_average_factor,
             self.eps
         )
+
+    def quantize(self):
+        QuantizableModule.quantize(self)
+
+        self.running_std = torch.sqrt(self.running_var)
+        eps = self.eps
+        self.eps = torch.sqrt(torch.Tensor([eps]))
+
+        self.inv_running_std = 1/torch.sqrt(self.running_var + eps)
 
     def train(self, mode:bool):
 

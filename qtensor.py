@@ -13,7 +13,6 @@ logging.basicConfig(level="INFO")
 logqt = logging.getLogger("qt")
 
 logging.disable()
-
 # logqt.info("QTensor logging started")
 
 class QTensor:
@@ -33,6 +32,7 @@ class QTensor:
         self.scale = scale
         self.zero = zero
         self.quantized = bool(quantized)
+        self.shape = self._t.shape
 
         if self.quantized:
             # TODO remove this costly assertion after testing !!!!! FIXME:
@@ -59,7 +59,7 @@ class QTensor:
         if kwargs is None:
             kwargs = {}
 
-        quantized_or_not = [a.quantized if isinstance(a, QTensor) else (False if isinstance(a,Tensor) else True) for a in args]
+        quantized_or_not = [a.quantized for a in args if isinstance(a, QTensor)]
         assert len(set(quantized_or_not)) == 1, [type(a) for a in args] # either all quantized or none quantized
 
         if func in HANDLED_FUNCTIONS and all(
@@ -99,11 +99,15 @@ class QTensor:
                 quantized=self.quantized)
 
     def __getattr__(self, attr):
-        # for transpose, data, etc
+        # for transpose(), data, etc:
+        # default behavior: return QTensor.
+        # must implement attrs/methods that shant return QTensors, e.g. .size()
+        # when they are implemented, __getattr__ is never called for them
         tensor_attr = getattr(self._t, attr)
 
         if isinstance(tensor_attr, torch.Tensor):
             return QTensor(tensor_attr, scale=self.scale, zero=self.zero)
+
         elif isinstance(tensor_attr, Callable):
             # NOTE: assuming all Tensor methods return Tensors
             # (this assumption may be wrong,
@@ -171,6 +175,13 @@ class QTensor:
     def to(self, *args, **kwargs):
         return QTensor(self._t.to(*args, **kwargs), scale=self.scale, zero=self.zero,
                 quantized=self.quantized)
+
+    def size(self, *args, **kwargs):
+        return self._t.size(*args, **kwargs)
+
+    def dim(self, *args, **kwargs):
+        return self._t.dim(*args, **kwargs)
+
 
 
 HANDLED_FUNCTIONS = {
