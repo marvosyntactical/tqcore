@@ -214,8 +214,36 @@ class FakeQuant(torch.autograd.Function):
     For forward pass in quantization aware training: fake-quantized weights and activations
     can then be used normally in dense/conv layer.
     """
+
     @staticmethod
-    def forward(ctx, x: Union[QTensor, torch.Tensor], quant: Quantization, num_bits: int, min_val: float, max_val: float, handling_qtensors=True) -> Union[QTensor, torch.Tensor]:
+    def apply_wrapper(*args, handling_qtensors):
+        if handling_qtensors:
+            args = [a._t if isinstance(a, QTensor) else a for a in args]
+
+        out, scale, zero = FakeQuant.apply(*args)
+        # try:
+        #     out, scale, zero = FakeQuant.apply(*args)
+        # except Exception as e:
+        #     print("got exception in fakequan apply; here are args:")
+        #     print(args)
+        #     print("exception gotten:")
+        #     print(f"{type(e)}:{e}")
+
+        if handling_qtensors:
+            # scale did not actually change, but need to give QTensor these qparams
+            # for them to be accessible by NonQuantized layers
+            out = QTensor(out, scale, zero, quantized=False)
+        return out
+
+    @staticmethod
+    def forward(
+            ctx,
+            x: Union[QTensor,torch.Tensor],
+            quant: Quantization,
+            num_bits: int,
+            min_val: float,
+            max_val: float,
+        ) -> Union[QTensor, torch.Tensor]:
         """
         :param x: torch tensor to quantize
         :param quant: quantization class for tensor
@@ -230,8 +258,6 @@ class FakeQuant(torch.autograd.Function):
         # but affinely transforms back again (dequantize).
         # The new scale, new zero are given for NonQuantizableModule to access this info
         # (NonQuantizableModule already needs qparams info during QAT)
-        if handling_qtensors:
-            x = x._t
 
         if min_val is None or max_val is None:
             min_val, max_val = x.min().item(), x.max().item()
@@ -243,18 +269,14 @@ class FakeQuant(torch.autograd.Function):
             x, num_bits=num_bits, scale=new_scale, zero=new_zero
         )
         # affinely transform back
-        out = quant.dequantize_qtensor(qx)
+        out = qx.dequantize()
 
-        if handling_qtensors:
-            # scale did not actually change, but need to give QTensor these qparams
-            # for them to be accessible by NonQuantized layers
-            out = QTensor(out, new_scale, new_zero, quantized=False)
-        return out
+        return out, torch.Tensor([new_scale]), torch.Tensor([new_zero])
 
     @staticmethod
     def backward(ctx, grad_output):
         """ Straight Through Estimator """
-        return grad_output, None, None, None, None, None
+        return grad_output, None, None, None, None
 
 
 str2quant = {"uniform": UniformQuantization, "uniform_sym": UniformSymmetricQuantization}

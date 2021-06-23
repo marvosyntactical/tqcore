@@ -157,7 +157,7 @@ class QListener(QuantizableModule):
 
         self.dont_fakeQ = dont_fakeQ
         if not dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply
+            self.fake_quantize = FakeQuant.apply_wrapper
 
         self._ranges_set = False
 
@@ -178,7 +178,8 @@ class QListener(QuantizableModule):
                 self.quantization,
                 self.num_bits,
                 self.__stats__["ema_min"],
-                self.__stats__["ema_max"]
+                self.__stats__["ema_max"],
+                handling_qtensors=True,
             )
         # print("QListener stat aware output type: ",type(x))
         return x
@@ -390,7 +391,7 @@ class QAdd(QuantizableModule):
     def forward_fp(self, a, b):
         return a + b
 
-    def forward_qat(self, a, b):
+    def forward_qat(self, a: QTensor, b: QTensor):
         rfloat = a._t + b._t
         r = QTensor(rfloat, scale=self.scale_next, zero=self.zero_next, quantized=False)
         return r
@@ -575,37 +576,46 @@ class NonQuantizableModuleWrap(QuantizableModule):
             **qkwargs
         )
 
-    def forward_fp(self, inp: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        r = self.fp_module(inp, *args, **kwargs)
+    def forward_fp(self, *args, **kwargs) -> torch.Tensor:
+        r = self.fp_module(*args, **kwargs)
         return r
 
-    def forward_qat(self, inp: QTensor, *args, **kwargs) -> torch.Tensor:
+    def forward_qat(self, *args, **kwargs) -> torch.Tensor:
 
-        fp_inp = inp._t
+        fp_args = [a._t if isinstance(a, QTensor) else a for a in args]
 
-        fp_out = self.fp_module(fp_inp, *args, **kwargs)
+        fp_out = self.fp_module(*fp_args, **kwargs)
 
-        fakeq_out = self.out_qat_listener(fp_out)
+        if not isinstance(fp_out, tuple):
+            fp_out = (fp_out,)
+        fakeq_out = [
+            self.out_listener(
+                QTensor(fp_o, self.FLOAT_SCALE, self.FLOAT_ZERO, quantized=False)) \
+                    if isinstance(fp_o, Tensor)
+                    else fp_o
+            for fp_o in fp_out
+        ]
 
-        return fakeq_out
+        return tuple(fakeq_out) if len(fakeq_out) else fakeq_out[0]
 
     def forward_quantized(self, inp: QTensor, *args, **kwargs) -> QTensor:
         print(f"nonQ QAT params: {inp.zero}, {inp.scale}")
 
-        fp_inp = inp.dequantize()
+        fp_args, is_q = zip(*[
+            (a.dequantize(), True) if isinstance(a, QTensor) else (a, False) \
+        for a in args])
 
-        fp_out = self.fp_module(fp_inp, *args, **kwargs)
+        fp_outs = self.fp_module(*fp_args, **kwargs)
 
-        fp_out = fp_out / self.in_fp_scale_next + self.in_fp_zero_next
-
-        q_out = self.quantization.quantize_to_qtensor_using_params(
+        q_outs = [
+        self.quantization.quantize_to_qtensor_using_params(
             fp_out,
-            scale=self.out_qat_scale_next,
-            zero=self.out_qat_zero_next,
+            scale=self.out_scale_next,
+            zero=self.out_zero_next,
             num_bits=self.num_bits
-        )
+        ) if is_q[i] else fp_out for i, fp_out in enumerate(fp_outs)]
 
-        return q_out
+        return tuple(q_outs) if len(q_outs) else q_outs[0]
 
 class QReLU6(QuantizableModule):
 

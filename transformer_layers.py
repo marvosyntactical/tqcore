@@ -320,7 +320,7 @@ class QTransformerEncoderLayer(nn.Module):
                 ), **qkwargs
             )
 
-            mixer_output_layer = [self.src_src_att.fp_module.output_layer]
+            mixer_output_layer = [] # layer that should be updated by next listener
             # mixer_output_layer = [self.src_src_att.output_layer]
             self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
         else:
@@ -333,7 +333,7 @@ class QTransformerEncoderLayer(nn.Module):
 
         self.dropout1 = nn.Dropout(dropout)
         self.add1 = QAdd(**qkwargs)
-        self.qRes1 = QListener(
+        self.add1l = QListener(
             * [self.add1] + mixer_output_layer,
             **qkwargs)
 
@@ -346,9 +346,10 @@ class QTransformerEncoderLayer(nn.Module):
             time_window=time_window,
             activ=activ,
             **qkwargs)
+
         self.dropout2 = nn.Dropout(dropout)
         self.add2 = QAdd(**qkwargs)
-        self.qRes2 = QListener(
+        self.add2l = QListener(
                 self.add2,
                 self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
                 **qkwargs)
@@ -369,16 +370,19 @@ class QTransformerEncoderLayer(nn.Module):
 
         h = self.mixer(x, mask)
 
-        sum1 = self.add1(h, self.dropout1(x))
-        sum1 = self.qRes1(sum1)
-        h = self.norm1(sum1)
+        res1 = self.add1(h, self.dropout1(x))
+        print("res1 output type:",type(res1))
+        res1 = self.add1l(res1)
+
+        h = self.norm1(res1)
         h = self.norm1l(h)
 
         ff_out = self.feed_forward(h)
 
-        sum2 = self.add2(ff_out, self.dropout2(h))
-        sum2 = self.qRes2(sum2)
-        o = self.norm2(sum2)
+        res2 = self.add2(ff_out, self.dropout2(h))
+        res2 = self.add2l(res2)
+
+        o = self.norm2(res2)
         h = self.norm2l(h)
 
         return o

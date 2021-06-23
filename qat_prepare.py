@@ -36,12 +36,12 @@ def _qat_layer_forward_pre_hook(mod:nn.Module, inp:torch.Tensor) -> None:
 
     # weights are not clamped to range (hence None, None for min_val, max_val)
     mod.weight.data = mod._fakeQ(
-        mod.weight.data, mod._Qwt, mod._num_bits_wt, None, None, False
+        mod.weight.data, mod._Qwt, mod._num_bits_wt, None, None, handling_qtensors=False
     )
 
     if mod.bias is not None:
         mod.bias.data = mod._fakeQ(
-            mod.bias.data, mod._Qwt, mod._num_bits_bias, None, None, False
+            mod.bias.data, mod._Qwt, mod._num_bits_bias, None, None, handling_qtensors=False
         )
 
 def qat_prepare(
@@ -86,12 +86,19 @@ def qat_prepare(
     module._parent_number = parent_number
 
     is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+    # if is_nonquantizable:
+    #     module.qat_prepare()
+    #     # do not recurse to children
+    #     return module, descendants_module_number
+
+    named_children = dict(module.named_children())
+
     if is_nonquantizable:
-        # do not recurse to children
-        return module, descendants_module_number
+        # ignore module wrapped by nonquant module wrapper, but dont ignore its listeners
+        del named_children["fp_module"]
 
     # increment DFS counter by 1 for current module before diving down further
-    for name, layer in module.named_children():
+    for name, layer in named_children.items():
 
         # ===== DFS down module graph ========
         _, descendants_module_number = qat_prepare(
@@ -115,7 +122,6 @@ def qat_prepare(
     _module_types[module_number] = type(module)
     param_names = [name for name, _ in module.named_parameters()]
 
-
     if isinstance(module, QuantizableModule):
         # most custom modules in .quantizable_layer; _QBatchNorm in .batchnorm
         module.qat_prepare()
@@ -129,7 +135,7 @@ def qat_prepare(
         module._Qwt = quant_weight()
         module._num_bits_wt = num_bits_weight
         module._num_bits_bias = num_bits_bias
-        module._fakeQ = FakeQuant.apply
+        module._fakeQ = FakeQuant.apply_wrapper
 
         # fake quantize weights, bias
         pre_hook_handle = module.register_forward_pre_hook(_qat_layer_forward_pre_hook)
