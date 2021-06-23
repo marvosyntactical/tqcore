@@ -23,10 +23,11 @@ def print_qt_stats(name, qtnsr):
     through = len(torch.unique(data))
     through_ratio = through/min(2**num_bits, data.nelement())
 
-    fstr = f"STATS({name}):\nSCALE={scale},\nZERO={zero}"
-    fstr += f";\nMIN={vmin}, MAX={vmax};"
-    fstr += f"\nTHROUGHPUT: {through} ({through_ratio}%)"
-    fstr += f"\nDATA={data}"
+    fstr = f"STATS({name}):\nSCALE\t= {scale},\nZERO\t= {zero}"
+    fstr += f";\nMIN\t= {vmin};\nMAX\t= {vmax};"
+    fstr += f"\nTHRU\t= {through} ({through_ratio}%)"
+    fstr += f"\nDATA\t= {data}"
+    print("="*20)
     print(fstr)
 
 
@@ -364,12 +365,14 @@ def _qadd(
         zero=zero_next,
         num_bits=num_bits # half the scale
     )
+    print_qt_stats("qadd a", a_requantized)
     b_requantized = quantization.quantize_to_qtensor_using_params(
         b.dequantize() * factor,
         scale=.5*scale_next,
         zero=zero_next,
         num_bits=num_bits # half the scale
     )
+    print_qt_stats("qadd b", b_requantized)
 
     r = a_requantized._t + b_requantized._t
     r = r.clamp(0., (2.**num_bits)-1.)

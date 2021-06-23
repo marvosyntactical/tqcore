@@ -53,6 +53,8 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
                 self.num_bits, self.num_bits_weight
             )
             print_qt_stats("centered input", centered_inp)
+            print_qt_stats("denom", running_var)
+            print_qt_stats("weight", weight)
             print(f"weight={weight.shape}; var={running_var.shape}")
             weightvar = _qmul(
                 running_var, weight, 1.,
@@ -118,7 +120,9 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         numerator_scale = x.scale * gamma.scale
         scale_out = math.sqrt(numerator_scale)
         # scale_out = numerator_scale
-        denominator_scale = 1/scale_out
+        denominator_scale = scale_out
+        scales = (numerator_scale, scale_out, denominator_scale)
+        input(f"inv_running_std: {self.inv_running_std.min()} {self.inv_running_std.max()};\nscale: {denominator_scale}\nscales:{scales}")
 
         mu = self.weight_quantization.quantize_to_qtensor_given_scale(
             - self.running_mean,
