@@ -220,8 +220,8 @@ class QListener(QuantizableModule):
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
-        print(f"CHECKS PASSED;\n {type(self.mods[0])}")
-        print_qt_stats(type(self.mods[0]), x)
+        # print(f"CHECKS PASSED;\n {type(self.mods[0])}")
+        # print_qt_stats(type(self.mods[0]), x)
 
         return x
 

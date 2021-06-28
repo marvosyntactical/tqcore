@@ -313,7 +313,7 @@ class QTransformerEncoderLayer(nn.Module):
         super().__init__()
 
         # NOTE DEBUG TODO: add these as cfg params
-        self.has_bn = True
+        self.has_bn = False
         self.has_res = False # debug: no residuals/adding/dropout
         self.has_mix = False
 
