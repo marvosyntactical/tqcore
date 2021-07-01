@@ -312,11 +312,15 @@ class QTransformerEncoderLayer(nn.Module):
         """
         super().__init__()
 
-        # NOTE DEBUG TODO: add these as cfg params
-        self.has_bn = False
+        # NOTE DEBUG TODO:
+        # add these as cfg params
+        # (preferrably dont leave them out entirely once NonQuant works)
+        # => mixer (NonQuant) quantization has priority
+        self.has_bn = True
         self.has_res = False # debug: no residuals/adding/dropout
-        self.has_mix = False
+        self.has_mix = True
 
+        mixer_output_layer = []
         if self.has_mix:
             if not fft:
                 # self.src_src_att = QMultiHeadedAttention(

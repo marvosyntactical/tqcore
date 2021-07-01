@@ -21,12 +21,14 @@ def print_qt_stats(name, qtnsr):
 
     num_bits = 8
     through = len(torch.unique(data))
-    through_ratio = through/min(2**num_bits, data.nelement())
+    through_ratio = (through/min(2**num_bits, data.nelement())) * 100
 
-    fstr = f"STATS({name}):\nSCALE\t= {scale},\nZERO\t= {zero}"
-    fstr += f";\nMIN\t= {vmin};\nMAX\t= {vmax};"
-    fstr += f"\nTHRU\t= {through} ({through_ratio}%)"
-    fstr += f"\nDATA\t= {data}"
+    fstr = f"STATS({name}):\nSCALE\t= {scale},\nZERO\t= {zero};"
+    fstr += f"\nMIN\t= {vmin};\nMAX\t= {vmax};"
+    fstr += f"\nSHAPE\t= {data.shape}"
+    fstr += f"\nNELEM\t= {data.nelement()}"
+    fstr += f"\nUNIQ\t= {data.unique()}"
+    fstr += f"\n#UNIQ\t= {through} ({through_ratio}%)"
     print("="*20)
     print(fstr)
 
@@ -339,9 +341,7 @@ def _convert_to_qtensor_for_kernel(
                 # t = QTensor(torch.as_tensor(t), scale=1., zero=0.)
 
         ab[i] = t
-
     return tuple(ab)
-
 
 
 def _qadd(
@@ -361,16 +361,16 @@ def _qadd(
 
     a_requantized = quantization.quantize_to_qtensor_using_params(
         a.dequantize() * factor,
-        scale=.5*scale_next,
+        scale=scale_next,
         zero=zero_next,
-        num_bits=num_bits # half the scale
+        num_bits=num_bits-1 # half the scale
     )
     print_qt_stats("qadd a", a_requantized)
     b_requantized = quantization.quantize_to_qtensor_using_params(
         b.dequantize() * factor,
-        scale=.5*scale_next,
+        scale=scale_next,
         zero=zero_next,
-        num_bits=num_bits # half the scale
+        num_bits=num_bits-1 # half the scale
     )
     print_qt_stats("qadd b", b_requantized)
 
@@ -712,166 +712,6 @@ class QReLU6(QuantizableModule):
 
         return QTensor(out, scale=scale, zero=zero)
 
-
-
-class ConvBNfoldable(QuantizableModule):
-    """
-    relu(batchnorm(conv(x))) style module with custom forward pass thats altered during qat_prepare and qat_convert
-
-    via https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
-    as described in https://arxiv.org/abs/1712.05877v1 Sec 3.2
-
-
-    This module
-
-    Switches the Fig C8 procedure upon call of self.qat_prepare():
-    https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf
-    Then folds/removes the BN completely when self.fold() is called
-    """
-    def __init__(
-            self,
-            in_planes,
-            out_planes,
-            kernel_size, #=3,
-            stride=1,
-            groups=1,
-            padding=0,
-            momentum=0.1,
-            relu:Union[int, bool]=6,
-            eps=1e-05,
-            Convclass=nn.Conv2d,
-            **qkwargs
-        ):
-
-        super().__init__(**qkwargs)
-
-        if not type(padding) == int:
-            # dont know what this is for; its from https://pytorch.org/tutorials/advanced/static_quantization_tutorial.htm
-            padding = (kernel_size - 1) // 2
-
-        self.conv = Convclass(in_planes, out_planes, kernel_size, stride, padding, groups=groups, bias=False)
-        self.bn = QBatchNorm2d(out_planes, momentum=momentum)
-
-        self.has_relu = not(type(relu) == bool and relu == False)
-
-        if self.has_relu:
-            relu_module = nn.ReLU() if (type(relu)==int and relu==0) else nn.ReLU6()
-            self.relu = relu_module
-
-        def debug_fold_backward(module, grad_in, grad_out):
-            # sanity check if weights have been updated since last backward pass
-            convweight = module.conv.weight.data
-            bnweight = module.bn.weight.data
-            bnbias = module.bn.bias.data
-            if hasattr(module, "last_weights_cache"):
-                # are these ever updated?
-                if not (convweight == module.last_weights_cache[0]).all():
-                    print("conv weight updated!")
-                if not (bnweight == module.last_weights_cache[1]).all():
-                    print("bn weight updated!")
-                if not (bnbias == module.last_weights_cache[2]).all():
-                    print("bn bias updated")
-
-            module.last_weights_cache = [convweight]
-            module.last_weights_cache += [bnweight]
-            module.last_weights_cache += [bnbias]
-
-        # self.register_backward_hook(
-        #        debug_fold_backward
-        #        )
-
-    def forward_fp(self, x):
-        # forward used during fp32 pretraining
-        assert not (not self.conv.training and self.bn.track_running_stats)
-
-        x = self.conv(x)
-        x = self.bn(x)
-        if self.has_relu:
-            x = self.relu(x)
-        return x
-
-    def forward_quantized(self, x):
-        # forward used after conversion, no bn
-        x = self.conv(x)
-        if self.has_relu:
-            x = self.relu(x)
-        return x
-
-    def quantize(self):
-        super().quantize()
-        self.fold()
-
-    def folded_weight(self):
-        # C8: w_fold = w * (gamma/sigma)
-        folded_weight = self.conv.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-        return folded_weight
-
-    def folded_bias(self):
-        # C8: bias = beta - gamma * mu / sigma
-        folded_bias = self.bn.bias -  (self.bn.weight * self.bn.running_mean) / torch.sqrt(self.bn.running_var + self.bn.eps)
-        return folded_bias
-
-    def fold(self):
-
-        folded_weight = self.folded_weight()
-        folded_bias = self.folded_bias()
-
-        assert not torch.isnan(folded_weight).any()
-        assert not torch.isnan(folded_bias).any()
-
-        self.conv.weight.data = folded_weight
-        if self.conv.bias is not None:
-            self.conv.bias.data = folded_bias
-        else:
-            self.conv.bias = nn.Parameter(folded_bias)
-
-        # change function to normal fwd pass again, but wthout bn
-        self.forward = self.forward_folded
-
-
-    def forward_qat(self, x):
-        """
-        https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf Fig C8 procedure
-        """
-        assert not (not self.conv.training and self.bn.track_running_stats)
-
-        if self.bn.track_running_stats:
-            # update BN running stats
-            self.bn(self.conv(x))
-
-        # fold the weights then fake quantize in conv's fwd hook:
-
-        # unterer Teil des training graphs in C8:
-
-        folded_weight = self.folded_weight()
-        folded_weight.data = self.conv._fakeQ(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None)
-
-        folded_bias = self.folded_bias()
-        folded_bias.data = self.conv._fakeQ(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None)
-
-        assert not torch.isnan(folded_weight).any()
-        assert not torch.isnan(folded_bias).any()
-
-        # DEBUG: try adding bias with functional batch norm instead ..?
-
-        # oberer teil des training graphs in C8:
-        x = F.conv2d(
-            F.pad(
-                x,
-                self.conv._reversed_padding_repeated_twice if hasattr(self.conv, "_reversed_padding_repeated_twice") else tuple(x_ for x_ in reversed(self.conv.padding) for _ in range(2)),
-            ),
-            folded_weight,
-            folded_bias,
-            self.conv.stride,
-            _pair(0),
-            self.conv.dilation,
-            self.conv.groups,
-        )
-
-        if self.has_relu:
-            x = self.relu(x)
-
-        return x
 
 
 def DiscreteHartleyTransform(input):
