@@ -80,7 +80,7 @@ class QuantizableModule(nn.Module):
     def forward_fp(self, x: Tensor) -> Tensor:
         return x
 
-    def forward_qat(self, x: Tensor) -> Tensor:
+    def forward_qat(self, x: QTensor) -> QTensor:
         raise NotImplementedError(f"{type(self)}.forward_qat")
 
     def forward_quantized(self, x: QTensor) -> QTensor:

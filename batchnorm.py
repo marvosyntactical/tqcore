@@ -6,6 +6,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 
 from .quantizable_layer import QuantizableModule, _qmul, _qadd, print_qt_stats
 from .qtensor import QTensor
+from .quantization_functions import FakeQuant
 
 import copy
 from typing import Dict, Optional, Union
@@ -180,24 +181,28 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         return self
 
-class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
-    def forward_fp(self, x):
-        x = torch.transpose(x,1,2)
-        x = _QBatchNorm.forward_fp(self, x)
-        x = torch.transpose(x,1,2)
-        return x
+def bn1d_transpose(AbstractBN: nn.Module):
+    class bn(AbstractBN, nn.BatchNorm1d):
+        def forward_fp(self, x):
+            x = torch.transpose(x,1,2)
+            x = AbstractBN.forward_fp(self, x)
+            x = torch.transpose(x,1,2)
+            return x
 
-    def forward_qat(self, x):
-        x = torch.transpose(x,1,2)
-        x = _QBatchNorm.forward_qat(self, x)
-        x = torch.transpose(x,1,2)
-        return x
+        def forward_qat(self, x):
+            x = torch.transpose(x,1,2)
+            x = AbstractBN.forward_qat(self, x)
+            x = torch.transpose(x,1,2)
+            return x
 
-    def forward_quantized(self, x):
-        x = torch.transpose(x,1,2)
-        x = _QBatchNorm.forward_quantized(self, x)
-        x = torch.transpose(x,1,2)
-        return x
+        def forward_quantized(self, x):
+            x = torch.transpose(x,1,2)
+            x = AbstractBN.forward_quantized(self, x)
+            x = torch.transpose(x,1,2)
+            return x
+    return bn
+
+QBatchNorm1dTranspose = bn1d_transpose(_QBatchNorm)
 
 class QBatchNorm1d(_QBatchNorm, nn.BatchNorm1d):
     pass
@@ -319,8 +324,8 @@ class ConvBNfoldable(QuantizableModule):
         else:
             self.conv.bias = nn.Parameter(folded_bias)
 
-        # change function to normal fwd pass again, but wthout bn
-        self.forward = self.forward_folded
+        # # change function to normal fwd pass again, but wthout bn
+        # self.forward = self.forward_folded
 
 
     def forward_qat(self, x):
@@ -370,23 +375,21 @@ class ConvBNfoldable(QuantizableModule):
 
 class BNfoldable(QuantizableModule):
     """
-    batchnorm(conv(x))) style module with custom forward pass thats altered during qat_prepare and qat_convert
+    container module with custom forward pass thats altered during qat_prepare and qat_convert
 
     via https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
     as described in https://arxiv.org/abs/1712.05877v1 Sec 3.2
 
     This module
-
     Switches the Fig C8 procedure upon call of self.qat_prepare():
     https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf
-    Then folds/removes the BN completely when self.fold() is called
     """
     def __init__(
             self,
             hidden,
-            dimension: int=1, # bn1d, bn2d, bn3d
             momentum=0.1,
             eps=1e-05,
+            dimension: int=1, # bn1d, bn2d, bn3d
             **qkwargs
         ):
 
@@ -402,93 +405,97 @@ class BNfoldable(QuantizableModule):
             raise NotImplementedError(dimension)
 
         self.bn = BatchNormMod(hidden, momentum=momentum, eps=eps)
+        self._fakeQ = FakeQuant.apply_wrapper
+
+
+    def forward_quantized(self, x: QTensor) -> QTensor:
+        """
+        """
+
+        gamma = self.weight_quantization.quantize_to_qtensor(
+            self.folded_weight,
+            num_bits=self.num_bits_weight # int8 or int32 ? TODO test
+        )
+
+        beta = self.quantization.quantize_to_qtensor_given_scale(
+            self.folded_bias,
+            x.scale * gamma.scale,
+            0,
+            num_bits=32,
+        )
+
+        assert not self.track_running_stats, "<-- this attr indicates whether we are training; forward_quantized is for inference only"
+
+        x_zeroed = x._t - x.zero
+        gamma_zeroed = gamma._t - gamma.zero
+
+        out = x_zeroed * gamma_zeroed + beta._t
+
+        multiplier = (x.scale * gamma.scale) / self.scale_next
+        out = out * multiplier + self.zero_next
+
+        out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
+
+        out = QTensor(out, scale=self.scale_next, zero=self.zero_next)
+
+        assert is_integer(out._t), out
+
+        assert len(torch.unique(out._t)) > 1, (out.min(), x.min(), x.max(), self.zero_next, self.scale_next)
+
+        return out # QTensor(out, scale=self.scale_next, zero=self.zero_next)
+
+    def forward_qat(self, x):
+        """
+        https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf Fig C8 procedure without Conv
+        """
+        assert not (not self.training and self.bn.track_running_stats)
+
+        if self.bn.track_running_stats:
+            # update BN running stats
+            self.bn(x)
+
+        # fold the weights then fake quantize:
+
+        # unterer Teil des training graphs in C8:
+
+        folded_weight = self.fold_weight()
+        folded_weight.data = self._fakeQ(folded_weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+
+        folded_bias = self.fold_bias(folded_weight)
+        folded_bias.data = self._fakeQ(folded_bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+
+        x = x._t * folded_weight + folded_bias
+
+        return QTensor(x, scale=self.scale_next, zero=self.zero_next, quantized=False)
 
     def forward_fp(self, x):
         # forward used during fp32 pretraining
-        assert not (not self.bn.training and self.bn.track_running_stats)
-
         x = self.bn(x)
-        return x
-
-    def forward_quantized(self, x):
-        # forward used after conversion, no bn
-        raise NotImplementedError()
         return x
 
     def quantize(self):
         super().quantize()
         self.fold()
 
-    def folded_weight(self):
-        # C8: w_fold = w * (gamma/sigma)
-        folded_weight = self.conv.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).unsqueeze(1).unsqueeze(1).unsqueeze(1)
+    def fold_weight(self):
+
+        inv_running_std = 1/torch.sqrt(self.bn.running_var + self.bn.eps)
+        folded_weight = (self.bn.weight * inv_running_std)\
+                .unsqueeze(0).unsqueeze(-1)
+        assert not torch.isnan(folded_weight).any()
         return folded_weight
 
-    def folded_bias(self):
-        # C8: bias = beta - gamma * mu / sigma
-        folded_bias = self.bn.bias -  (self.bn.weight * self.bn.running_mean) / torch.sqrt(self.bn.running_var + self.bn.eps)
+    def fold_bias(self, folded_weight):
+        folded_bias = self.bn.bias.unsqueeze(0).unsqueeze(-1) \
+                - (self.bn.running_mean.unsqueeze(0).unsqueeze(-1) \
+                * folded_weight)
+        assert not torch.isnan(folded_bias).any()
         return folded_bias
 
     def fold(self):
-
-        folded_weight = self.folded_weight()
-        folded_bias = self.folded_bias()
-
-        assert not torch.isnan(folded_weight).any()
-        assert not torch.isnan(folded_bias).any()
-
-        self.conv.weight.data = folded_weight
-        if self.conv.bias is not None:
-            self.conv.bias.data = folded_bias
-        else:
-            self.conv.bias = nn.Parameter(folded_bias)
-
-        # change function to normal fwd pass again, but wthout bn
-        self.forward = self.forward_folded
+        self.folded_weight = folded_weight = self.fold_weight()
+        self.folded_bias = folded_bias = self.fold_bias(folded_weight)
 
 
-    def forward_qat(self, x):
-        """
-        https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf Fig C8 procedure
-        """
-        assert not (not self.conv.training and self.bn.track_running_stats)
-
-        if self.bn.track_running_stats:
-            # update BN running stats
-            self.bn(self.conv(x))
-
-        # fold the weights then fake quantize in conv's fwd hook:
-
-        # unterer Teil des training graphs in C8:
-
-        folded_weight = self.folded_weight()
-        folded_weight.data = self.conv._fakeQ(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None)
-
-        folded_bias = self.folded_bias()
-        folded_bias.data = self.conv._fakeQ(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None)
-
-        assert not torch.isnan(folded_weight).any()
-        assert not torch.isnan(folded_bias).any()
-
-        # DEBUG: try adding bias with functional batch norm instead ..?
-
-        # oberer teil des training graphs in C8:
-        x = F.conv2d(
-            F.pad(
-                x,
-                self.conv._reversed_padding_repeated_twice if hasattr(self.conv, "_reversed_padding_repeated_twice") else tuple(x_ for x_ in reversed(self.conv.padding) for _ in range(2)),
-            ),
-            folded_weight,
-            folded_bias,
-            self.conv.stride,
-            _pair(0),
-            self.conv.dilation,
-            self.conv.groups,
-        )
-
-        if self.has_relu:
-            x = self.relu(x)
-
-        return x
-
+QBatchNorm1dfoldableTranspose = bn1d_transpose(BNfoldable)
 

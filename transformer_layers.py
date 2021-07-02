@@ -24,7 +24,7 @@ from .quantizable_layer import \
     NonQuantizableModuleWrap, \
     print_qt_stats
 
-from .batchnorm import QBatchNorm1dTranspose
+from .batchnorm import QBatchNorm1dTranspose, QBatchNorm1dfoldableTranspose
 
 # FIXME remove this: (should have no dependency on tst)
 from tst.modules import MultiHeadedAttention
@@ -316,6 +316,11 @@ class QTransformerEncoderLayer(nn.Module):
         # add these as cfg params
         # (preferrably dont leave them out entirely once NonQuant works)
         # => mixer (NonQuant) quantization has priority
+        self.simulate_folding = True
+        if self.simulate_folding:
+            BatchNormMod = QBatchNorm1dfoldableTranspose
+        else:
+            BatchNormMod = QBatchNorm1dTranspose
         self.has_bn = True
         self.has_res = False # debug: no residuals/adding/dropout
         self.has_mix = True
@@ -351,7 +356,7 @@ class QTransformerEncoderLayer(nn.Module):
                 **qkwargs)
 
         if self.has_bn:
-            self.norm1 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
+            self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm1l = QListener(self.norm1, **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
@@ -369,7 +374,7 @@ class QTransformerEncoderLayer(nn.Module):
                     self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
                     **qkwargs)
         if self.has_bn:
-            self.norm2 = QBatchNorm1dTranspose(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
+            self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm2l = QListener(self.norm2, **qkwargs)
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
