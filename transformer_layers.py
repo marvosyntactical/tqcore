@@ -27,7 +27,7 @@ from .quantizable_layer import \
 from .batchnorm import QBatchNorm1dTranspose, BNFoldableTranspose
 
 # FIXME remove this: (should have no dependency on tst)
-from tst.modules import MultiHeadedAttention
+from tst.transformer import MultiHeadedAttention
 
 
 # this file contains quantized versions of layers used in tst_pytorch/modules.py
