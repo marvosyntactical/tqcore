@@ -24,7 +24,7 @@ from .quantizable_layer import \
     NonQuantizableModuleWrap, \
     print_qt_stats
 
-from .batchnorm import QBatchNorm1dTranspose, QBatchNorm1dfoldableTranspose
+from .batchnorm import QBatchNorm1dTranspose, BNFoldableTranspose
 
 # FIXME remove this: (should have no dependency on tst)
 from tst.modules import MultiHeadedAttention
@@ -316,14 +316,14 @@ class QTransformerEncoderLayer(nn.Module):
         # add these as cfg params
         # (preferrably dont leave them out entirely once NonQuant works)
         # => mixer (NonQuant) quantization has priority
-        self.simulate_folding = True
+        self.simulate_folding = False
         if self.simulate_folding:
-            BatchNormMod = QBatchNorm1dfoldableTranspose
+            BatchNormMod = BNFoldableTranspose
         else:
             BatchNormMod = QBatchNorm1dTranspose
         self.has_bn = True
         self.has_res = False # debug: no residuals/adding/dropout
-        self.has_mix = True
+        self.has_mix = False
 
         mixer_output_layer = []
         if self.has_mix:
