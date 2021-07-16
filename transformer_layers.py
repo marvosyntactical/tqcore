@@ -24,7 +24,7 @@ from .quantizable_layer import \
     NonQuantizableModuleWrap, \
     print_qt_stats
 
-from .batchnorm import QBatchNorm1dTranspose, BNFoldableTranspose
+from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
 
 # FIXME remove this: (should have no dependency on tst)
 from tst.transformer import MultiHeadedAttention
@@ -315,49 +315,52 @@ class QTransformerEncoderLayer(nn.Module):
         # NOTE DEBUG TODO:
         # add these as cfg params
         # (preferrably dont leave them out entirely once NonQuant works)
-        # => mixer (NonQuant) quantization has priority
+        # => mix (NonQuant) quantization has priority
         self.simulate_folding = False
         if self.simulate_folding:
-            BatchNormMod = BNFoldableTranspose
+            BatchNormMod = QBNFoldableTranspose
         else:
             BatchNormMod = QBatchNorm1dTranspose
+
         self.has_bn = True
-        self.has_res = False # debug: no residuals/adding/dropout
+        self.has_res = True # debug: no residuals/adding/dropout
         self.has_mix = False
 
-        mixer_output_layer = []
+        self.fft = fft
+        mix_output_layer = []
         if self.has_mix:
             if not fft:
                 # self.src_src_att = QMultiHeadedAttention(
                 #     num_heads, dim,
                 #     dropout=dropout, **qkwargs)
-                self.src_src_att = NonQuantizableModuleWrap(
+                self.mixer = NonQuantizableModuleWrap(
                     MultiHeadedAttention(
                         num_heads, dim, dropout=dropout
                     ), **qkwargs
                 )
 
-                mixer_output_layer = [] # layer that should be updated by next listener
-                # mixer_output_layer = [self.src_src_att.output_layer]
-                self.mixer = lambda x, mask: self.src_src_att(x,x,x,mask)
+                mix_output_layer = [] # layer that should be updated by next listener
+                # mix_output_layer = [self.src_src_att.output_layer]
+                self.mix = lambda x, mask: self.mixer(x,x,x,mask)
             else:
-                self.fft = NonQuantizableModuleWrap(FFT(), **qkwargs)
+                self.mixer = NonQuantizableModuleWrap(FFT(), **qkwargs)
                 # self.fft = QFFT(**qkwargs)
 
-                mixer_output_layer = []
-                self.mixer = lambda x, mask: self.fft(x, mask)
+                mix_output_layer = []
+                self.mix = lambda x, mask: self.mixer(x, mask)
 
 
-        if self.has_res:
+        if 0: # self.has_res:
             self.dropout1 = nn.Dropout(dropout)
             self.add1 = QAdd(**qkwargs)
             self.add1l = QListener(
-                * [self.add1] + mixer_output_layer,
-                **qkwargs)
+                * [self.add1] + mix_output_layer,
+                **qkwargs
+            )
 
         if self.has_bn:
             self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-            self.norm1l = QListener(self.norm1, **qkwargs)
+            # self.norm1l = QListener(self.norm1, **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim, ff_size=ff_size,
@@ -370,9 +373,11 @@ class QTransformerEncoderLayer(nn.Module):
             self.dropout2 = nn.Dropout(dropout)
             self.add2 = QAdd(**qkwargs)
             self.add2l = QListener(
-                    self.add2,
-                    self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
-                    **qkwargs)
+                self.add2,
+                self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
+                self.norm1,
+                **qkwargs
+            )
         if self.has_bn:
             self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm2l = QListener(self.norm2, **qkwargs)
@@ -390,23 +395,23 @@ class QTransformerEncoderLayer(nn.Module):
         """
 
         if self.has_mix:
-            h = self.mixer(x, mask)
+            h = self.mix(x, mask)
         else:
             h = x
 
-        if self.has_res:
+        if 0: # self.has_res:
             res1 = self.add1(h, self.dropout1(x))
             # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
-            if hasattr(self, "__is_quantized__"):
+            if self.norm1.stage == 2:
                 print_qt_stats("res1", res1)
         else:
             res1 = h
 
         if self.has_bn:
             h = self.norm1(res1)
-            h = self.norm1l(h)
-            if hasattr(self, "__is_quantized__"):
+            # h = self.norm1l(h)
+            if self.norm1.stage == 2:
                 print_qt_stats("norm2", h)
         else:
             h = res1
@@ -416,14 +421,16 @@ class QTransformerEncoderLayer(nn.Module):
         if self.has_res:
             res2 = self.add2(ff_out, self.dropout2(h))
             res2 = self.add2l(res2)
+            if self.norm1.stage == 2:
+                print_qt_stats("res2", res2)
         else:
             res2 = ff_out
 
         if self.has_bn:
             o = self.norm2(res2)
-            h = self.norm2l(h)
-            if hasattr(self, "__is_quantized__"):
-                print_qt_stats("norm2", h)
+            o = self.norm2l(o)
+            if self.norm1.stage == 2:
+                print_qt_stats("norm2", o)
         else:
             o = res2
 
@@ -517,12 +524,14 @@ class QTransformerEncoder(nn.Module):
         return x
 
     def __repr__(self):
-        if hasattr(self.layers[0], "src_src_att"):
-            s = "%s(num_layers=%r, num_heads=%r)" % (
-                self.__class__.__name__, len(self.layers),
-                self.layers[0].src_src_att.fp_module.num_heads
-                # self.layers[0].src_src_att.num_heads
-            )
+        if not self.layers[0].fft:
+            pass # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
+            # s = "%s(num_layers=%r, num_heads=%r)" % (
+            #     self.__class__.__name__, len(self.layers),
+            #     self.layers[0].mixer.fp_module.num_heads,
+            #     self.layers[0].mixer.num_heads,
+            # )
+            s="f{self.__class__.__name__}:FIXME"
         else:
             s = "%s(num_layers=%r, fft=True)" % (
                 self.__class__.__name__, len(self.layers)

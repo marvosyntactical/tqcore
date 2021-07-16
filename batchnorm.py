@@ -42,8 +42,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         :param x: QTensor, quantized input data
         """
 
-        # TODO figure out how to factor out these scales properly
-        # so I can assign these tensors permanently
+        # TODO assign these tensors permanently during .quantize() ....
         # (this falls under optimization tho and would not appease mr knuth)
 
         gamma = self.weight_quantization.quantize_to_qtensor(
@@ -368,7 +367,7 @@ class ConvBNfoldable(QuantizableModule):
 
         return x
 
-class BNFoldableTranspose(QuantizableModule):
+class QBNFoldableTranspose(QuantizableModule):
     """
     container module with custom forward pass thats altered during qat_prepare and qat_convert
 

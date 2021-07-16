@@ -95,8 +95,6 @@ def convert_module(
 
     is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
 
-    module.__is_quantized__ = 1
-
     if is_nonquantizable:
         # do not recurse to children
         return module
