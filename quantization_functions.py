@@ -81,17 +81,17 @@ class UniformQuantization(Quantization):
 
         return q_x, scale, zero
 
-    def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
+    def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8, quantized=True) -> QTensor:
 
         q_x, scale, zero =  self._quantize_tensor(
             x, min_val=min_val, max_val=max_val, num_bits=num_bits
         )
-        return QTensor(q_x, scale=scale, zero=zero)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=False, quantized=quantized)
 
-    def quantize_to_qtensor_using_params(self, x, scale, zero=0, num_bits=8) -> QTensor:
+    def quantize_to_qtensor_using_params(self, x, scale, zero=0, num_bits=8, quantized=True) -> QTensor:
 
         q_x = self._quantize_tensor_using_params(x, scale, zero, num_bits=num_bits)
-        return QTensor(q_x, scale=scale, zero=zero)
+        return QTensor(q_x, scale=scale, zero=zero, quantized=quantized, symmetric=False)
 
 
     def quantize_to_torch_tensor(self, x, qparams, min_val=None, max_val=None, num_bits=8) -> torch.Tensor:
@@ -140,13 +140,14 @@ class UniformQuantization(Quantization):
     def tensor_clamp(self, x: torch.Tensor, num_bits) -> torch.Tensor:
         return x.round().clamp(0, 2. ** num_bits - 1.)
 
-    def quantize_to_qtensor_given_scale(self, x:torch.Tensor, scale, zero, num_bits=32) -> QTensor:
+    def quantize_to_qtensor_given_scale(self, x:torch.Tensor, scale, zero, num_bits=32, quantized=True) -> QTensor:
         """Bias Quantization"""
 
         q_x = x / scale + zero
         q_x = self.tensor_clamp(q_x, num_bits=num_bits)
 
-        return QTensor(q_x, scale=scale, zero=zero)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=False, quantized=quantized)
+
 
 class UniformSymmetricQuantization(Quantization):
     """
@@ -170,7 +171,7 @@ class UniformSymmetricQuantization(Quantization):
     def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
 
         q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
-        return QTensor(q_x, scale=scale, zero=zero)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=True)
 
     def calc_params(self, min_val, max_val, num_bits=8):
         # Calc Scale
@@ -185,13 +186,13 @@ class UniformSymmetricQuantization(Quantization):
     def tensor_clamp(self, x: torch.Tensor, num_bits):
         return x.round().clamp(-(2. ** (num_bits - 1) - 1), 2. ** (num_bits - 1) - 1)
 
-    def quantize_to_qtensor_given_scale(self, x, scale, zero=0, num_bits=32):
+    def quantize_to_qtensor_given_scale(self, x, scale, zero=0, num_bits=32, quantized=True):
         """Bias Quantization"""
 
         q_x = x / scale + zero
         q_x = self.tensor_clamp(q_x, num_bits=num_bits)
 
-        return QTensor(q_x, scale=scale, zero=zero)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=True, quantized=quantized)
 
     def quantize_to_torch_tensor(self, x, qparams, min_val=None, max_val=None, num_bits=8) -> torch.Tensor:
         # updates globally used qparams dict in place instead of returning QTensor
@@ -267,7 +268,7 @@ class FakeQuant(torch.autograd.Function):
 
         # affine trafo and round there to simulate error appropriately
         qx = quant.quantize_to_qtensor_given_scale(
-            x, num_bits=num_bits, scale=new_scale, zero=new_zero
+            x, num_bits=num_bits, scale=new_scale, zero=new_zero, quantized=False
         )
         # affinely transform back
         out = qx.dequantize()

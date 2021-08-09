@@ -23,22 +23,27 @@ class QTensor:
     and whatever Tensor methods are needed
     INSTEAD OF
     trying to actually subclass Tensor
-    (very messy with infinite recursions and does not save time anyways
+    (very messy with infinite recursions and does not save coding time anyways
     because you still need to reimplement everything used).
     """
 
-    def __init__(self, data, scale:float, zero:int=0, quantized=True, **kwargs):
+    def __init__(self, data, scale: float, zero: int=0, quantized: bool=True, symmetric:bool=False, **kwargs):
         self._t = torch.as_tensor(data, **kwargs)
         self.scale = scale
         self.zero = zero
         self.quantized = bool(quantized)
-        self.shape = self._t.shape
+        self.symmetric = symmetric
 
         if self.quantized:
             # TODO remove this costly assertion after testing !!!!! FIXME:
             assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
+            if not symmetric:
+                assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
-    def dequantize(self) -> torch.Tensor:
+        # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
+        self.shape: Tensor = self._t.shape
+
+    def dequantize(self) -> Tensor:
         return (self._t - self.zero) * self.scale
 
     def __torch_function__(cls, func, types, args=(), kwargs=None):

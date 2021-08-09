@@ -15,26 +15,7 @@ import copy
 from typing import Optional, Union, Tuple
 from functools import partial
 
-def print_qt_stats(name, qtnsr):
-    data, scale, zero = qtnsr._t, qtnsr.scale, qtnsr.zero
-    vmin, vmax = data.min(), data.max()
-
-    num_bits = 8
-    through = len(torch.unique(data))
-    through_ratio = (through/min(2**num_bits, data.nelement())) * 100
-
-    fstr = f"STATS({name}):\nSCALE\t= {scale},\nZERO\t= {zero};"
-    fstr += f"\nMIN\t= {vmin};\nMAX\t= {vmax};"
-    fstr += f"\nSHAPE\t= {data.shape}"
-    fstr += f"\nNELEM\t= {data.nelement()}"
-    fstr += f"\nUNIQ\t= {data.unique()}"
-    fstr += f"\n#UNIQ\t= {through} ({through_ratio}%)"
-    print("="*20)
-    print(fstr)
-
-
-__DEBUG__ = True
-is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
+from .utils import print_qt_stats, is_integer
 
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 
@@ -473,6 +454,10 @@ class QAdd(QuantizableModule):
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
+        print("start qt stats in QAdd:")
+        print_qt_stats("left", a)
+        print_qt_stats("right", b)
+        print("end qt stats in QAdd:")
         return _qadd(
             a, b, 1.,
             self.scale_next, self.zero_next, torch.add,

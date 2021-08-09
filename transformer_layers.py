@@ -323,8 +323,8 @@ class QTransformerEncoderLayer(nn.Module):
             BatchNormMod = QBatchNorm1dTranspose
 
         self.has_bn = True
-        self.has_res = True # debug: no residuals/adding/dropout
-        self.has_mix = False
+        self.has_res = True # debug: no residuals/adding/dropout # only second res for now
+        self.has_mix = True
 
         self.fft = fft
         mix_output_layer = []
@@ -350,7 +350,7 @@ class QTransformerEncoderLayer(nn.Module):
                 self.mix = lambda x, mask: self.mixer(x, mask)
 
 
-        if 0: # self.has_res:
+        if 0: # self.has_res: # FIXME only second residual for now
             self.dropout1 = nn.Dropout(dropout)
             self.add1 = QAdd(**qkwargs)
             self.add1l = QListener(
@@ -382,6 +382,8 @@ class QTransformerEncoderLayer(nn.Module):
             self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm2l = QListener(self.norm2, **qkwargs)
 
+        self.plot_step_counter = 0
+
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         """
         Forward pass for a single transformer encoder layer.
@@ -403,16 +405,14 @@ class QTransformerEncoderLayer(nn.Module):
             res1 = self.add1(h, self.dropout1(x))
             # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
-            if self.norm1.stage == 2:
-                print_qt_stats("res1", res1)
+            print_qt_stats("res1", res1, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             res1 = h
 
         if self.has_bn:
             h = self.norm1(res1)
             # h = self.norm1l(h)
-            if self.norm1.stage == 2:
-                print_qt_stats("norm2", h)
+            print_qt_stats("norm2", h, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             h = res1
 
@@ -421,19 +421,18 @@ class QTransformerEncoderLayer(nn.Module):
         if self.has_res:
             res2 = self.add2(ff_out, self.dropout2(h))
             res2 = self.add2l(res2)
-            if self.norm1.stage == 2:
-                print_qt_stats("res2", res2)
+            print_qt_stats("res2", res2, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             res2 = ff_out
 
         if self.has_bn:
             o = self.norm2(res2)
             o = self.norm2l(o)
-            if self.norm1.stage == 2:
-                print_qt_stats("norm2", o)
+            print_qt_stats("norm2", o, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             o = res2
 
+        self.plot_step_counter += 1
         return o
 
 
@@ -485,7 +484,8 @@ class QTransformerEncoder(nn.Module):
             QTransformerEncoderLayer(dim=dim, ff_size=ff_size,
                 num_heads=num_heads, dropout=dropout,
                 time_window=time_window, activ=activ, fft=fft, qkwargs=qkwargs)
-            for _ in range(num_layers)])
+            for _ in range(num_layers)
+        ])
 
         if freeze:
             raise NotImplementedError("TODO Implement Freezing everything but head as in TST paper")
