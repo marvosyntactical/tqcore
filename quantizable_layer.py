@@ -88,7 +88,9 @@ class Quant(QuantizableModule):
                 and torch.is_floating_point(x)\
                 and not isinstance(x, QTensor):
             r = QTensor(
-                x, scale=self.FLOAT_SCALE, zero=self.FLOAT_ZERO,
+                x,
+                scale=self.FLOAT_SCALE,
+                zero=self.FLOAT_ZERO,
                 quantized=False
             )
         return r
@@ -143,19 +145,35 @@ class QListener(QuantizableModule):
     """
     During qat, this module records min, max values of torch.Tensor s passing through.
     (no other module records stats)
-    Accepts an iterable of modules for each of which the QListener sets the module.scale_next attribute and so on
+    Constructed with n nn.Modules "modules", for each of which the QListener sets the attributes:
+        - module.scale_next
+        - module.zero_next
+        - module.min_val
+        - module.max_val
+    Or, optionally, module.name_scale_next, and so on.
     """
-    def __init__(self, *modules: nn.Module, name = None, function = None, dont_fakeQ: bool = False, ema_decay: float = .9999, nudge_zero: bool = False, **qkwargs):
+    def __init__(
+            self,
+            *modules: nn.Module,
+            name = None,
+            function = None,
+            dont_fakeQ: bool = False,
+            ema_decay: float = .9999,
+            nudge_zero: bool = False,
+            calibrate: bool = False,
+            **qkwargs
+        ):
 
         super().__init__(**qkwargs)
 
         self.function = function # optionally apply function before collecting stats (for softmax)
         self.name = "" if name is None else str(name) # set attribute name_scale_next and so on
         self.ema_decay = ema_decay
+        self.calibrate = calibrate
 
         self.__stats__ = {}
         for module in modules:
-            exec(f"module.{self.name+'__stats__'} = self.__stats__")
+            setattr(module, self.name+'__stats__', self.__stats__)
         self.mods = list(modules)
 
         self.dont_fakeQ = dont_fakeQ
@@ -198,14 +216,12 @@ class QListener(QuantizableModule):
     def forward_quantized(self, x: QTensor) -> QTensor:
 
         # costly! remove these! TODO FIXME
-
         assert isinstance(x, QTensor)
         assert is_integer(x._t)
         assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
         assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
         # print(f"CHECKS PASSED;\n {type(self.mods[0])}")
         # print_qt_stats(type(self.mods[0]), x)
-
         return x
 
     def _update_ema_stats(self, x):
@@ -261,7 +277,7 @@ class QListener(QuantizableModule):
         # the QListener dict. So now I've got to have a list with all the modules,
         # which may be dangerous with certain other things
         for module in self.mods:
-            exec(f"module.{self.name+'__stats__'} = self.__stats__")
+            setattr(module, self.name+'__stats__', self.__stats__)
 
     def quantize(self):
         self.set_ranges()

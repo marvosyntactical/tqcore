@@ -138,7 +138,13 @@ def _factory_quantized_layer(module:nn.Module):
 
         assert is_integer(out), out
 
-        assert len(torch.unique(out)) > 1, (out.mean(), tnsr_stats(x, quant_input),scale_next, zero_next, out_before_clamp)
+        assert len(torch.unique(out)) > 1, (
+            out.mean(),
+            tnsr_stats(x, quant_input),
+            scale_next,
+            zero_next,
+            out_before_clamp
+        )
 
         return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
 

@@ -13,7 +13,9 @@ __PLOT__ = 0
 __DEBUG__ = 0
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
 
+
 def print_qt_stats(name, qtnsr, stage=2, step=0):
+
     if stage == 2:
         data, scale, zero = qtnsr._t, qtnsr.scale, qtnsr.zero
         vmin, vmax = data.min(), data.max()

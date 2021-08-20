@@ -11,13 +11,13 @@ and activations during forward pass, uses STE for backward pass.
 
 Quantized ReLU for variable zero point.
 
-Also here
+See Also here
 https://github.com/eladhoffer/utils.pytorch/blob/master/quantize.py
 
 """
 
 from collections import namedtuple
-from typing import Tuple, Union
+from typing import Tuple, Union, Dict
 import math
 import torch
 from .qtensor import QTensor
@@ -62,7 +62,7 @@ class UniformQuantization(Quantization):
     def __init__(self, nudge_zero=True):
         self.nudge_zero = nudge_zero
 
-    def _quantize_tensor_using_params(self, x:torch.Tensor, scale, zero=0, num_bits=8):
+    def _quantize_tensor_using_params(self, x: torch.Tensor, scale: float, zero=0, num_bits=8):
 
         q_x = x / scale + zero
         q_x = self.tensor_clamp(q_x, num_bits=num_bits)
@@ -74,27 +74,41 @@ class UniformQuantization(Quantization):
             # weight quantization: dont actually clamp (use full range)
             min_val, max_val = x.min().item(), x.max().item()
 
-        # scale ist real; zero ganz
+        # scale ist real; zero is int
         scale, zero = self.calc_params(min_val, max_val, num_bits)
 
         q_x = self._quantize_tensor_using_params(x, scale, zero=zero, num_bits=num_bits)
 
         return q_x, scale, zero
 
-    def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8, quantized=True) -> QTensor:
+    def quantize_to_qtensor(
+            self,
+            x: torch.Tensor,
+            min_val=None,
+            max_val=None,
+            num_bits=8,
+            quantized=True
+        ) -> QTensor:
 
-        q_x, scale, zero =  self._quantize_tensor(
+        q_x, scale, zero = self._quantize_tensor(
             x, min_val=min_val, max_val=max_val, num_bits=num_bits
         )
         return QTensor(q_x, scale=scale, zero=zero, symmetric=False, quantized=quantized)
 
-    def quantize_to_qtensor_using_params(self, x, scale, zero=0, num_bits=8, quantized=True) -> QTensor:
+    def quantize_to_qtensor_using_params(self, x: torch.Tensor, scale: float, zero=0, num_bits=8, quantized=True) -> QTensor:
 
         q_x = self._quantize_tensor_using_params(x, scale, zero, num_bits=num_bits)
         return QTensor(q_x, scale=scale, zero=zero, quantized=quantized, symmetric=False)
 
 
-    def quantize_to_torch_tensor(self, x, qparams, min_val=None, max_val=None, num_bits=8) -> torch.Tensor:
+    def quantize_to_torch_tensor(
+            self,
+            x: QTensor,
+            qparams: Dict[str, Union[float,int]],
+            min_val: float=None,
+            max_val: float=None,
+            num_bits=8
+        ) -> torch.Tensor:
         # updates globally used qparams dict in place instead of returning QTensor
 
         q_x, scale, zero =  self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
@@ -119,7 +133,7 @@ class UniformQuantization(Quantization):
         """
         "in both cases (wt, bias), the boundaries [a; b] are nudged so that
         value 0.0 is exactly representable as an integer z(a, b, n)
-        after quantization"
+        after quantization" ~ benoit et al.
         """
 
         if initial_zero < qmin:
@@ -206,8 +220,6 @@ class UniformSymmetricQuantization(Quantization):
 
     def dequantize_qtensor(self, qx: QTensor) -> torch.Tensor:
         return (qx._t - qx.zero) * qx.scale
-
-
 
 class FakeQuant(torch.autograd.Function):
     """
