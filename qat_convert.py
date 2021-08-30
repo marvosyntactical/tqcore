@@ -8,12 +8,12 @@ import torch.nn.functional as F
 TRANSFORMER = True # TODO add as option in entry points if necessary
 
 if TRANSFORMER:
-    from .transformer_layers import *
+    from .transformer import *
 
 from .quantizable_layer import *
 
 from .quantized_layer import _factory_convert_layer_forward_impl, \
-        OPS, NONQUANT
+        __OPS__, __NONQUANT__
 
 from .quantization_functions import *
 
@@ -55,7 +55,7 @@ def find_first_and_last_layer(module_types_dict) -> Tuple[int]:
     assert found_last, "did not find any implemented LAYER to pick as last layer ..."
     return (first_idx, last_idx)
 
-def quantize_model(
+def qat_convert(
         model: nn.Module,
         **kwargs):
 
@@ -93,18 +93,17 @@ def convert_module(
 
     mod_type = type(module)
 
-    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in __NONQUANT__]
 
     if is_nonquantizable:
         # do not recurse to children
         return module
 
-    #1. convert forward passes of all internal modules to handle only quantized tensors
+    #1. DFS to convert forward passes of all internal modules to handle only quantized tensors
 
     for name, layer in module.named_children():
 
         # ===== DFS down module graph ========
-
         convert_module(
             layer,
             leave_first_and_last_layer=leave_first_and_last_layer,
@@ -115,7 +114,7 @@ def convert_module(
             inplace=True
         )
 
-    # 2. convert known layer types and remove forward hooks on a basis of spaghetti
+    # 2. remove forward hooks on a basis of spaghetti
 
     # ################  remove pre / post hooks ###################
 
@@ -132,9 +131,11 @@ def convert_module(
 
     # ################  end remove pre / post hooks ###################
 
+    # 3. convert known layer types
+
     dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
 
-    is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
+    is_layer = True in [issubclass(mod_type, layer) for layer in __OPS__]
 
     # delete fake quantizer:
     if hasattr(module, "_fakeQ"):

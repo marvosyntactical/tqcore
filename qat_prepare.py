@@ -57,11 +57,9 @@ def qat_prepare(
         is_root_module: bool = True,
         _handles: Dict = None,
         _module_types: Dict = None, # convenience to search for next activation during conversion
-    ) -> (nn.Module, Dict):
+    ) -> (nn.Module, int):
     """
-    prep module for qat,
-    return dict of forward hook handles to call handle.remove() on during conversion.
-
+    prep module for QAT,
     after calling this, train for a few epochs, then convert_model
     """
 
@@ -130,7 +128,7 @@ def qat_prepare(
            isinstance(module, nn.Conv2d) or \
            isinstance(module, nn.modules.batchnorm._BatchNorm):
 
-        assert not len(set(param_names) - {"weight", "bias"}), param_names
+        assert not set(param_names) - {"weight", "bias"}, param_names
 
         module._Qwt = quant_weight()
         module._num_bits_wt = num_bits_weight

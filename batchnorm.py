@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from .quantizable_layer import QuantizableModule, _qmul, _qadd, print_qt_stats
+from .quantizable_layer import QuantizableModule, _qmul, _qadd, print_qt_stats, __SYMMETRIZING_MODULES__
 from .qtensor import QTensor
 from .quantization_functions import FakeQuant
 
@@ -208,17 +208,14 @@ class QBatchNorm2d(_QBatchNorm, nn.BatchNorm2d):
 class QBatchNorm3d(_QBatchNorm, nn.BatchNorm3d):
     pass
 
-
 class ConvBNfoldable(QuantizableModule):
     """
-    relu(batchnorm(conv(x))) style module with custom forward pass thats altered during qat_prepare and qat_convert
+    relu(batchnorm2d(conv2d(x))) style module
+    with custom forward pass that is altered during qat_prepare and qat_convert
 
-    via https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
+    structure from https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
     as described in https://arxiv.org/abs/1712.05877v1 Sec 3.2
-
-    This module
-
-    Switches the Fig C8 procedure upon call of self.qat_prepare():
+    This module switches to the Fig C8 procedure upon call of self.qat_prepare():
     https://bluemountain.eee.hku.hk/papaa2018/PAPAA18-L04-Jac+18.pdf
     Then folds/removes the BN completely when self.fold() is called
     """
@@ -506,4 +503,7 @@ class QBNFoldableTranspose(QuantizableModule):
         self.folded_weight = self.fold_weight()
         self.folded_bias = self.fold_bias(self.folded_weight)
 
-
+__SYMMETRIZING_MODULES__ += [
+    QBatchNorm1dTranspose,
+    QBNFoldableTranspose,
+]

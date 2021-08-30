@@ -9,7 +9,9 @@ from .quantized_layer import *
 from .quantizable_layer import *
 
 from .batchnorm import *
-
-from .transformer_layers import QTSTModel
-
+from .transformer import QTSTModel
 from .models import *
+
+from .histogram import *
+from .config import *
+from .calibration import *

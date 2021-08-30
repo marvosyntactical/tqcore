@@ -7,13 +7,13 @@ from functools import partial
 import math
 
 import torch
-from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from torch.autograd import Variable
 
 from .quantizable_layer import \
-    Quant, DeQuant, \
+    QuantStub, DeQuantStub, \
     QListener, \
     QAdd, QMul, QMatMul, \
     QSoftmax, \
@@ -22,7 +22,9 @@ from .quantizable_layer import \
     QFFT, \
     FFT, \
     NonQuantizableModuleWrap, \
-    print_qt_stats
+    print_qt_stats, \
+    __CLIPPING_MODULES__, \
+    __SYMMETRIZING_MODULES__
 
 from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
 
@@ -111,7 +113,6 @@ class MultiHeadedAttention(nn.Module):
         output = self.output_layer(context)
 
         return output
-
 
 # this file contains quantized versions of layers used in tst_pytorch/modules.py
 
@@ -206,7 +207,7 @@ class QPositionalEncoding(nn.Module):
                  ):
         super().__init__()
 
-        self.W = nn.Parameter(init_fn(time_window,dim))
+        self.W = nn.Parameter(init_fn(time_window, dim))
 
     def forward(self, X):
         """
@@ -347,12 +348,15 @@ class QPositionwiseFeedForward(nn.Module):
         :param dropout:
         """
         super().__init__()
+        activation = eval(activ.strip())()
+        print(f"Initiated QFeedFwd with activation={activation}")
+
         modules = [
             nn.Linear(input_size, ff_size),
-            eval(activ.strip())(), # unsafe FIXME
+            activation,
         ]
         modules += [
-            QListener(*modules, **qkwargs),
+            QListener(*modules, clipped_distribution=True, **qkwargs),
             nn.Linear(ff_size, input_size)
         ]
         modules += [
@@ -407,7 +411,7 @@ class QTransformerEncoderLayer(nn.Module):
 
         self.has_bn = True
         self.has_res = True # debug: no residuals/adding/dropout # only second res for now
-        self.has_mix = True
+        self.has_mix = False
 
         self.fft = fft
         mix_output_layer = []
@@ -555,23 +559,32 @@ class QTransformerEncoder(nn.Module):
         """
         super().__init__()
 
-        self.embedding = nn.Linear(src_dim, dim)
-        self.pe = QPositionalEncoding(dim, time_window)
-        self.emb_dropout = nn.Dropout(p=emb_dropout)
+        self.quantStub = QuantStub(**qkwargs)
+        self.input_listener = QListener(self.quantStub, calibration="minandmax", **qkwargs)
 
-        self.quantStub = Quant(**qkwargs)
-        self.input_listener = QListener(self.quantStub, **qkwargs)
+        self.embedding = nn.Linear(src_dim, dim)
+        self.emb_listener = QListener(self.embedding, **qkwargs)
+
+        self.pe = QPositionalEncoding(dim, time_window)
+        self.pe_listener = QListener(self.pe, **qkwargs)
+
+        self.emb_dropout = nn.Dropout(p=emb_dropout)
 
         # build all (num_layers) layers
         self.layers = nn.ModuleList([
-            QTransformerEncoderLayer(dim=dim, ff_size=ff_size,
+            QTransformerEncoderLayer(
+                dim=dim, ff_size=ff_size,
                 num_heads=num_heads, dropout=dropout,
-                time_window=time_window, activ=activ, fft=fft, qkwargs=qkwargs)
+                time_window=time_window, activ=activ,
+                fft=fft, qkwargs=qkwargs
+            )
             for _ in range(num_layers)
         ])
 
         if freeze:
             raise NotImplementedError("TODO Implement Freezing everything but head as in TST paper")
+
+        self.plot_step_counter = 0
 
     def forward(self,
                 x: Tensor,
@@ -593,13 +606,20 @@ class QTransformerEncoder(nn.Module):
             - hidden_concat: last hidden state with
                 shape (batch_size, directions*hidden)
         """
+        self.plot_step_counter += 1
 
-        x = self.embedding(x)
-        x = self.pe(x)  # add position encoding to word embeddings
-        x = self.emb_dropout(x)
-
+        x = (x - x.mean()) / x.std()
         x = self.quantStub(x)
         x = self.input_listener(x)
+
+        print_qt_stats("input", x, stage=self.quantStub.stage, step=self.plot_step_counter, plot="always")
+        x = self.embedding(x)
+        x = self.emb_listener(x)
+
+        x = self.pe(x) # add position encoding to word embeddings
+        x = self.pe_listener(x)
+
+        x = self.emb_dropout(x)
 
         for layer in self.layers:
             x = layer(x, mask)
@@ -608,13 +628,14 @@ class QTransformerEncoder(nn.Module):
 
     def __repr__(self):
         if not self.layers[0].fft:
-            pass # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
+            pass
+            # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
             # s = "%s(num_layers=%r, num_heads=%r)" % (
             #     self.__class__.__name__, len(self.layers),
             #     self.layers[0].mixer.fp_module.num_heads,
             #     self.layers[0].mixer.num_heads,
             # )
-            s="f{self.__class__.__name__}:FIXME"
+            s="f{self.__class__.__name__}:(FIXME display info)"
         else:
             s = "%s(num_layers=%r, fft=True)" % (
                 self.__class__.__name__, len(self.layers)
@@ -676,7 +697,7 @@ class QTSTModel(nn.Module):
             ]
             head_list += [
                 QListener(head_list[-1], **qkwargs),
-                DeQuant(**qkwargs),
+                DeQuantStub(**qkwargs),
             ]
 
         elif "reg" in task:
@@ -687,7 +708,7 @@ class QTSTModel(nn.Module):
             ]
             head_list += [
                 QListener(head_list[-1], **qkwargs),
-                DeQuant(**qkwargs),
+                DeQuantStub(**qkwargs),
             ]
         elif "cl" in task:
             # classification: predict distribution over n labels (Softmax in CrossEntropyLoss)
@@ -697,7 +718,7 @@ class QTSTModel(nn.Module):
             ]
             head_list += [
                 QListener(head_list[-1], **qkwargs),
-                DeQuant(**qkwargs),
+                DeQuantStub(**qkwargs),
                 nn.LogSoftmax(dim=-1),
             ]
         else:
@@ -707,8 +728,6 @@ class QTSTModel(nn.Module):
             *head_list
         )
 
-
-
     def forward(self, src, mask=None):
 
         h = self.encoder(src, mask)
@@ -716,5 +735,8 @@ class QTSTModel(nn.Module):
 
         return out
 
+__SYMMETRIZING_MODULES__ += [
+    QPositionalEncoding,
+]
 
 

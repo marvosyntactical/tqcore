@@ -1,22 +1,30 @@
 import torch
-import torch.nn as nn
-
-from .qtensor import QTensor
-from .quantization_functions import Quantization, \
-        UniformQuantization, UniformSymmetricQuantization, FakeQuant
 
 import matplotlib
 import matplotlib.pyplot as plt
 
+from .qtensor import QTensor
+from .quantization_functions import Quantization, \
+        UniformQuantization, UniformSymmetricQuantization, FakeQuant
+from .config import QuantStage
+
 
 __PLOT__ = 0
 __DEBUG__ = 0
+
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
 
-
-def print_qt_stats(name, qtnsr, stage=2, step=0):
-
-    if stage == 2:
+def print_qt_stats(
+        name,
+        qtnsr,
+        stage=QuantStage.Quantized,
+        step=0,
+        plot=None
+    ):
+    plot_dir = "/home/silversurfer42/Pictures/plots/again/"
+    qat_plot_str = plot_dir + "QAT_{}_{}.png"
+    fp_plot_str =  plot_dir + "FP32_{}_{}.png"
+    if stage == QuantStage.Quantized:
         data, scale, zero = qtnsr._t, qtnsr.scale, qtnsr.zero
         vmin, vmax = data.min(), data.max()
         assert qtnsr.quantized
@@ -34,7 +42,7 @@ def print_qt_stats(name, qtnsr, stage=2, step=0):
         print("="*20)
         print(fstr)
 
-    elif (stage == 1) and __DEBUG__:
+    elif (stage == QuantStage.QAT) and __DEBUG__:
         if isinstance(qtnsr, QTensor):
             assert not qtnsr.quantized
             data = qtnsr._t
@@ -51,19 +59,21 @@ def print_qt_stats(name, qtnsr, stage=2, step=0):
             plot_data = data.detach().reshape(-1).numpy()
             plt.hist(plot_data, bins=100)
             plt.gca().set(title=f"QAT Activation hist after {name}", ylabel="Freq")
-            plt.savefig(f"/home/silversurfer42/Pictures/plots/again/QAT_{name}_{step}.png")
+            plt.savefig(QAT_plot_str.format(name, step))
             plt.gcf().clear()
 
-    elif (stage == 0):
+    elif (stage == QuantStage.FP32):
         data = qtnsr
         # sometimes show matplotlib histogram
-        if __PLOT__ and torch.rand(1) > 0.9:
+        if __PLOT__ and torch.rand(1) > 0.9 or plot=="always":
             plot_data = data.detach().reshape(-1).numpy()
             plt.hist(plot_data, bins=100)
             plt.gca().set(title=f"FP32 Activation hist after {name}", ylabel="Freq")
-            plt.savefig(f"/home/silversurfer42/Pictures/plots/again/FP32_{name}_{step}.png")
+            plt.savefig(fp_plot_str.format(name, step))
             plt.gcf().clear()
 
 
+class QuantConfigurationError(Exception):
+    pass
 
 

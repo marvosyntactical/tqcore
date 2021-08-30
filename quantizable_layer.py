@@ -3,22 +3,28 @@ from torch import Tensor
 from torch.fft import fft, fft2
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .qtensor import QTensor
-from .quantization_functions import Quantization, \
-        UniformQuantization, UniformSymmetricQuantization, FakeQuant
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from torch.nn.modules.utils import _pair
 
 import math
 import copy
-from typing import Optional, Union, Tuple
-from functools import partial
+from enum import Enum
+from typing import Optional, Union, Tuple, Dict, Union
+from collections import defaultdict
+import warnings
 
-from .utils import print_qt_stats, is_integer
+from .qtensor import QTensor
+from .quantization_functions import Quantization, \
+        UniformQuantization, UniformSymmetricQuantization, FakeQuant
+from .utils import print_qt_stats, is_integer, QuantConfigurationError
+from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind
+from .histogram import HistogramCalibrator
+
+
+__ASSERT__ = True
 
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
-
 class QuantizableModule(nn.Module):
     """
     Interface for quantizable modules to implement.
@@ -55,7 +61,7 @@ class QuantizableModule(nn.Module):
         self.weight_quantization = weight_quantization(nudge_zero=nudge_zero)
         self.num_bits_bias = num_bits_bias
 
-        self.stage = 0 # 0 == FP32; 1 == QAT; 2 == Quantized
+        self.stage = QuantStage.FP32
         self.forward = self.forward_fp # changes from stage to stage
 
     def forward_fp(self, x: Tensor) -> Tensor:
@@ -67,19 +73,30 @@ class QuantizableModule(nn.Module):
     def forward_quantized(self, x: QTensor) -> QTensor:
         raise NotImplementedError(f"{type(self)}.forward_quantized")
 
+    def calibration_prepare(self):
+        self.stage = QuantStage.Calibration
+
     def qat_prepare(self):
-        self.stage = 1
+        self.stage = QuantStage.QAT
         self.forward = self.forward_qat
 
     def quantize(self):
-        self.stage = 2
+        self.stage = QuantStage.Quantized
         self.forward = self.forward_quantized
 
+        if not [attr for attr in dir(self) if "scale" in attr or "zero" in attr]:
+            warnings.warn(
+                f"""
+                During {self}.quantize(), no scale or zero attribute were found.
+                These should be set for this instance of {type(self)}.
+                Could be due to calling super().quantize() before setting self.zero/self.scale.
+                """
+            )
 
-class Quant(QuantizableModule):
+class QuantStub(QuantizableModule):
     """
     Quantizes incoming torch.Tensors into tqcore.QTensors if necessary.
-    Functionality Analogous to torch.quantization.QuantStub
+    Functionality analogous to torch.quantization.QuantStub
     """
 
     def forward_qat(self, x):
@@ -100,18 +117,18 @@ class Quant(QuantizableModule):
         if isinstance(x, Tensor)\
                 and torch.is_floating_point(x)\
                 and not isinstance(x, QTensor):
-            r = self.quantization.quantize_to_qtensor(
+            r = self.quantization.quantize_to_qtensor_using_params(
                 x,
-                self.min_val,
-                self.max_val,
-                num_bits=self.num_bits
+                self.scale,
+                self.zero,
+                num_bits=self.num_bits,
             )
         return r
 
-class DeQuant(QuantizableModule):
+class DeQuantStub(QuantizableModule):
     """
     Dequantizes incoming torch.Tensors into tqcore.QTensors if necessary.
-    Functionality Analogous to torch.quantization.QuantStub
+    Functionality Analogous to torch.quantization.DeQuantStub
     """
     def __init__(self, **qkwargs):
         super().__init__(**qkwargs)
@@ -140,172 +157,6 @@ class DeQuant(QuantizableModule):
     def forward_quantized(self, outputs: Union[QTensor, Tuple[QTensor]]):
         f = lambda qt: qt.dequantize()
         return self._process_outputs(outputs, f)
-
-class QListener(QuantizableModule):
-    """
-    During qat, this module records min, max values of torch.Tensor s passing through.
-    (no other module records stats)
-    Constructed with n nn.Modules "modules", for each of which the QListener sets the attributes:
-        - module.scale_next
-        - module.zero_next
-        - module.min_val
-        - module.max_val
-    Or, optionally, module.name_scale_next, and so on.
-    """
-    def __init__(
-            self,
-            *modules: nn.Module,
-            name = None,
-            function = None,
-            dont_fakeQ: bool = False,
-            ema_decay: float = .9999,
-            nudge_zero: bool = False,
-            calibrate: bool = False,
-            **qkwargs
-        ):
-
-        super().__init__(**qkwargs)
-
-        self.function = function # optionally apply function before collecting stats (for softmax)
-        self.name = "" if name is None else str(name) # set attribute name_scale_next and so on
-        self.ema_decay = ema_decay
-        self.calibrate = calibrate
-
-        self.__stats__ = {}
-        for module in modules:
-            setattr(module, self.name+'__stats__', self.__stats__)
-        self.mods = list(modules)
-
-        self.dont_fakeQ = dont_fakeQ
-        if not dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply_wrapper
-
-        self._ranges_set = False
-
-    def _forward(self, x: QTensor):
-        """
-        Collect stats AND fakequantize
-        """
-        self._update_ema_stats(x._t)
-
-        if not self.dont_fakeQ:
-            scale, zero = self.quantization.calc_params(
-                self.__stats__["ema_min"], self.__stats__["ema_max"],
-                num_bits=self.num_bits
-            )
-
-            x = self.fake_quantize(
-                x,
-                self.quantization,
-                self.num_bits,
-                self.__stats__["ema_min"],
-                self.__stats__["ema_max"],
-                handling_qtensors=True,
-            )
-        # print("QListener stat aware output type: ",type(x))
-        return x
-
-    def forward_fp(self, x: Tensor):
-        return x
-
-    def forward_qat(self, x: QTensor):
-        x = self._forward(x)
-        self.set_ranges() # already make scale and zero accessible here for NonQuantizedModule
-        return x
-
-    def forward_quantized(self, x: QTensor) -> QTensor:
-
-        # costly! remove these! TODO FIXME
-        assert isinstance(x, QTensor)
-        assert is_integer(x._t)
-        assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
-        assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
-        # print(f"CHECKS PASSED;\n {type(self.mods[0])}")
-        # print_qt_stats(type(self.mods[0]), x)
-        return x
-
-    def _update_ema_stats(self, x):
-        """
-        Calculates EMA/MA for activations, based on https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
-        Each call calculates EMA for one layer, specified by key.
-        Stats is a regular python dictionary containing EMA for multiple layers.
-        :param x: activation tensor of layer
-        :param stats: dictionary: EMA
-        :param key: string, name/identifier of current layer
-        :return: stats: updated EMA
-        """
-        x = x.detach()
-
-        if self.function is not None:
-            cache = x
-            x = self.function(x)
-            assert not torch.isinf(x).any(), f"fraction of infs: {torch.isinf(x).sum()/x.view(-1).shape[0]}, {cache.max().item()}, {cache.min().item()}"
-
-        max_val = torch.max(x).item()
-        min_val = torch.min(x).item()
-
-        assert not torch.isnan(x).any(), f"fraction of NaNs: {torch.isnan(x).sum()/x.view(-1).shape[0]}"
-        # assert max_val != min_val, (max_val, (x==max_val).all())
-
-        if not self.__stats__:
-            self.__stats__ = {"ema_max": max_val, "ema_min": min_val}
-
-        curr_max = self.__stats__["ema_max"]
-        curr_min = self.__stats__["ema_min"]
-        self.__stats__['ema_max'] = max(max_val, curr_max) if curr_max is not None else max_val
-        self.__stats__['ema_min'] = max(min_val, curr_min) if curr_min is not None else min_val
-
-
-        if 'ema_min' in self.__stats__:
-            # self.__stats__['ema_min'] = (1.-self.ema_decay) * min_val + self.ema_decay * self.__stats__['ema_min']
-            self.__stats__['ema_min'] -=  (1 - self.ema_decay) * (self.__stats__['ema_min'] - min_val)
-        else:
-            self.__stats__['ema_min'] = min_val
-
-        if 'ema_max' in self.__stats__:
-            # self.__stats__['ema_max'] = (1.-self.ema_decay) * max_val + self.ema_decay * self.__stats__['ema_max']
-            self.__stats__['ema_max'] -= (1 - self.ema_decay) * (self.__stats__['ema_max'] - max_val)
-        else:
-            self.__stats__['ema_max'] = max_val
-
-        # assert not torch.isnan(torch.Tensor([self.__stats__["ema_max"]]))
-        # assert not torch.isnan(torch.Tensor([self.__stats__["ema_min"]]))
-
-        # FIXME need to update every module's stats individually
-        # previously, it worked to just set their stats to another module's stats dict
-        # and update that. Now the id()s change when doing that and updating only
-        # the QListener dict. So now I've got to have a list with all the modules,
-        # which may be dangerous with certain other things
-        for module in self.mods:
-            setattr(module, self.name+'__stats__', self.__stats__)
-
-    def quantize(self):
-        self.set_ranges()
-        return super().quantize()
-
-    def set_ranges(self):
-        stats = self.__stats__
-
-        try:
-            scale_next, zero_next = self.quantization.calc_params(
-                stats["ema_min"], stats["ema_max"], num_bits=self.num_bits
-            )
-        except KeyError as KE:
-            if True in [isinstance(mod, QMask) or isinstance(mod, QSoftmax) for mod in self.mods]:
-                print(f"Got KeyError: {KE} during QListener conversion.")
-                return
-            else:
-                raise
-
-        prefix = self.name + "_" if self.name else ""
-
-        for mod in self.mods:
-            setattr(mod, prefix+"scale_next", scale_next)
-            setattr(mod, prefix+"zero_next", zero_next)
-            setattr(mod, prefix+"min_val", stats["ema_min"])
-            setattr(mod, prefix+"max_val", stats["ema_max"])
-
-        self._ranges_set = True
 
 
 def _convert_to_qtensor_for_kernel(
@@ -339,7 +190,6 @@ def _convert_to_qtensor_for_kernel(
 
         ab[i] = t
     return tuple(ab)
-
 
 def _qadd(
         a, b, factor: float,
@@ -424,7 +274,7 @@ class QMul(QuantizableModule):
     def forward_qat(self, a: QTensor, b: QTensor):
         # NO affine transformation; multiply in float but keep track of scale
         rfloat = a._t * b._t
-        r = QTensor(rfloat, scale=self.scale_next, zero=self.zero_next, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
         return r
 
     def forward_quantized(
@@ -433,7 +283,7 @@ class QMul(QuantizableModule):
             b: Union[QTensor, torch.Tensor, nn.Parameter, float, int],
         ):
         # affine transformation; simulates low bit multiplication
-        return _qmul(a, b, 1., self.scale_next, self.zero_next, torch.mul,
+        return _qmul(a, b, 1., self.scale, self.zero, torch.mul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
 
@@ -448,12 +298,12 @@ class QMatMul(QuantizableModule):
 
     def forward_qat(self, a, b):
         rfloat = self.factor * a._t @ b._t
-        r = QTensor(rfloat, scale=self.scale_next, zero=self.zero_next, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
         return _qmul(
-                a, b, self.factor, self.scale_next, self.zero_next, torch.matmul,
+                a, b, self.factor, self.scale, self.zero, torch.matmul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
 
@@ -466,7 +316,7 @@ class QAdd(QuantizableModule):
 
     def forward_qat(self, a: QTensor, b: QTensor):
         rfloat = a._t + b._t
-        r = QTensor(rfloat, scale=self.scale_next, zero=self.zero_next, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
@@ -476,7 +326,7 @@ class QAdd(QuantizableModule):
         print("end qt stats in QAdd:")
         return _qadd(
             a, b, 1.,
-            self.scale_next, self.zero_next, torch.add,
+            self.scale, self.zero, torch.add,
             self.quantization, self.weight_quantization,
             self.num_bits, self.num_bits_weight
         )
@@ -492,11 +342,11 @@ class QMask(QuantizableModule):
 
     def forward_qat(self, scores, mask):
         scores = scores._t.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
-        return QTensor(scores, self.scale_next, self.zero_next, quantized=False)
+        return QTensor(scores, self.scale, self.zero, quantized=False)
 
     def forward_quantized(self, scores, mask):
-        scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero_next)
-        return QTensor(scores, self.scale_next, self.zero_next)
+        scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero)
+        return QTensor(scores, self.scale, self.zero)
 
 class QSoftmax(QuantizableModule):
 
@@ -543,7 +393,7 @@ class QSoftmax(QuantizableModule):
     def _exp_lkp(self, long_tensor: torch.LongTensor):
         # (not differentiable)
         return QTensor(
-            self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale_next, zero=self.exp_zero_next,
+            self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale, zero=self.exp_zero,
             quantized=False
         )
 
@@ -573,16 +423,16 @@ class QSoftmax(QuantizableModule):
     def forward_quantized(self, inp: QTensor) -> QTensor:
 
         print(f"Softmax quantized fwd debug:")
-        print(self.exp_scale_next, self.exp_zero_next)
-        print(self.normed_scale_next, self.normed_zero_next)
+        print(self.exp_scale, self.exp_zero)
+        print(self.normed_scale, self.normed_zero)
         print(f"mean of inp: {inp._t.mean().item()} (if high, logsumexp can help!)")
         print("^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
         exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0 to 255 here already!
 
         zeroed_exp =  exponentiated._t - exponentiated.zero
-        M = exponentiated.scale / (self.normed_scale_next * self.alpha)
-        normed_exp = (zeroed_exp * M) + self.normed_zero_next
+        M = exponentiated.scale / (self.normed_scale * self.alpha)
+        normed_exp = (zeroed_exp * M) + self.normed_zero
         r = self.quantization.tensor_clamp(normed_exp, num_bits=self.num_bits)
 
         # print("Softmax return:")
@@ -672,8 +522,8 @@ class NonQuantizableModuleWrap(QuantizableModule):
         q_outs = [
         self.quantization.quantize_to_qtensor_using_params(
             fp_out,
-            scale=self.out_scale_next,
-            zero=self.out_zero_next,
+            scale=self.out_scale,
+            zero=self.out_zero,
             num_bits=self.num_bits
         ) if is_q[i] else fp_out for i, fp_out in enumerate(fp_outs)]
 
@@ -685,14 +535,8 @@ class QReLU6(QuantizableModule):
         return nn.functional.relu6(x)
 
     def forward_qat(self, x: torch.Tensor) -> torch.Tensor:
-        # min_val = self.__stats__.get("ema_min", x.min().item())
-        # max_val = self.__stats__.get("ema_max", x.max().item())
 
-        # scale, zero = self.quantization.calc_params(
-        #     min_val, max_val, num_bits=self.num_bits
-        # )
-
-        scale, zero = self.scale_next, self.zero_next
+        scale, zero = self.scale, self.zero
 
         six = round(6 / scale + zero)
         out = x.clamp(min=zero, max=six)
@@ -701,8 +545,8 @@ class QReLU6(QuantizableModule):
 
     def forward_quantized(self, x: QTensor) -> QTensor:
 
-        scale = self.scale_next
-        zero = self.zero_next
+        scale = self.scale
+        zero = self.zero
         six = round(6 / scale + zero)
         out = x._t.clamp(min=zero, max=six)
 
@@ -713,8 +557,6 @@ class QReLU6(QuantizableModule):
 
         return QTensor(out, scale=scale, zero=zero)
 
-
-
 def DiscreteHartleyTransform(input):
     # from https://github.com/AlbertZhangHIT/Hartley-spectral-pooling/blob/master/spectralpool.py
     # TODO test as alternative
@@ -724,7 +566,6 @@ def DiscreteHartleyTransform(input):
 
 class FFT(nn.Module):
     # TODO move this to ..modules.py
-
     # TODO figure out mask
 
     # figure out whether to orthonormalize (scale by 1/sqrt(n))
@@ -772,4 +613,286 @@ class QFFT(QuantizableModule):
         x = x.real #  + x.imag
         return x
 
+class QListener(QuantizableModule):
+    """
+    During qat, this module records min, max values of torch.Tensor s passing through.
+    (no other module records stats)
+    Constructed with n nn.Modules "modules", for each of which the QListener sets the attributes:
+        - module.scale_next
+        - module.zero_next
+        - module.min
+        - module.max
+    Or, optionally, module.name_scale_next, and so on.
+    """
+    def __init__(
+            self,
+            *modules: nn.Module,
+            name = None,
+            function = None,
+            dont_fakeQ: bool = False,
+            ema_decay: float = .9999,
+            nudge_zero: bool = False,
+            calibration: Optional[str] = None, # manually override qkwargs["calib_mode"]
+            clipped_distr: Optional[bool] = None, # manually override distribution type
+            **qkwargs
+        ):
+
+        super().__init__(**qkwargs)
+
+        self.function = function # optionally apply function before collecting stats (for softmax)
+        self.name = "" if name is None else str(name) # set attribute name_scale_next and so on
+        self.ema_decay = ema_decay
+        self.set_qparams_during_quantization = False # updates range after every QAT forward call
+        self.mods = list(modules)
+
+        # CalibMode
+        calib_mode = qkwargs["calib_mode"].lower() if calibration is None else calibration
+        if "kl" in calib_mode or "div" in calib_mode or "ent" in calib_mode:
+            self.calibration_mode = CalibMode.KL
+        elif "min" in calib_mode or "max" in calib_mode or "ema" in calib_mode:
+            self.calibration_mode = CalibMode.EMA
+        else:
+            raise QuantConfigurationError(f"calib_mode={calib_mode}")
+
+        if self.calibration_mode==CalibMode.KL:
+            self.hist_calib = HistogramCalibrator(
+                num_bits=self.num_bits,
+                num_bins=qkwargs["calib_num_bins"],
+                unsigned=True,
+                skip_zeros=False,
+            )
+            # type of input distribution
+            if clipped_distr is not None:
+                # manually specified by user during init
+                self.distribution_kind = DistKind.CLIPPED if clipped_distr else DistKind.SYMM
+            else:
+                # infer distribution based on input modules
+                errmsg = f"""QListener cannot infer kind of input distribution on its own :/
+It listens to {self.mods}.
+Please specify the kind of input distribution for this QListener
+by initializing it with clipped_distr: bool given as kwarg.
+"""
+                # is there a clipping input module?
+                clipping = True in [isinstance(mod, tuple(__CLIPPING_MODULES__)) for mod in self.mods]
+                # is there a symmetrizing input module?
+                symm = True in [isinstance(mod, tuple(__SYMMETRIZING_MODULES__)) for mod in self.mods]
+
+                if clipping and not symm:
+                    self.distribution_kind = DistKind.CLIPPED
+                    distkind = "clipped"
+                elif symm and not clipping:
+                    self.distribution_kind = DistKind.SYMM
+                    distkind = "symmetric"
+                else:
+                    if not clipping and not symm:
+                        errmsg += "(The problem could be due to the modules above being unknown.)"
+                        raise QuantConfigurationError(errmsg)
+                    else:
+                        # errmsg += "(The problem is due to some input modules producing a symmetric, others a clipped distribution.)"
+                        # assume clipping is applied to everything
+                        warnings.warn(f"QListeneder encountered some clipping, some symmetrizing input modules. Assuming everything is clipped.")
+                        self.distribution_kind = DistKind.CLIPPED
+                        distkind = "clipped"
+                warnings.warn(f"QListener listening to\n{self.mods}\ndecided on {distkind}")
+        else:
+            # distribution does not matter if we just estimate EMA min/max
+            if clipped_distr is not None:
+                warnings.warn(f"QListener listening to\n{self.mods}\nignores given kwarg clipped_distr={clipped_distr} because it calibrates with EMA only")
+            self.distribution_kind = DistKind.IGNORE
+
+        if self.distribution_kind != DistKind.CLIPPED:
+            self.__stats__ = defaultdict()
+            # TODO FIXME is this still necessary?
+            for module in self.mods:
+                setattr(module, self.name+'__stats__', self.__stats__)
+
+        threshs = qkwargs["thresholds"].lower()
+        if "symm" in threshs:
+            self.threshold_mode = ThresholdMode.Symmetric
+        elif "indep" in threshs:
+            self.threshold_mode = ThresholdMode.Independent
+        elif "conj" in threshs:
+            self.threshold_mode = ThresholdMode.Conjugate
+        else:
+            raise QuantConfigurationError(f"thresholds={threshs}")
+
+        self.dont_fakeQ = dont_fakeQ
+        if not dont_fakeQ:
+            self.fake_quantize = FakeQuant.apply_wrapper
+
+        self._qparams_set = False
+
+    def forward_fp(self, x: Tensor):
+        if self.stage == QuantStage.Calibration:
+            """
+            Save histograms for Calibration as in
+            https://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
+            """
+            if self.calibration_mode == CalibMode.KL:
+                self.hist_calib.collect(x)
+                if self.distribution_kind == DistKind.SYMM:
+                    # update mean ema
+                    self._update_ema(x)
+                if not self.set_qparams_during_quantization:
+                    self._set_qparams()
+            else:
+                self._update_ema(x)
+        return x
+
+    def forward_qat(self, x: QTensor):
+        """
+        Collect stats and possibly fakequantize
+        """
+        if not self.distribution_kind==CalibMode.CLIPPED:
+            self._update_ema(x)
+
+        if not self.dont_fakeQ:
+            scale, zero = self.quantization.calc_params(
+                self.__stats__["min"],
+                self.__stats__["max"],
+                num_bits=self.num_bits
+            )
+
+            x = self.fake_quantize(
+                x,
+                self.quantization,
+                self.num_bits,
+                self.__stats__["min"],
+                self.__stats__["max"],
+                handling_qtensors=True,
+            )
+        if not self.set_qparams_during_quantization:
+            # already make scale and zero accessible here for NonQuantizedModule
+            # also done for KL_CLIPPED calibration in tensorRT's procedure
+            self._set_qparams()
+        return x
+
+    def forward_quantized(self, x: QTensor) -> QTensor:
+
+        if __ASSERT__:
+            # costly! remove these! TODO FIXME
+            assert isinstance(x, QTensor)
+            assert is_integer(x._t)
+            assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
+            assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
+        return x
+
+    def _update_ema(self, x: QTensor=None):
+        """
+        Calculates EMA for activations, based on https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
+        Each call calculates EMA for one layer, specified by key.
+        EMA statistics are saved to self.__stats__,
+        a regular python dictionary containing EMA stats.
+        If and what EMA stats are saved depends on self.calibration_mode and self.distribution_kind:
+            * CalibMode.KL and DistKind.SYMM: "mu"
+            * CalibMode.EMA: "min", "max"
+        :param x: QTensor, unless fp is True, then self.calibration_mode must be gaussian, and x FP32
+        :param fp: string, name/identifier of current layer
+        :return: stats: updated EMA
+        """
+        x = x.detach()
+        assert not torch.isnan(x).any(), f"fraction of NaNs: {torch.isnan(x).sum()/x.view(-1).shape[0]}"
+
+        if self.function is not None:
+            # transform input by function (exp; for softmax)
+            cache = x
+            x = self.function(x)
+            assert not torch.isinf(x).any(), f"fraction of infs: {torch.isinf(x).sum()/x.view(-1).shape[0]}, {cache.max().item()}, {cache.min().item()}"
+
+        if self.distribution_kind == DistKind.SYMM:
+            mu = torch.mean(x).item()
+            # sigma = torch.std(x).item()
+            dict_new_vals = {"mu": mu}
+        else:
+            assert self.calibration_mode == CalibMode.EMA
+            min_val = torch.min(x).item()
+            max_val = torch.max(x).item()
+            assert max_val != min_val, (max_val, (x==max_val).all())
+            dict_new_vals = {"min": min_val, "max": max_val}
+
+        if not self.__stats__:
+            self.__stats__ = dict_new_vals
+        else:
+            for key, new_val in dict_new_vals.items():
+                curr_val = self.__stats__[key]
+                self.__stats__[key] = max(new_val, curr_val) if curr_val is not None else new_val
+
+        for key, ema in self.__stats__.items():
+            new_val = dict_new_vals[key]
+            self.__stats__[key] -= (1 - self.ema_decay) * (ema - new_val)
+
+        for module in self.mods:
+            setattr(module, self.name+'__stats__', self.__stats__)
+
+    def quantize(self):
+        if self.set_qparams_during_quantization:
+            self._set_qparams()
+        return super().quantize()
+
+    def _compute_thresholds(self, a, b, mu=None):
+        if self.threshold_mode == ThresholdMode.Symmetric:
+            return a, b
+        elif self.threshold_mode == ThresholdMode.Independent:
+            return a, b
+        elif self.threshold_mode == ThresholdMode.Conjugate:
+            assert mu is not None
+            t = max(abs(mu - a), abs(mu - b))
+            return (mu - t).item(), (mu + t).item()
+
+    def _set_qparams(self):
+        # depends on self.calibration_mode
+        try:
+            if self.calibration_mode==CalibMode.EMA:
+                stats = self.__stats__
+                scale, zero = self.quantization.calc_params(
+                    stats["min"], stats["max"], num_bits=self.num_bits
+                )
+            else:
+                if self.distribution_kind==DistKind.SYMM:
+                    stats = self.__stats__
+                    mu = stats["mu"]
+                    a, b = self.hist_calib.compute_range(mu, title=self)
+                    lower, upper = self._compute_thresholds(mu, a, b)
+                    scale, zero = self.quantization.calc_params(
+                        lower, upper, num_bits=self.num_bits
+                    )
+                elif self.distribution_kind==DistKind.CLIPPED:
+                    a, b = self.hist_calib.compute_one_bound()
+                    scale, zero = self.quantization.calc_params(
+                        a, b,  num_bits=self.num_bits
+                    )
+        except KeyError as KE:
+            raise Exception(f"Got KeyError: {KE} during QListener (listening to {self.mods}) conversion. It was possibly never called during tuning?")
+
+        prefix = self.name + "_" if self.name else ""
+
+
+        # set attributes for all listened modules
+        for mod in self.mods:
+            msg = f"Successfully set {mod}'s qparams: scale, zero"
+            setattr(mod, prefix+"scale", scale)
+            setattr(mod, prefix+"zero", zero)
+            if self.distribution_kind!=DistKind.CLIPPED:
+                msg += f", {list(stats.keys())}"
+                for key, ema in stats.items():
+                    setattr(mod, prefix+key, ema)
+            print(msg)
+        self._qparams_set = True
+
+    def __repr__(self):
+        s = f"QListener(mods={self.mods}, dist={self.distribution_kind}, calib={self.calibration_mode})"
+        return s
+
+# these must be updated in every module that adds QuantizableModules that belong here
+global __CLIPPING_MODULES__, __SYMMETRIZING_MODULES__
+__CLIPPING_MODULES__ = [
+    QReLU6,
+    nn.ReLU6,
+    nn.ReLU
+] # comprehensive list of modules that output clipped distribution
+__SYMMETRIZING_MODULES__ = [
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.Linear
+]
 
