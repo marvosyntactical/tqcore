@@ -12,8 +12,15 @@ import logging
 logging.basicConfig(level="INFO")
 logqt = logging.getLogger("qt")
 
-logging.disable()
-# logqt.info("QTensor logging started")
+__all__ = ["QTensor"]
+
+__DEBUG__ = 0
+__LOG__ = 1
+if __LOG__:
+    logqt.info("QTensor logging started")
+else:
+    logging.disable()
+
 
 class QTensor:
     r"""
@@ -37,7 +44,7 @@ class QTensor:
         if self.quantized:
             # TODO remove this costly assertion after testing !!!!! FIXME:
             assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
-            if not symmetric:
+            if not symmetric and __DEBUG__:
                 assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
         # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
@@ -46,6 +53,7 @@ class QTensor:
     def dequantize(self) -> Tensor:
         return (self._t - self.zero) * self.scale
 
+    @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """
         From
@@ -86,8 +94,12 @@ class QTensor:
 
             tensor_args = [a._t if isinstance(a, QTensor) else a for a in args]
             ret = func(*tensor_args, **kwargs)
-            return QTensor(ret, scale=args[0].scale, zero=args[0].zero,
-                    quantized=args[0].quantized)
+            return QTensor(
+                ret,
+                scale=args[0].scale,
+                zero=args[0].zero,
+                quantized=args[0].quantized
+            )
 
 
     # ----------------- item methods for slicing ---------------

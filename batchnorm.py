@@ -4,7 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from .quantizable_layer import QuantizableModule, _qmul, _qadd, print_qt_stats, __SYMMETRIZING_MODULES__
+from .quantizable_layer import QuantizableModule, print_qt_stats, SYMMETRIZING_MODULES
+from .kernel import qmul, qadd
 from .qtensor import QTensor
 from .quantization_functions import FakeQuant
 
@@ -45,7 +46,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         # TODO assign these tensors permanently during .quantize() ....
         # (this falls under optimization tho and would not appease mr knuth)
 
-        gamma = self.weight_quantization.quantize_to_qtensor(
+        gamma = self.weight_quantization.quantize_to_qtensor_using_range(
             self.folded_weight,
             num_bits=self.num_bits_weight # int8 or int32 ? TODO test
         )
@@ -80,7 +81,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         return out # QTensor(out, scale=self.scale_next, zero=self.zero_next)
 
-    def do_checks(self, input: Tensor) -> Tensor:
+    def _do_checks(self, input: Tensor) -> Tensor:
         self._check_input_dim(input)
 
         # exponential_average_factor is set to self.momentum
@@ -126,7 +127,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         return bn_training, exponential_average_factor
 
     def forward_fp(self, input: Tensor) -> Tensor:
-        bn_training, exponential_average_factor = self.do_checks(input)
+        bn_training, exponential_average_factor = self._do_checks(input)
 
         return F.batch_norm(
             input,
@@ -141,7 +142,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
 
     def forward_qat(self, input: Tensor) -> Tensor:
-        bn_training, exponential_average_factor = self.do_checks(input)
+        bn_training, exponential_average_factor = self._do_checks(input)
 
         return F.batch_norm(
             input,
@@ -171,13 +172,10 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
                 * self.folded_weight)
 
     def train(self, mode:bool):
-
         # batchnorm can apparently not handle eval mode
         # (https://github.com/pytorch/pytorch/issues/4741)
         # instead, set following flag and use it in BatchNormWrap.forward:
-
         self.track_running_stats = bool(mode)
-
         return self
 
 class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
@@ -366,6 +364,7 @@ class ConvBNfoldable(QuantizableModule):
 
 class QBNFoldableTranspose(QuantizableModule):
     """
+    # FIXME for the moment only works with QAT TODO implement calibration
     container module with custom forward pass thats altered during qat_prepare and qat_convert
 
     via https://pytorch.org/tutorials/advanced/static_quantization_tutorial.html#quantization-aware-training
@@ -414,7 +413,7 @@ class QBNFoldableTranspose(QuantizableModule):
     def forward_quantized(self, x: QTensor) -> QTensor:
         x = torch.transpose(x, 1, 2)
 
-        gamma = self.weight_quantization.quantize_to_qtensor(
+        gamma = self.weight_quantization.quantize_to_qtensor_using_range(
             self.folded_weight,
             num_bits=self.num_bits_weight # int8 or int32 ? TODO test
         )
@@ -503,7 +502,7 @@ class QBNFoldableTranspose(QuantizableModule):
         self.folded_weight = self.fold_weight()
         self.folded_bias = self.fold_bias(self.folded_weight)
 
-__SYMMETRIZING_MODULES__ += [
+SYMMETRIZING_MODULES += [
     QBatchNorm1dTranspose,
     QBNFoldableTranspose,
 ]

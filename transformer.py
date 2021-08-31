@@ -12,23 +12,23 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.autograd import Variable
 
+from .utils import print_qt_stats
 from .quantizable_layer import \
     QuantStub, DeQuantStub, \
     QListener, \
     QAdd, QMul, QMatMul, \
     QSoftmax, \
+    QPositionalEncoding, \
     QMask, \
     QReLU6, \
     QFFT, \
     FFT, \
     NonQuantizableModuleWrap, \
-    print_qt_stats, \
-    __CLIPPING_MODULES__, \
-    __SYMMETRIZING_MODULES__
-
+    CLIPPING_MODULES, \
+    SYMMETRIZING_MODULES
 from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
 
-# from tst.transformer import MultiHeadedAttention
+# from tst.transformer import MultiHeadedAttention, MaskedMSE, XentLoss
 # NOTE copied from tst to avoid the above import:
 
 class MultiHeadedAttention(nn.Module):
@@ -195,30 +195,6 @@ class XentLoss(nn.Module):
         loss = self.criterion(
                 log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
         return loss
-
-class QPositionalEncoding(nn.Module):
-    """
-    Learnable Position Encoding (A W x D bias matrix that we add to the input)
-    """
-    def __init__(self,
-                 dim: int = 0,
-                 time_window: int = 24,
-                 init_fn: Callable = torch.rand
-                 ):
-        super().__init__()
-
-        self.W = nn.Parameter(init_fn(time_window, dim))
-
-    def forward(self, X):
-        """
-        Encode inputs.
-        Args:
-            X (FloatTensor): Sequence of word vectors
-                ``(batch_size, dim, time_window)``
-        """
-        # Add position encodings
-        out = self.W + X
-        return out
 
 class QMultiHeadedAttention(nn.Module):
     """
@@ -410,7 +386,8 @@ class QTransformerEncoderLayer(nn.Module):
             BatchNormMod = QBatchNorm1dTranspose
 
         self.has_bn = True
-        self.has_res = True # debug: no residuals/adding/dropout # only second res for now
+        self.has_res1 = True # debug: no residuals/adding/dropout # only second res for now
+        self.has_res2 = True
         self.has_mix = False
 
         self.fft = fft
@@ -437,12 +414,13 @@ class QTransformerEncoderLayer(nn.Module):
                 self.mix = lambda x, mask: self.mixer(x, mask)
 
 
-        if 0: # self.has_res: # FIXME only second residual for now
+        if self.has_res1: # FIXME only second residual for now
             self.dropout1 = nn.Dropout(dropout)
             self.add1 = QAdd(**qkwargs)
             self.add1l = QListener(
                 * [self.add1] + mix_output_layer,
-                **qkwargs
+                clipped_distr=False,
+                **qkwargs,
             )
 
         if self.has_bn:
@@ -456,13 +434,14 @@ class QTransformerEncoderLayer(nn.Module):
             activ=activ,
             **qkwargs)
 
-        if self.has_res:
+        if self.has_res2:
             self.dropout2 = nn.Dropout(dropout)
             self.add2 = QAdd(**qkwargs)
             self.add2l = QListener(
                 self.add2,
                 self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
                 self.norm1,
+                clipped_distr=False,
                 **qkwargs
             )
         if self.has_bn:
@@ -488,7 +467,7 @@ class QTransformerEncoderLayer(nn.Module):
         else:
             h = x
 
-        if 0: # self.has_res:
+        if self.has_res1:
             res1 = self.add1(h, self.dropout1(x))
             # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
@@ -505,7 +484,7 @@ class QTransformerEncoderLayer(nn.Module):
 
         ff_out = self.feed_forward(h)
 
-        if self.has_res:
+        if self.has_res2:
             res2 = self.add2(ff_out, self.dropout2(h))
             res2 = self.add2l(res2)
             print_qt_stats("res2", res2, stage=self.norm1.stage, step=self.plot_step_counter)
@@ -560,7 +539,7 @@ class QTransformerEncoder(nn.Module):
         super().__init__()
 
         self.quantStub = QuantStub(**qkwargs)
-        self.input_listener = QListener(self.quantStub, calibration="minandmax", **qkwargs)
+        self.input_listener = QListener(self.quantStub, calibration="minmax", **qkwargs)
 
         self.embedding = nn.Linear(src_dim, dim)
         self.emb_listener = QListener(self.embedding, **qkwargs)
@@ -735,7 +714,7 @@ class QTSTModel(nn.Module):
 
         return out
 
-__SYMMETRIZING_MODULES__ += [
+SYMMETRIZING_MODULES += [
     QPositionalEncoding,
 ]
 

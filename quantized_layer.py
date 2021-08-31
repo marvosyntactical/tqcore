@@ -20,10 +20,16 @@ __DEBUG__ = False
 
 # helper fns
 printdbg = lambda *expr: printdbg(*expr) if __DEBUG__ else None
-tnsr_stats = lambda t, qinp: (round(t.min().item(), 3), round(t.max().item(), 3),qinp.calc_zero(t.min().item(), t.max().item(), 8))
+tnsr_stats = lambda t, qinp: (round(t.min().item(), 3), round(t.max().item(), 3), qinp.calc_zero(t.min().item(), t.max().item(), 8))
 is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 
+# TODO NOTE FIXME ############ REFACTOR PLAN FOR THIS MODULE
+"""
+* use kernels from kernel.py
+* only used for the few modules in OPS; maybe just implement these as QuantizableModule s?
 
+"""
+# ################ END REFACTOR PLAN
 
 # contains factory functions for quantized forward passes used in .qat_convert.py
 # for pytorch layers such as linear, conv, batchnorm
@@ -63,13 +69,12 @@ def _factory_convert_layer_forward_impl(module):
         Wrapper function for layer fwd pass
         min_val and max_val are fixed and set to the averages recorded during QAT
         """
+        assert hasattr(module, "scale"), f"{module}'s qparams need to be set for quantized forward"
         x_q = q_layer_fwd(
             x=x,
             layer=module,
             quant_input=module._Qinp,
             quant_weight=module._Qwt,
-            min_val=module.__stats__["ema_min"],
-            max_val=module.__stats__["ema_max"],
             num_bits_input=module._num_bits_inp,
             num_bits_weight=module._num_bits_wt,
             num_bits_bias=module._num_bits_bias if hasattr(module, "_num_bits_bias") else None,
@@ -86,8 +91,6 @@ def _factory_quantized_layer(module:nn.Module):
             layer:torch.nn.modules.batchnorm._BatchNorm,
             quant_input:Quantization,
             quant_weight:Quantization,
-            min_val:int,
-            max_val:int,
             num_bits_weight=8,
             num_bits_input=8,
             num_bits_bias=32,
@@ -106,8 +109,6 @@ def _factory_quantized_layer(module:nn.Module):
         :param layer: the batch norm layer to be quantized
         :param quant_input: Quantization function for the activations
         :param quant_weight: Quantization function for the weights
-        :param min_val: EMA min_val for next activation
-        :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
         :return: QTensor: (output, output_scale, output_zero)
@@ -130,7 +131,7 @@ def _factory_quantized_layer(module:nn.Module):
             **kwargs
         )
 
-        out = out / layer.scale_next + layer.zero_next
+        out = out / layer.scale + layer.zero
 
         out_before_clamp = tnsr_stats(out, quant_input)
 
@@ -141,20 +142,18 @@ def _factory_quantized_layer(module:nn.Module):
         assert len(torch.unique(out)) > 1, (
             out.mean(),
             tnsr_stats(x, quant_input),
-            scale_next,
-            zero_next,
+            layer.scale,
+            layer.zero,
             out_before_clamp
         )
 
-        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
+        return QTensor(out, scale=layer.scale, zero=layer.zero)
 
     def quantized_linear(
             x:torch.Tensor,
             layer:torch.nn.Linear,
             quant_input:Quantization,
             quant_weight:Quantization,
-            min_val:int,
-            max_val:int,
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
@@ -174,7 +173,7 @@ def _factory_quantized_layer(module:nn.Module):
         :param num_bits_weight: bit width of weight
         :return: QTensor: (output, output_scale, output_zero)
         """
-        w = quant_weight.quantize_to_qtensor(
+        w = quant_weight.quantize_to_qtensor_using_range(
             layer.weight.data,
             num_bits=num_bits_weight
         )
@@ -195,21 +194,19 @@ def _factory_quantized_layer(module:nn.Module):
 
         out = F.linear(x_zeroed,  w_zeroed, bias=b, **kwargs)
 
-        multiplier = (x.scale * w.scale) / layer.scale_next
+        multiplier = (x.scale * w.scale) / layer.scale
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        out = out * multiplier + layer.zero_next
+        out = out * multiplier + layer.zero
 
         out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
 
-        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
+        return QTensor(out, scale=layer.scale, zero=layer.zero)
 
     def quantized_conv2d(
             x:torch.Tensor,
             layer:torch.nn.Conv2d,
             quant_input:Quantization,
             quant_weight:Quantization,
-            min_val,
-            max_val,
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
@@ -224,14 +221,12 @@ def _factory_quantized_layer(module:nn.Module):
         :param layer: the current torch layer
         :param quant_input: Quantization function for the activations
         :param quant_weight: Quantization function for the weights
-        :param min_val: EMA min_val for next activation
-        :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
         :return: QTensor: (output, output_scale, output_zero)
         """
 
-        w = quant_weight.quantize_to_qtensor(
+        w = quant_weight.quantize_to_qtensor_using_range(
             layer.weight.data,
             num_bits=num_bits_weight
         )
@@ -267,24 +262,22 @@ def _factory_quantized_layer(module:nn.Module):
             layer.groups,
         )
 
-        multiplier = ( x.scale * w.scale ) / layer.scale_next
+        multiplier = ( x.scale * w.scale ) / layer.scale
 
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        out = out * multiplier + layer.zero_next
+        out = out * multiplier + layer.zero
 
         out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
 
         # Update activation tensor quantization values
 
-        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
+        return QTensor(out, scale=layer.scale, zero=layer.zero)
 
     def quantized_maxpool2d(
             x:torch.Tensor,
             layer:torch.nn.Conv2d,
             quant_input:Quantization,
             quant_weight:Quantization,
-            min_val,
-            max_val,
             num_bits_input=8,
             num_bits_weight=8,
             num_bits_bias=32,
@@ -299,8 +292,6 @@ def _factory_quantized_layer(module:nn.Module):
         :param layer: the current torch layer
         :param quant_input: Quantization function for the activations
         :param quant_weight: Quantization function for the weights
-        :param min_val: EMA min_val for next activation
-        :param max_val: EMA max_val for next activation
         :param num_bits_input: bit width of input
         :param num_bits_weight: bit width of weight
         :return: QTensor: (output, output_scale, output_zero)
@@ -323,10 +314,10 @@ def _factory_quantized_layer(module:nn.Module):
             dilation=layer.dilation,
         )
 
-        multiplier = x.scale / scale_next
+        multiplier = x.scale / layer.scale
 
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
-        out = out * multiplier + zero_next
+        out = out * multiplier + layer.zero
 
         out = quant_input.tensor_clamp(out, num_bits=num_bits_input)
 
@@ -334,7 +325,7 @@ def _factory_quantized_layer(module:nn.Module):
 
         # Update activation tensor quantization values
 
-        return QTensor(out, scale=layer.scale_next, zero=layer.zero_next)
+        return QTensor(out, scale=layer.scale, zero=layer.zero)
 
     quantized_ops = {
         nn.BatchNorm1d: non_quantized_batchnorm,

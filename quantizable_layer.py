@@ -10,7 +10,7 @@ from torch.nn.modules.utils import _pair
 import math
 import copy
 from enum import Enum
-from typing import Optional, Union, Tuple, Dict, Union
+from typing import Optional, Union, Tuple, Dict, Union, Callable
 from collections import defaultdict
 import warnings
 
@@ -20,7 +20,7 @@ from .quantization_functions import Quantization, \
 from .utils import print_qt_stats, is_integer, QuantConfigurationError
 from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind
 from .histogram import HistogramCalibrator
-
+from .kernel import qadd, qmul
 
 __ASSERT__ = True
 
@@ -29,10 +29,12 @@ class QuantizableModule(nn.Module):
     """
     Interface for quantizable modules to implement.
 
-    During fp training, this module acts as Identity.
-    It also has a Quantization Aware Training (QAT) stage, and quantized stage;
-    Each of the three should be implemented by subclasses.
-    (otherwise this module remains an Identity)
+    During fp training, this module acts as Identity if forward is not overwritten.
+    It also has a Tuning Stage, which can be either
+        * Quantization Aware Training (QAT) or
+        * Calibration
+    and then a fully quantized stage;
+    Each of the stages should be implemented by subclasses.
     """
     FLOAT_SCALE = 1. # this determines all successive scales
     FLOAT_ZERO = 0.
@@ -73,8 +75,12 @@ class QuantizableModule(nn.Module):
     def forward_quantized(self, x: QTensor) -> QTensor:
         raise NotImplementedError(f"{type(self)}.forward_quantized")
 
+    def forward_calib(self, *args, **kwargs):
+        return self.forward_fp(*args, **kwargs)
+
     def calibration_prepare(self):
         self.stage = QuantStage.Calibration
+        self.forward = self.forward_calib
 
     def qat_prepare(self):
         self.stage = QuantStage.QAT
@@ -158,115 +164,6 @@ class DeQuantStub(QuantizableModule):
         f = lambda qt: qt.dequantize()
         return self._process_outputs(outputs, f)
 
-
-def _convert_to_qtensor_for_kernel(
-        a, b,
-        quantization, weight_quantization
-    ) -> Tuple[torch.Tensor]:
-
-    ab = [a,b]
-    for i, t in enumerate(ab):
-        if not isinstance(t, QTensor):
-            if isinstance(t, torch.Tensor):
-                if isinstance(t, nn.Parameter):
-                    # e.g. elementwise mul with parameter
-                    t = weight_quantization.quantize_to_qtensor(
-                        t,
-                        min_val=t.min().item(),
-                        max_val=t.max().item(),
-                        num_bits=num_bits_weight,
-                    )
-                else:
-                    # e.g. rescale in mhattn
-                    t = quantization.quantize_to_qtensor(
-                        t,
-                        min_val=t.min().item(),
-                        max_val=t.max().item(),
-                        num_bits=num_bits,
-                    )
-            else:
-                assert False, (t, type(t))
-                # t = QTensor(torch.as_tensor(t), scale=1., zero=0.)
-
-        ab[i] = t
-    return tuple(ab)
-
-def _qadd(
-        a, b, factor: float,
-        scale_next, zero_next, op,
-        quantization, weight_quantization,
-        num_bits, num_bits_weight
-    ) -> QTensor:
-    # mock low bit addition kernel
-
-    # tensor wrapper version of the earlier "globalparams" implementation:
-    # https://cegit.ziti.uni-heidelberg.de/mkoss/tqcore/-/blob/globalparams/quantized_layer.py#L206
-
-    a, b = _convert_to_qtensor_for_kernel(
-        a, b, quantization, weight_quantization
-    )
-
-    a_requantized = quantization.quantize_to_qtensor_using_params(
-        a.dequantize() * factor,
-        scale=scale_next,
-        zero=zero_next,
-        num_bits=num_bits-1 # half the scale
-    )
-    print_qt_stats("qadd a", a_requantized)
-    b_requantized = quantization.quantize_to_qtensor_using_params(
-        b.dequantize() * factor,
-        scale=scale_next,
-        zero=zero_next,
-        num_bits=num_bits-1 # half the scale
-    )
-    print_qt_stats("qadd b", b_requantized)
-
-    r = a_requantized._t + b_requantized._t
-    r = r.clamp(0., (2.**num_bits)-1.)
-    r = QTensor(r, scale=scale_next, zero=zero_next)
-
-    print_qt_stats("qadd result", r)
-
-    assert is_integer(r._t), r
-
-    return r
-
-
-
-def _qmul(
-        a, b, factor: float,
-        scale_next, zero_next, op,
-        quantization, weight_quantization,
-        num_bits, num_bits_weight
-    ) -> QTensor:
-    # mock low bitwidth kernel for mul and matmul
-
-    # TODO future:
-    # replace this and _qadd by gemmlowp (possibly <) 8 bit kernel
-    a, b = _convert_to_qtensor_for_kernel(
-        a, b, quantization, weight_quantization
-    )
-
-    a_zeroed = a._t - round(a.zero)
-    b_zeroed = b._t - round(b.zero)
-
-    r: torch.Tensor = op(a_zeroed, b_zeroed)
-    r_float = r
-
-    multiplier = (a.scale * b.scale * factor) / scale_next
-    # scale result tensor back to given bit width, saturate to uint if unsigned is used:
-    r = r * multiplier + zero_next
-    r_unclamped = r
-
-    # round and clamp
-    r = quantization.tensor_clamp(r, num_bits=num_bits)
-
-    # Make sure we didnt move outside of EMA range:
-    assert r.min() != r.max(), \
-        (scale_next, zero_next, r.min(), a._t.min(), a._t.max(), b._t.min(), b._t.max(), r_float.min(), r_float.max(), r_unclamped.min(), r_unclamped.max(), multiplier, factor)
-
-    return QTensor(r, scale=scale_next, zero=zero_next)
-
 class QMul(QuantizableModule):
     def forward_fp(self, a: torch.Tensor, b: torch.Tensor):
         return a * b
@@ -283,7 +180,7 @@ class QMul(QuantizableModule):
             b: Union[QTensor, torch.Tensor, nn.Parameter, float, int],
         ):
         # affine transformation; simulates low bit multiplication
-        return _qmul(a, b, 1., self.scale, self.zero, torch.mul,
+        return qmul(a, b, 1., self.scale, self.zero, torch.mul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
 
@@ -302,7 +199,7 @@ class QMatMul(QuantizableModule):
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
-        return _qmul(
+        return qmul(
                 a, b, self.factor, self.scale, self.zero, torch.matmul,
                 self.quantization, self.weight_quantization,
                 self.num_bits, self.num_bits_weight)
@@ -324,7 +221,7 @@ class QAdd(QuantizableModule):
         print_qt_stats("left", a)
         print_qt_stats("right", b)
         print("end qt stats in QAdd:")
-        return _qadd(
+        return qadd(
             a, b, 1.,
             self.scale, self.zero, torch.add,
             self.quantization, self.weight_quantization,
@@ -429,7 +326,6 @@ class QSoftmax(QuantizableModule):
         print("^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
         exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0 to 255 here already!
-
         zeroed_exp =  exponentiated._t - exponentiated.zero
         M = exponentiated.scale / (self.normed_scale * self.alpha)
         normed_exp = (zeroed_exp * M) + self.normed_zero
@@ -457,7 +353,7 @@ class QSoftmax(QuantizableModule):
 
         # print("denominator: scale=",denominator.scale, "zero=",denominator.zero)
 
-        # r = _qmul(
+        # r = qmul(
         #     numerator, denominator, 1.,
         #     self.normed_scale_next, self.normed_zero_next,
         #     torch.mul,
@@ -613,6 +509,39 @@ class QFFT(QuantizableModule):
         x = x.real #  + x.imag
         return x
 
+class QPositionalEncoding(QuantizableModule):
+    """
+    Learnable Position Encoding (A W x D bias matrix that we add to the input)
+    """
+    def __init__(self,
+                 dim: int = 0,
+                 time_window: int = 24,
+                 init_fn: Callable = torch.rand
+                 ):
+        super().__init__()
+
+        self.W = nn.Parameter(init_fn(time_window, dim))
+
+    def forward_fp(self, X: torch.Tensor):
+        """
+        Encode inputs.
+        Args:
+            X (FloatTensor): Sequence of word vectors
+                ``(batch_size, dim, time_window)``
+        """
+        # Add position encodings
+        out = self.W + X
+        return out
+
+    def forward_quantized(self, X: QTensor):
+        return qadd(
+            self.W, X, 1.,
+            self.scale, self.zero, torch.add,
+            self.quantization, self.weight_quantization,
+            self.num_bits, self.num_bits_weight
+        )
+
+
 class QListener(QuantizableModule):
     """
     During qat, this module records min, max values of torch.Tensor s passing through.
@@ -642,7 +571,7 @@ class QListener(QuantizableModule):
         self.function = function # optionally apply function before collecting stats (for softmax)
         self.name = "" if name is None else str(name) # set attribute name_scale_next and so on
         self.ema_decay = ema_decay
-        self.set_qparams_during_quantization = False # updates range after every QAT forward call
+        self.set_qparams_during_quantization = False # updates range after every tuning forward call
         self.mods = list(modules)
 
         # CalibMode
@@ -673,9 +602,9 @@ Please specify the kind of input distribution for this QListener
 by initializing it with clipped_distr: bool given as kwarg.
 """
                 # is there a clipping input module?
-                clipping = True in [isinstance(mod, tuple(__CLIPPING_MODULES__)) for mod in self.mods]
+                clipping = True in [isinstance(mod, tuple(CLIPPING_MODULES)) for mod in self.mods]
                 # is there a symmetrizing input module?
-                symm = True in [isinstance(mod, tuple(__SYMMETRIZING_MODULES__)) for mod in self.mods]
+                symm = True in [isinstance(mod, tuple(SYMMETRIZING_MODULES)) for mod in self.mods]
 
                 if clipping and not symm:
                     self.distribution_kind = DistKind.CLIPPED
@@ -722,21 +651,19 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         self._qparams_set = False
 
-    def forward_fp(self, x: Tensor):
-        if self.stage == QuantStage.Calibration:
-            """
-            Save histograms for Calibration as in
-            https://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
-            """
-            if self.calibration_mode == CalibMode.KL:
-                self.hist_calib.collect(x)
-                if self.distribution_kind == DistKind.SYMM:
-                    # update mean ema
-                    self._update_ema(x)
-                if not self.set_qparams_during_quantization:
-                    self._set_qparams()
-            else:
-                self._update_ema(x)
+    def forward_calib(self, x: Tensor):
+        """
+        Save histograms for Calibration as in
+        https://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
+        """
+        assert self.stage == QuantStage.Calibration
+        if self.calibration_mode == CalibMode.KL:
+            self.hist_calib.collect(x)
+        if not self.distribution_kind == DistKind.CLIPPED:
+            # update ema for mean or min+max
+            self._update_ema(x)
+        if not self.set_qparams_during_quantization:
+            self._set_qparams()
         return x
 
     def forward_qat(self, x: QTensor):
@@ -869,14 +796,14 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         # set attributes for all listened modules
         for mod in self.mods:
-            msg = f"Successfully set {mod}'s qparams: scale, zero"
+            msg = ("="*20)+"\n"+f"Successfully set {mod}'s qparams: scale, zero"
             setattr(mod, prefix+"scale", scale)
             setattr(mod, prefix+"zero", zero)
             if self.distribution_kind!=DistKind.CLIPPED:
                 msg += f", {list(stats.keys())}"
                 for key, ema in stats.items():
                     setattr(mod, prefix+key, ema)
-            print(msg)
+            print(msg+"\n"+("="*20))
         self._qparams_set = True
 
     def __repr__(self):
@@ -884,13 +811,13 @@ by initializing it with clipped_distr: bool given as kwarg.
         return s
 
 # these must be updated in every module that adds QuantizableModules that belong here
-global __CLIPPING_MODULES__, __SYMMETRIZING_MODULES__
-__CLIPPING_MODULES__ = [
+global CLIPPING_MODULES, SYMMETRIZING_MODULES
+CLIPPING_MODULES = [
     QReLU6,
     nn.ReLU6,
     nn.ReLU
 ] # comprehensive list of modules that output clipped distribution
-__SYMMETRIZING_MODULES__ = [
+SYMMETRIZING_MODULES = [
     nn.BatchNorm1d,
     nn.BatchNorm2d,
     nn.Linear

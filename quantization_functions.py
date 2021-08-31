@@ -30,7 +30,7 @@ class Quantization():
     def from_opt(cls):
         return cls()
 
-    def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8):
+    def quantize_to_qtensor_using_range(self, x, min_val=None, max_val=None, num_bits=8):
         pass
 
     def quantize_to_torch_tensor(self, x, min_val=None, max_val=None, num_bits=8):
@@ -81,7 +81,7 @@ class UniformQuantization(Quantization):
 
         return q_x, scale, zero
 
-    def quantize_to_qtensor(
+    def quantize_to_qtensor_using_range(
             self,
             x: torch.Tensor,
             min_val=None,
@@ -182,7 +182,7 @@ class UniformSymmetricQuantization(Quantization):
 
         return q_x, scale, 0
 
-    def quantize_to_qtensor(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
+    def quantize_to_qtensor_using_range(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
 
         q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
         return QTensor(q_x, scale=scale, zero=zero, symmetric=True)
