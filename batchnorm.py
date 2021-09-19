@@ -159,13 +159,16 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             exponential_average_factor,
             self.eps
         )
-        if self.n_qat_batches >= self.record_n_batches:
+        if self.n_qat_batches == self.record_n_batches:
             self.freeze()
         return out
 
     def freeze(self):
         # to stop recording running stats;
         # make self never trainable again.
+        print("="*30)
+        print(self, " stopped recording.")
+        print("="*30)
         self.track_running_stats = False
         self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after freeze!"); return self
 

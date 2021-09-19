@@ -182,10 +182,10 @@ class UniformSymmetricQuantization(Quantization):
 
         return q_x, scale, 0
 
-    def quantize_to_qtensor_using_range(self, x, min_val=None, max_val=None, num_bits=8) -> QTensor:
+    def quantize_to_qtensor_using_range(self, x, min_val=None, max_val=None, num_bits=8, quantized=True) -> QTensor:
 
         q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
-        return QTensor(q_x, scale=scale, zero=zero, symmetric=True)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=True, quantized=quantized)
 
     def calc_params(self, min_val, max_val, num_bits=8):
         # Calc Scale
@@ -278,9 +278,9 @@ class FakeQuant(torch.autograd.Function):
 
         new_scale, new_zero = quant.calc_params(min_val, max_val, num_bits=num_bits)
 
-        # affine trafo and round there to simulate error appropriately
+        # affine transformation and round there to simulate error appropriately
         qx = quant.quantize_to_qtensor_given_scale(
-            x, num_bits=num_bits, scale=new_scale, zero=new_zero, quantized=False
+            x, num_bits=num_bits, scale=new_scale, zero=new_zero, quantized=True
         )
         # affinely transform back
         out = qx.dequantize()

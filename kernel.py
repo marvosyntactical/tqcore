@@ -18,7 +18,8 @@ def _convert_to_qtensor_for_kernel(
         quantization,
         weight_quantization,
         num_bits,
-        num_bits_weight
+        num_bits_weight,
+        quantize=True,
     ) -> Tuple[torch.Tensor]:
     # helper function
 
@@ -33,6 +34,7 @@ def _convert_to_qtensor_for_kernel(
                         min_val=t.min().item(),
                         max_val=t.max().item(),
                         num_bits=num_bits_weight,
+                        quantized=quantize
                     )
                 else:
                     # e.g. rescale in mhattn
@@ -41,6 +43,7 @@ def _convert_to_qtensor_for_kernel(
                         min_val=t.min().item(),
                         max_val=t.max().item(),
                         num_bits=num_bits,
+                        quantized=quantize
                     )
             else:
                 assert False, (t, type(t))
@@ -113,7 +116,7 @@ def qadd(
     # r = r.clamp(0., (2.**num_bits)-1.)
     r = QTensor(r, scale=scale_next, zero=zero_next)
 
-    print_qt_stats("qadd result", r)
+    # print_qt_stats("qadd result", r)
 
     assert is_integer(r._t), r
 
@@ -129,7 +132,8 @@ def qmul(
         quantization: Quantization,
         weight_quantization: Quantization,
         num_bits: int,
-        num_bits_weight: int
+        num_bits_weight: int,
+        quantize=True,
     ) -> QTensor:
     # mock low bitwidth kernel for mul and matmul
 
@@ -155,6 +159,6 @@ def qmul(
     assert r.min() != r.max(), \
         (scale_next, zero_next, r.min(), a._t.min(), a._t.max(), b._t.min(), b._t.max(), r_float.min(), r_float.max(), r_unclamped.min(), r_unclamped.max(), multiplier, factor)
 
-    return QTensor(r, scale=scale_next, zero=zero_next)
+    return QTensor(r, scale=scale_next, zero=zero_next, quantized=quantize)
 
 

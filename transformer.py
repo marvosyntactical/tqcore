@@ -21,6 +21,7 @@ from .quantizable_layer import \
     QPositionalEncoding, \
     QMask, \
     QReLU6, \
+    QLinear, \
     QFFT, \
     FFT, \
     NonQuantizableModuleWrap, \
@@ -29,6 +30,8 @@ from .quantizable_layer import \
 from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
 from .qtensor import QTensor
 from .config import QuantStage
+
+linear_cls = QLinear
 
 # NOTE the following modules are copied from tst to avoid this import:
 # from tst.transformer import MultiHeadedAttention, MaskedMSE, XentLoss
@@ -223,13 +226,13 @@ class QMultiHeadedAttention(nn.Module):
         self.model_size = dim
         self.num_heads = num_heads
 
-        self.k_layer = nn.Linear(dim, num_heads * head_size)
+        self.k_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
         self.post_kl = QListener(self.k_layer, **qkwargs)
 
-        self.v_layer = nn.Linear(dim, num_heads * head_size)
+        self.v_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
         self.post_vl = QListener(self.v_layer, **qkwargs)
 
-        self.q_layer = nn.Linear(dim, num_heads * head_size)
+        self.q_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
         self.post_ql = QListener(self.q_layer, **qkwargs)
 
         scale = 1./head_size**6
@@ -242,12 +245,20 @@ class QMultiHeadedAttention(nn.Module):
         self.qMask = QMask(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
-        self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        # qsoft = 0
+        # if qsoft:
+        #     self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        # else:
+        #     self.qsoftmax = NonQuantizableModuleWrap(
+        #         nn.Softmax(dim=-1), **qkwargs
+        #     )
+
 
         self.avMatMul = QMatMul(**qkwargs)
         self.avl = QListener(self.avMatMul, **qkwargs)
 
-        self.output_layer = nn.Linear(dim, dim)
+        self.output_layer = linear_cls(dim, dim, qkwargs=qkwargs)
+        self.plot_step_counter = 0
 
 
     def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Tensor = None):
@@ -293,8 +304,11 @@ class QMultiHeadedAttention(nn.Module):
             print(f"qMaskl was activated!!! qMaskl.__stats__: {self.qMaskl.__stats__}")
         self.qMaskl(scores)
 
-        # normalize context vectors.
-        attention = self.qsoftmax(scores)
+        print_qt_stats("scores", scores, stage=self.qMaskl.stage, step=self.plot_step_counter, p=.1)
+
+        # # normalize context vectors.
+        # attention = self.qsoftmax(scores)
+        attention = scores
 
         # get context vector (select values with attention) and reshape
         # back to [B, W, D]
@@ -305,6 +319,7 @@ class QMultiHeadedAttention(nn.Module):
             batch_size, -1, num_heads * self.head_size)
 
         output = self.output_layer(context)
+        self.plot_step_counter += 1
 
         return output
 
@@ -327,12 +342,12 @@ class QPositionwiseFeedForward(nn.Module):
         print(f"Initiated QFeedFwd with activation={activation}")
 
         modules = [
-            nn.Linear(input_size, ff_size),
+            linear_cls(input_size, ff_size, qkwargs=qkwargs),
             activation,
         ]
         modules += [
             QListener(*modules, clipped_distribution=True, **qkwargs),
-            nn.Linear(ff_size, input_size)
+            linear_cls(ff_size, input_size, qkwargs=qkwargs)
         ]
         modules += [
             QListener(modules[-1], **qkwargs),
@@ -379,10 +394,10 @@ class QTransformerEncoderLayer(nn.Module):
         # (preferrably dont leave them out entirely once NonQuant works)
         # => mix (NonQuant) quantization has priority
         self.simulate_folding = 0
-        self.has_mix = 0
-        self.qattn = 0
+        self.has_mix = 1
+        self.qattn = 1
         self.fft = fft
-        self.has_res1 = 1 # debug: no residuals/adding/dropout # only second res for now
+        self.has_res1 = 1
         self.has_bn = 1
         self.has_res2 = 1
 
@@ -477,7 +492,7 @@ class QTransformerEncoderLayer(nn.Module):
             res1 = self.add1(h, self.dropout1(x))
             # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
-            # print_qt_stats("res1", res1, stage=self.norm1.stage, step=self.plot_step_counter)
+            print_qt_stats("res1", res1, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             res1 = h
 
@@ -485,11 +500,12 @@ class QTransformerEncoderLayer(nn.Module):
             h = self.norm1(res1)
             if not self.has_res2:
                 h = self.norm1l(h)
-                print_qt_stats("norm1", h, stage=self.norm1.stage, step=self.plot_step_counter)
+            print_qt_stats("norm1", h, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             h = res1
 
         ff_out = self.feed_forward(h)
+        # print_qt_stats("ff", h, stage=self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)].stage, step=self.plot_step_counter)
 
         if self.has_res2:
             res2 = self.add2(ff_out, self.dropout2(h))
@@ -551,7 +567,7 @@ class QTransformerEncoder(nn.Module):
         self.quantStub = QuantStub(**qkwargs)
         self.input_listener = QListener(self.quantStub, calibration="minmax", **qkwargs)
 
-        self.embedding = nn.Linear(src_dim, dim)
+        self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
         self.emb_listener = QListener(self.embedding, **qkwargs)
 
         # TODO FIXME add these again
@@ -570,6 +586,8 @@ class QTransformerEncoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
+        # for i in range(self.layers):
+        #     setattr(self.layers["{i}"], "i", i)
 
         if freeze:
             raise NotImplementedError("TODO Implement Freezing everything but head as in TST paper")
@@ -627,6 +645,9 @@ class QTransformerEncoder(nn.Module):
         if self.quantStub.stage == QuantStage.Quantized:
             assert x.quantized
             assert not isinstance(mask, Tensor)
+        elif self.quantStub.stage == QuantStage.QAT:
+            pass
+            # print(f"{x}\nquantized?")
 
         for i, layer in enumerate(self.layers):
             x = layer(x, mask)
@@ -700,7 +721,7 @@ class QTSTModel(nn.Module):
         if "pre" in task:
             # pretrain: reconstruct input
             head += [
-                nn.Linear(dim, src_dim),
+                linear_cls(dim, src_dim, qkwargs=qkwargs),
             ]
             head += [
                 QListener(head[-1], **qkwargs),
@@ -711,7 +732,7 @@ class QTSTModel(nn.Module):
             # regression: predict n scalars
             head += [
                 nn.Flatten(1),
-                nn.Linear(time_window * dim, n_labels),
+                linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
             ]
             head += [
                 QListener(head[-1], **qkwargs),
@@ -721,7 +742,7 @@ class QTSTModel(nn.Module):
             # classification: predict distribution over n labels (Softmax in CrossEntropyLoss)
             head = [
                 nn.Flatten(1),
-                nn.Linear(time_window * dim, n_labels),
+                linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
             ]
             head += [
                 QListener(head[-1], **qkwargs),

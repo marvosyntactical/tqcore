@@ -51,14 +51,15 @@ class QTensor:
         self.shape: Tensor = self._t.shape
 
         if self.quantized:
+            assert torch.allclose(self._t, self._t.round()), f"quantized QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
             # TODO remove this costly assertion after testing !!!!! FIXME:
-            assert torch.allclose(self._t, self._t.round()), f"QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
             if not symmetric and __DEBUG__:
                 assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
         # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
 
     def dequantize(self) -> Tensor:
+        assert self.quantized, "may only dequantize QTensor holding quantized values; use qtensor._t instead"
         return (self._t - self.zero) * self.scale
 
     @classmethod
