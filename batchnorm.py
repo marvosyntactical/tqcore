@@ -12,6 +12,7 @@ from .quantization_functions import FakeQuant
 import copy
 from typing import Dict, Optional, Union
 import math
+import warnings
 
 __DEBUG__ = True
 is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
@@ -26,9 +27,10 @@ is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 
 class _QBatchNorm(QuantizableModule, _BatchNorm):
 
-    def __init__(self, *args, qkwargs: Dict = None, **kwargs):
+    def __init__(self, *args, qkwargs: Dict, **kwargs):
         QuantizableModule.__init__(self, **qkwargs)
         _BatchNorm.__init__(self, *args, **kwargs)
+        self.record_n_batches = qkwargs["record_n_batches_bn"]
 
     def forward_quantized(self, x: QTensor) -> QTensor:
         """
@@ -68,18 +70,19 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         out = x_zeroed * gamma_zeroed + beta._t
 
-        multiplier = (x.scale * gamma.scale) / self.scale_next
-        out = out * multiplier + self.zero_next
+        multiplier = (x.scale * gamma.scale) / self.scale
+
+        out = out * multiplier + self.zero
 
         out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
-        out = QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        out = QTensor(out, scale=self.scale, zero=self.zero)
 
         assert is_integer(out._t), out
 
-        assert len(torch.unique(out._t)) > 1, (out.min(), x.min(), x.max(), self.zero_next, self.scale_next)
+        assert len(torch.unique(out._t)) > 1, (out.min(), x.min(), x.max(), self.zero, self.scale)
 
-        return out # QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return out # QTensor(out, scale=self.scale, zero=self.zero)
 
     def _do_checks(self, input: Tensor) -> Tensor:
         self._check_input_dim(input)
@@ -142,9 +145,10 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
 
     def forward_qat(self, input: Tensor) -> Tensor:
+        super().forward_qat(input)
         bn_training, exponential_average_factor = self._do_checks(input)
 
-        return F.batch_norm(
+        out = F.batch_norm(
             input,
             # If buffers are not to be tracked, ensure that they won't be updated
             self.running_mean if not self.training or self.track_running_stats else None,
@@ -155,6 +159,15 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             exponential_average_factor,
             self.eps
         )
+        if self.n_qat_batches >= self.record_n_batches:
+            self.freeze()
+        return out
+
+    def freeze(self):
+        # to stop recording running stats;
+        # make self never trainable again.
+        self.track_running_stats = False
+        self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after freeze!"); return self
 
     def quantize(self):
         QuantizableModule.quantize(self)
@@ -179,6 +192,10 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         return self
 
 class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
+    def __init__(self, *args, qkwargs: Dict, **kwargs):
+        _QBatchNorm.__init__(self, *args, qkwargs=qkwargs, **kwargs)
+        nn.BatchNorm1d.__init__(self, *args, **kwargs)
+
     def forward_fp(self, x):
         x = torch.transpose(x,1,2)
         x = _QBatchNorm.forward_fp(self, x)
@@ -430,18 +447,18 @@ class QBNFoldableTranspose(QuantizableModule):
 
         out = x_zeroed * gamma_zeroed + beta._t
 
-        multiplier = (x.scale * gamma.scale) / self.scale_next
-        out = out * multiplier + self.zero_next
+        multiplier = (x.scale * gamma.scale) / self.scale
+        out = out * multiplier + self.zero
 
         out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
-        out = QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        out = QTensor(out, scale=self.scale, zero=self.zero)
 
         assert is_integer(out._t), out
 
-        assert len(torch.unique(out._t)) > 1, (out.min(), x.min(), x.max(), self.zero_next, self.scale_next)
+        assert len(torch.unique(out._t)) > 1, (out.min(), x.min(), x.max(), self.zero, self.scale)
 
-        return torch.transpose(out, 1,2) # QTensor(out, scale=self.scale_next, zero=self.zero_next)
+        return torch.transpose(out, 1,2) # QTensor(out, scale=self.scale, zero=self.zero)
 
     def forward_qat(self, x):
         """
@@ -469,7 +486,7 @@ class QBNFoldableTranspose(QuantizableModule):
 
         x = torch.transpose(x, 1, 2)
 
-        return QTensor(x, scale=self.scale_next, zero=self.zero_next, quantized=False)
+        return QTensor(x, scale=self.scale, zero=self.zero, quantized=False)
 
     def forward_fp(self, x):
         # forward used during fp32 pretraining

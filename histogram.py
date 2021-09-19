@@ -89,7 +89,6 @@ class HistogramCalibrator:
             temp_argmax = np.max(x_np)
             temp_argmin = np.min(x_np)
 
-            # FIXME: support can only be extended to right, not to left? NOTE
             if temp_argmax > self._calib_bin_edges[-1]:
                 # increase the number of bins (by extending support to the right)
 
@@ -207,12 +206,13 @@ class HistogramCalibrator:
         left_hist = hist[left_support[:-1]]
         left_bin_edges = bin_edges[left_support]
 
+        print("~"*20)
         print("computing range for:", title)
-
         print(f"leftmost bin edge={bin_edges[0]}; rightmost bin edge={bin_edges[-1]}")
         print(f"right support nbins={right_support.sum()}; N={right_hist.sum()}")
         print(f"mu={mu}")
         print(f"left support nbins={left_support.sum()}; N={left_hist.sum()}")
+        print("~"*20)
 
         # reverse left hist because compute_one_bound computes righthand side threshold
         _, threshold_right = self.compute_one_bound(

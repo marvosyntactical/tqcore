@@ -24,6 +24,7 @@ import warnings
 # pre_hook = call before module.forward
 # post_hook = hook = call after module.forward
 
+from .quantized_layer import NONQUANT
 
 def _qat_layer_forward_pre_hook(mod:nn.Module, inp:torch.Tensor) -> None:
     """

@@ -13,9 +13,11 @@ if TRANSFORMER:
 from .quantizable_layer import *
 
 from .quantized_layer import _factory_convert_layer_forward_impl, \
-        __OPS__, __NONQUANT__
+        OPS, NONQUANT
 
 from .quantization_functions import *
+
+from .config import QuantStage
 
 # using lisa kuhn's code in .tinyquant/*
 # to prepare a module for QAT and convert it (like in the pytorch QAT API)
@@ -93,15 +95,17 @@ def convert_module(
 
     mod_type = type(module)
 
-    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in __NONQUANT__]
+    named_children = dict(module.named_children())
+
+    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
 
     if is_nonquantizable:
         # do not recurse to children
-        return module
+        del named_children["fp_module"]
 
     #1. DFS to convert forward passes of all internal modules to handle only quantized tensors
 
-    for name, layer in module.named_children():
+    for name, layer in named_children.items():
 
         # ===== DFS down module graph ========
         convert_module(
@@ -135,15 +139,16 @@ def convert_module(
 
     dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
 
-    is_layer = True in [issubclass(mod_type, layer) for layer in __OPS__]
+    is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
 
     # delete fake quantizer:
     if hasattr(module, "_fakeQ"):
         del module._fakeQ
 
     if isinstance(module, QuantizableModule):
-
+        # input(f"\nCONVERT: Quantizing quantizable module {module}")
         module.quantize()
+        assert module.stage==QuantStage.Quantized
 
     elif is_layer and not dont_quantize:
 

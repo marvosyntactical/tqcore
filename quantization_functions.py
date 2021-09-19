@@ -118,7 +118,7 @@ class UniformQuantization(Quantization):
 
         return q_x
 
-    def calc_params(self, min_val, max_val, num_bits=8, nudge=True):
+    def calc_params(self, min_val, max_val, num_bits=8, nudge=True) -> Tuple[float,Union[float, int]]:
         qmin = 0.
         qmax = 2. ** num_bits - 1.
 
@@ -142,7 +142,7 @@ class UniformQuantization(Quantization):
             zero = qmax
         else:
             if self.nudge_zero or nudge:
-                zero = round(initial_zero)
+                zero = int(initial_zero)
             else:
                 zero = initial_zero
 

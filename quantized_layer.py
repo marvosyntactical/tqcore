@@ -338,8 +338,8 @@ def _factory_quantized_layer(module:nn.Module):
     assert fun, type(module)
     return fun
 
-global __OPS__, __NONQUANT__
-__OPS__ = [
+global OPS, NONQUANT
+OPS = [
     nn.Conv2d,
     nn.Linear,
     nn.modules.batchnorm._BatchNorm,
@@ -347,7 +347,7 @@ __OPS__ = [
 ]
 
 # ignore subclasses of these:
-__NONQUANT__ = [
+NONQUANT = [
     NonQuantizableModuleWrap
 ]
 

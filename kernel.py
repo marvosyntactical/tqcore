@@ -69,23 +69,48 @@ def qadd(
         a, b, quantization, weight_quantization, num_bits, num_bits_weight
     )
 
-    a_requantized = quantization.quantize_to_qtensor_using_params(
-        a.dequantize() * factor,
-        scale=scale_next,
-        zero=zero_next,
-        num_bits=num_bits-1 # half the scale
-    )
-    print_qt_stats("qadd a", a_requantized)
-    b_requantized = quantization.quantize_to_qtensor_using_params(
-        b.dequantize() * factor,
-        scale=scale_next,
-        zero=zero_next,
-        num_bits=num_bits-1 # half the scale
-    )
-    print_qt_stats("qadd b", b_requantized)
+    denom = a.scale + b.scale
+    a_frac = a.scale / denom
+    b_frac = b.scale / denom
 
-    r = a_requantized._t + b_requantized._t
-    r = r.clamp(0., (2.**num_bits)-1.)
+    a_dq = (a._t - a.zero) * a.scale
+    b_dq = (b._t - b.zero) * b.scale
+
+    a_rq = a_dq / scale_next + zero_next
+    b_rq = b_dq / scale_next + zero_next
+
+    a_rq *= a_frac
+    b_rq *= b_frac
+
+    # NOTE:
+    # for accurate simulation of quantization, it is crucial that round() and clamp() happen
+    # before the tensors get added
+    bits = (num_bits-1)
+    a_rq = a_rq.round().clamp(0, (2.**bits)-1.)
+    b_rq = b_rq.round().clamp(0, (2.**bits)-1.)
+
+    r = a_rq + b_rq
+
+    # r = a_rq + b_rq
+    # r = r.round()
+
+    # a_requantized = quantization.quantize_to_qtensor_using_params(
+    #     a.dequantize() * factor,
+    #     scale=scale_next*.5,
+    #     zero=zero_next,
+    #     num_bits=num_bits # half the scale
+    # )
+    # print_qt_stats("qadd a", a_requantized)
+    # b_requantized = quantization.quantize_to_qtensor_using_params(
+    #     b.dequantize() * factor,
+    #     scale=scale_next*.5,
+    #     zero=zero_next,
+    #     num_bits=num_bits # half the scale
+    # )
+    # print_qt_stats("qadd b", b_requantized)
+
+    # r = a_requantized._t + b_requantized._t
+    # r = r.clamp(0., (2.**num_bits)-1.)
     r = QTensor(r, scale=scale_next, zero=zero_next)
 
     print_qt_stats("qadd result", r)

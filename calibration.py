@@ -6,7 +6,7 @@ import warnings
 from .quantization_functions import *
 from .quantizable_layer import QuantizableModule
 from .quantized_layer import _factory_convert_layer_forward_impl, \
-        __OPS__, __NONQUANT__
+        OPS, NONQUANT
 from .qat_convert import *
 
 def calibration_prepare(
@@ -33,7 +33,13 @@ def calibration_prepare(
 
     descendants_module_number = module_number + 1
 
+    is_nonquantizable = issubclass(mod_type, tuple(NONQUANT))
     named_children = dict(module.named_children())
+
+    if is_nonquantizable:
+        # do not recurse to children
+        del named_children["fp_module"]
+
     for name, layer in named_children.items():
         _, descendants_module_number = calibration_prepare(
             layer,
@@ -97,15 +103,17 @@ def calibration_convert(
 
     mod_type = type(module)
 
-    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in __NONQUANT__]
+    is_nonquantizable = True in [issubclass(mod_type, layer) for layer in NONQUANT]
+
+    named_children = dict(module.named_children())
 
     if is_nonquantizable:
         # do not recurse to children
-        return module
+        del named_children["fp_module"]
 
     #1. convert forward passes of all internal modules to handle only quantized tensors
 
-    for name, layer in module.named_children():
+    for name, layer in named_children.items():
 
         # ===== DFS down module graph ========
 
@@ -122,7 +130,7 @@ def calibration_convert(
 
     dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
 
-    is_layer = True in [issubclass(mod_type, layer) for layer in __OPS__]
+    is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
 
     if isinstance(module, QuantizableModule):
         module.quantize()

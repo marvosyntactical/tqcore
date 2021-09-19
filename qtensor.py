@@ -15,7 +15,7 @@ logqt = logging.getLogger("qt")
 __all__ = ["QTensor"]
 
 __DEBUG__ = 0
-__LOG__ = 1
+__LOG__ = 0
 if __LOG__:
     logqt.info("QTensor logging started")
 else:
@@ -34,12 +34,21 @@ class QTensor:
     because you still need to reimplement everything used).
     """
 
-    def __init__(self, data, scale: float, zero: int=0, quantized: bool=True, symmetric:bool=False, **kwargs):
-        self._t = torch.as_tensor(data, **kwargs)
-        self.scale = scale
-        self.zero = zero
-        self.quantized = bool(quantized)
-        self.symmetric = symmetric
+    def __init__(
+            self,
+            data,
+            scale: float,
+            zero: int=0,
+            quantized: bool=True,
+            symmetric:bool=False,
+            **kwargs
+        ):
+        self._t: Tensor = torch.as_tensor(data, **kwargs)
+        self.scale: float = scale
+        self.zero: int = zero
+        self.quantized: bool = bool(quantized)
+        self.symmetric: bool = bool(symmetric)
+        self.shape: Tensor = self._t.shape
 
         if self.quantized:
             # TODO remove this costly assertion after testing !!!!! FIXME:
@@ -48,7 +57,6 @@ class QTensor:
                 assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
         # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
-        self.shape: Tensor = self._t.shape
 
     def dequantize(self) -> Tensor:
         return (self._t - self.zero) * self.scale
@@ -100,7 +108,6 @@ class QTensor:
                 zero=args[0].zero,
                 quantized=args[0].quantized
             )
-
 
     # ----------------- item methods for slicing ---------------
     def __delitem__(self, *args, **kwargs):
@@ -186,6 +193,7 @@ class QTensor:
         string = "QT"+string[1:-1]
         string += ", scale="+str(self.scale)
         string += ", zero="+str(self.zero)
+        string += f", quantized={self.quantized}"
         string += ")"
         return  string
 
@@ -198,6 +206,15 @@ class QTensor:
 
     def dim(self, *args, **kwargs):
         return self._t.dim(*args, **kwargs)
+
+    def item(self, *args, **kwargs):
+        return self._t.item(*args, **kwargs)
+
+    def nelement(self, *args, **kwargs):
+        return self._t.nelement(*args, **kwargs)
+
+    def any(self, *args, **kwargs):
+        return self._t.any(*args, **kwargs)
 
 
 
