@@ -881,7 +881,8 @@ by initializing it with clipped_distr: bool given as kwarg.
         EMA statistics are saved to self.__stats__,
         a regular python dictionary containing EMA stats.
         If and what EMA stats are saved depends on self.calibration_mode and self.distribution_kind:
-            * CalibMode.KL and DistKind.SYMM: "mu"
+            * CalibMode.KL AND DistKind.SYMM: "mu"
+            * CalibMode.KL AND DistKind.CLIPPED: nothing
             * CalibMode.EMA: "min", "max"
         :param x: QTensor, unless fp is True, then self.calibration_mode must be gaussian, and x FP32
         :param fp: string, name/identifier of current module
@@ -959,7 +960,7 @@ by initializing it with clipped_distr: bool given as kwarg.
                         a, b, num_bits=self.num_bits
                     )
         except KeyError as KE:
-            raise Exception(f"Got KeyError: {KE} during QListener (listening to {self.mods}) conversion. It was possibly never called during tuning?")
+            raise Exception(f"Got KeyError: {KE} during conversion of {self}. It was possibly never called during tuning?")
 
         prefix = self.name + "_" if self.name else ""
 
@@ -990,6 +991,8 @@ CLIPPING_MODULES = [
 SYMMETRIZING_MODULES = [
     nn.BatchNorm1d,
     nn.BatchNorm2d,
-    nn.Linear
+    nn.Linear,
+    QMatMul,
+    QMask,
 ]
 
