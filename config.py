@@ -4,6 +4,9 @@ import json
 
 """Options used by various quantization routines, in descending scope"""
 
+class QuantConfigurationError(Exception):
+    pass
+
 class TuningMode(Enum):
     # used in ../quantize.py ("which quantization workflow?")
     Calibration = 0

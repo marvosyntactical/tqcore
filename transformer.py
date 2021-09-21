@@ -22,7 +22,6 @@ from .quantizable_layer import \
     QMask, \
     QReLU6, \
     QLinear, \
-    QFFT, \
     FFT, \
     NonQuantizableModuleWrap, \
     CLIPPING_MODULES, \
@@ -107,7 +106,7 @@ class MultiHeadedAttention(nn.Module):
 
         # DONT apply attention dropout and compute context vectors.
         attention = self.softmax(scores)
-        # attention = self.dropout(attention)
+        attention = self.dropout(attention)
 
         # get context vector (select values with attention) and reshape
         # back to [B, W, D]
@@ -208,7 +207,8 @@ class QMultiHeadedAttention(nn.Module):
     Implementation modified from OpenNMT-py.
     https://github.com/OpenNMT/OpenNMT-py
 
-    (from https://github.com/joeynmt/joeynmt/blob/master/joeynmt/transformer_layers.py)
+    made quantizable, taken from
+    https://github.com/joeynmt/joeynmt/blob/master/joeynmt/transformer_layers.py
     """
 
     def __init__(self, num_heads: int, dim: int, dropout: float = 0.1, **qkwargs):
@@ -245,13 +245,14 @@ class QMultiHeadedAttention(nn.Module):
         self.qMask = QMask(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
-        # qsoft = 0
-        # if qsoft:
-        #     self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
-        # else:
-        #     self.qsoftmax = NonQuantizableModuleWrap(
-        #         nn.Softmax(dim=-1), **qkwargs
-        #     )
+        qsoft = 0
+        if qsoft:
+            self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+        else:
+            self.qsoftmax = NonQuantizableModuleWrap(
+                nn.Softmax(dim=-1), **qkwargs
+            )
+        self.dropout = nn.Dropout(dropout)
 
 
         self.avMatMul = QMatMul(**qkwargs)
@@ -301,14 +302,15 @@ class QMultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1).unsqueeze(1)
             scores = self.qMask(scores, mask)
             print(f"Got mask={mask!=0}")
-            print(f"qMaskl was activated!!! qMaskl.__stats__: {self.qMaskl.__stats__}")
-        self.qMaskl(scores)
+            print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
+            self.qMaskl(scores)
 
         print_qt_stats("scores", scores, stage=self.qMaskl.stage, step=self.plot_step_counter, p=.1)
 
         # # normalize context vectors.
-        # attention = self.qsoftmax(scores)
-        attention = scores
+        attention = self.qsoftmax(scores)
+        # attention = scores
+        attention = self.dropout(attention)
 
         # get context vector (select values with attention) and reshape
         # back to [B, W, D]
@@ -374,7 +376,7 @@ class QTransformerEncoderLayer(nn.Module):
              dropout: float = 0.1,
              time_window: int = 50,
              bn_mom: float = 0.9,
-             activ: str = "nn.ReLU6",
+             activ: str = "QReLU6",
              fft: bool = False,
              qkwargs: Dict = None,
              **kwargs
@@ -426,7 +428,6 @@ class QTransformerEncoderLayer(nn.Module):
                 self.mix = lambda x, mask: self.mixer(x,x,x,mask)
             else:
                 self.mixer = NonQuantizableModuleWrap(FFT(), **qkwargs)
-                # self.fft = QFFT(**qkwargs)
                 mix_output_layer = []
                 self.mix = lambda x, mask: self.mixer(x, mask)
 
@@ -571,8 +572,17 @@ class QTransformerEncoder(nn.Module):
         self.emb_listener = QListener(self.embedding, **qkwargs)
 
         # TODO FIXME add these again
-        # self.pe = QPositionalEncoding(dim, time_window)
-        # self.pe_listener = QListener(self.pe, **qkwargs)
+        self.has_pe = 1
+        self.wrapped_pe = 0
+        if self.has_pe:
+            if self.wrapped_pe:
+                self.pe = NonQuantizableModuleWrap(
+                    QPositionalEncoding(dim, time_window)
+                    ,**qkwargs
+                )
+            else:
+                self.pe = QPositionalEncoding(dim, time_window)
+            self.pe_listener = QListener(self.pe, **qkwargs)
 
         self.emb_dropout = nn.Dropout(p=emb_dropout)
 
@@ -616,7 +626,7 @@ class QTransformerEncoder(nn.Module):
         """
         self.plot_step_counter += 1
 
-        x = (x - x.mean()) / x.std()
+        # x = (x - x.mean()) / x.std()
 
         x = self.quantStub(x)
         x = self.input_listener(x)
@@ -632,8 +642,9 @@ class QTransformerEncoder(nn.Module):
         # if self_is_quant:
         #     assert x.quantized
 
-        # x = self.pe(x) # add position encoding to word embeddings
-        # x = self.pe_listener(x)
+        if self.has_pe:
+            x = self.pe(x) # add position encoding to word embeddings
+            x = self.pe_listener(x)
 
         x = self.emb_dropout(x)
 

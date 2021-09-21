@@ -10,13 +10,11 @@ from .config import QuantStage
 
 import numpy as np
 
-__PLOT__ = 1
+__PLOT__ = 0
 __DEBUG__ = 0
 
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
 
-class QuantConfigurationError(Exception):
-    pass
 
 def print_qt_stats(
         name,

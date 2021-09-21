@@ -17,8 +17,8 @@ import warnings
 from .qtensor import QTensor
 from .quantization_functions import Quantization, \
         UniformQuantization, UniformSymmetricQuantization, FakeQuant
-from .utils import print_qt_stats, is_integer, QuantConfigurationError
-from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind
+from .utils import print_qt_stats, is_integer
+from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind, QuantConfigurationError
 from .histogram import HistogramCalibrator
 from .kernel import qadd, qmul
 
@@ -585,25 +585,7 @@ def DiscreteHartleyTransform(input):
     dht = fft[:, :, :, :, -2] - fft[:, :, :, :, -1]
     return dht
 
-class FFT(nn.Module):
-    # TODO move this to ..modules.py
-    # TODO figure out mask
-
-    # figure out whether to orthonormalize (scale by 1/sqrt(n))
-    # paper: vandermonde matrix has normalization
-    # third party code: no normalization
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-
-        # x = fft(fft(x, dim=-1), dim=-2).real
-        x = fft2(x)
-        x = x.real #  + x.imag
-        return x
-
-class QFFT(QuantizableModule):
+class FFT(QuantizableModule):
     # TODO figure out mask
 
     # figure out whether to use kwarg "normalize" (scale by 1/sqrt(n))
@@ -611,28 +593,19 @@ class QFFT(QuantizableModule):
     # third party code: no normalization
 
     def __init__(self, *args, **kwargs):
-        assert False, NotImplemented
         super().__init__()
 
     def forward_fp(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        assert False, NotImplemented
+        if mask is not None:
+            print("="*20)
+            print("Warning: FFT mask not yet implemented!")
+            print("="*20)
 
-        # x = fft(fft(x, dim=-1), dim=-2).real
-        x = fft2(x)
-        x = x.real #  + x.imag
-        return x
-
-    def forward_qat(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        super().forward_qat(x)
-        assert False, NotImplemented
-        x = fft2(x)
-        x = x.real #  + x.imag
-        return x
-
-    def forward_quantized(self, x: QTensor, mask: Optional[torch.Tensor] = None):
-        assert False, NotImplemented
-        x = fft2(x)
-        x = x.real #  + x.imag
+        # method 1 (paper):
+        x = fft(fft(x, dim=-1), dim=-2).real
+        # method 2:
+        # x = fft2(x)
+        # x = x.real # method 2b:  + x.imag
         return x
 
 class QPositionalEncoding(QuantizableModule):
@@ -658,29 +631,29 @@ class QPositionalEncoding(QuantizableModule):
                 ``(batch_size, dim, time_window)``
         """
         # Add position encodings
-        out = self.W + X
-        return out
+        return self.W + X
 
     def forward_qat(self, X: QTensor):
-        super().forward_qat(x)
-        self.W.data = self.fake_quantize(
-            self.W.data,
-            self.quantization,
-            self.num_bits,
-            None,
-            None,
-            handling_qtensors=False,
-        )
+        super().forward_qat()
         rfloat = self.W + X._t
         r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
         return r
 
     def forward_quantized(self, X: QTensor):
         return qadd(
-            self.W, X, 1.,
+            self._w, X, 1.,
             self.scale, self.zero, torch.add,
             self.quantization, self.weight_quantization,
             self.num_bits, self.num_bits_weight
+        )
+
+    def quantize(self):
+        super().quantize()
+        # nn.Parameter W is replaced by QTensor
+        self._w = self.weight_quantization.quantize_to_qtensor_using_range(
+            self.W.data,
+            num_bits=self.num_bits_weight,
+            quantized=True
         )
 
 
