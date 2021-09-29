@@ -9,8 +9,10 @@ from .quantization_functions import Quantization
 from .utils import print_qt_stats, is_integer
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul
+# (the terminology "kernel" is from https://github.com/google/gemmlowp : low bit compute functions)
 # TODO future:
-# replace qadd and qmul by gemmlowp (possibly <) 8 bit kernel
+# replace qadd and qmul by gemmlowp like (possibly <) 8 bit kernel
+# (gemmlowp also contains hints on how to do this for less than 8 bits)
 
 def _convert_to_qtensor_for_kernel(
         a,

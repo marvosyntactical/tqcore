@@ -57,6 +57,7 @@ class QConfig(NamedTuple):
     calib_mode: str = "minandmax"
     thresholds: str = "conjugate"
     calib_num_bins: int = 2048
+    calib_eps: int = 5
     record_n_batches_bn: int =  30
     record_n_batches_qlistener: int =  60
 

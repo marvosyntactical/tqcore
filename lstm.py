@@ -5,20 +5,39 @@ jinhunchoi's implementation of BNLSTM at
 https://raw.githubusercontent.com/jihunchoi/recurrent-batch-normalization-pytorch/master/bnlstm.py
 and extended with some more LSTM wrapper modules
 
-
-
 # NOTE TODO
 Implement QBNLSTM analogously to the below:
 https://github.com/quic/aimet-model-zoo/blob/develop/zoo_torch/examples/deepspeech2_quanteval.py
 """
 
+import functools
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.nn import functional, init
 from utils import xavier_uniform
+from .quantizable_layer import \
+    QuantStub, DeQuantStub, \
+    QListener, \
+    QAdd, QMul, QMatMul, \
+    QSoftmax, \
+    QPositionalEncoding, \
+    QBoolMask, \
+    QStack, \
+    QReLU6, \
+    QLinear, \
+    FFT, \
+    NonQuantizableModuleWrap, \
+    CLIPPING_MODULES, \
+    SYMMETRIZING_MODULES, \
+    QHSigmoid, \
+    QHTanH
+from .qtensor import QTensor
+from .config import QuantStage
 
+linear_cls = QLinear
 
 class SeparatedBatchNorm1d(nn.Module):
 
@@ -85,52 +104,87 @@ class SeparatedBatchNorm1d(nn.Module):
                 .format(name=self.__class__.__name__, **self.__dict__))
 
 
-class LSTMCell(nn.Module):
+class QLSTMCell(nn.Module):
 
-    """A basic LSTM cell."""
+    """A basic quantizable LSTM cell."""
 
-    def __init__(self, input_size, hidden_size, use_bias=True, **kwargs):
+    def __init__(
+            self,
+            input_size,
+            hidden_size,
+            use_bias=True,
+            qkwargs: Dict = None,
+            **kwargs
+        ):
         """
         Most parts are copied from torch.nn.LSTMCell.
         """
 
-        super(LSTMCell, self).__init__()
+        super(QLSTMCell, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.use_bias = use_bias
-        self.weight_ih = nn.Parameter(
-            torch.FloatTensor(input_size, 4 * hidden_size))
-        self.weight_hh = nn.Parameter(
-            torch.FloatTensor(hidden_size, 4 * hidden_size))
-        if use_bias:
-            self.bias = nn.Parameter(torch.FloatTensor(4 * hidden_size))
-        else:
-            self.register_parameter('bias', None)
+
+        self.has_qsigm = 1
+        self.has_qtanh = 1
+
+        sigmoid_cls = QHSigmoid if self.has_qsigm else \
+                functools.partial(NonQuantizableModuleWrap, nn.Hardsigmoid)
+        tanh_cls = QHTanH if self.has_qtanh else \
+                functools.partial(NonQuantizableModuleWrap, nn.Hardtanh)
+
+        self.i_to_h = QLinear(input_size, 4 * hidden_size, bias=use_bias, qkwargs=qkwargs)
+        self.h_to_h = QLinear(hidden_size, 4 * hidden_size, bias=False, qkwargs=qkwargs)
+
+        self.add1 = QAdd(**qkwargs)
+        self.add1l = QListener(self.add1, **qkwargs)
+
+        # activation functions and their listeners
+        self.forget_ = sigmoid_cls(**qkwargs)
+        self.forget_l = QListener(self.forget_, **qkwargs)
+        self.f_ = lambda f: self.forget_l(self.forget_(f))
+
+        self.input_ = sigmoid_cls(**qkwargs)
+        self.input_l = QListener(self.input_, **qkwargs)
+        self.i_ = lambda i: self.input_l(self.input_(i))
+
+        self.gate_ = tanh_cls(**qkwargs)
+        self.gate_l = QListener(self.gate_, **qkwargs)
+        self.g_ = lambda g: self.gate_l(self.gate_(g))
+
+        self.output_ = sigmoid_cls(**qkwargs)
+        self.output_l = QListener(self.output_, **qkwargs)
+        self.o_ = lambda o: self.output_l(self.output_(o))
+
+        self.cell_ = tanh_cls(**qkwargs)
+        self.cell_l = QListener(self.cell_, **qkwargs)
+        self.c_ = lambda c: self.cell_l(self.cell_(c))
+
+        # multiplications and additions:
+        self.new_m  = QMul(**qkwargs)
+        self.new_m_l  = QListener(self.new_m, **qkwargs)
+        self.new_mul = lambda a, b: self.new_m_l(self.new_m(a,b))
+
+        self.old_m  = QMul(**qkwargs)
+        self.old_m_l  = QListener(self.old_m, **qkwargs)
+        self.old_mul = lambda a, b: self.old_m_l(self.old_m(a,b))
+
+        self.cell_a  = QAdd(**qkwargs)
+        self.cell_a_l  = QListener(self.cell_a, **qkwargs)
+        self.cell_add = lambda a, b: self.cell_a_l(self.cell_a(a,b))
+
+        self.hidden_m  = QMul(**qkwargs)
+        self.hidden_m_l  = QListener(self.hidden_m, **qkwargs)
+        self.hidden_mul = lambda a, b: self.hidden_m_l(self.hidden_m(a,b))
+
         self.reset_parameters()
 
-    def reset_parameters(self):
-        """
-        Initialize parameters following the way proposed in the paper.
-        """
-
-        init.orthogonal(self.weight_ih.data)
-
-        weight_hh_data = torch.eye(self.hidden_size)
-        weight_hh_data = weight_hh_data.repeat(1, 4)
-
-        with torch.no_grad():
-            self.weight_hh.set_(weight_hh_data)
-
-        # The bias is just set to zero vectors.
-        if self.use_bias:
-            init.constant(self.bias.data, val=0)
-
-    def forward(self, input_, hx):
+    def forward(self, input_, hc):
         """
         Args:
             input_: A (batch, input_size) tensor containing input
                 features.
-            hx: A tuple (h_0, c_0), which contains the initial hidden
+            hc: A tuple (h_0, c_0), which contains the initial hidden
                 and cell state, where the size of both states is
                 (batch, hidden_size).
 
@@ -138,26 +192,55 @@ class LSTMCell(nn.Module):
             h_1, c_1: Tensors containing the next hidden and cell state.
         """
 
-        h_0, c_0 = hx
-        batch_size = h_0.size(0)
-        bias_batch = self.bias.unsqueeze(0).expand(
-            batch_size, *self.bias.size()
-        )
+        h_0, c_0 = hc
 
-        wh_b = torch.addmm(bias_batch, h_0, self.weight_hh)
-        wi = torch.mm(input_, self.weight_ih)
-        f, i, o, g = torch.split(wh_b + wi,
-                                 self.hidden_size, dim=1)
-        c_1 = torch.sigmoid(f) * c_0 + torch.sigmoid(i) * torch.tanh(g)
-        h_1 = torch.sigmoid(o) * torch.tanh(c_1)
+        if self.i_to_h.stage == QuantStage.QAT:
+            assert type(input_) == QTensor
+            assert type(h_0) == QTensor
+
+        wi = self.i_to_h(input_)
+        wh_b = self.h_to_h(h_0)
+
+        h_x4 = self.add1(wh_b, wi)
+        h_x4 = self.add1l(h_x4)
+
+        f, i, o, g = h_x4.split(self.hidden_size, dim=1)
+
+        # update cell
+        new = self.new_mul(self.i_(i), self.g_(g))
+        old = self.old_mul(self.f_(f), c_0)
+        c_1 = self.cell_add(old, new)
+
+        # use hidden and cell to update hidden
+        h_1 = self.hidden_mul(self.o_(o), self.c_(c_1))
+
         return h_1, c_1
+
+    def reset_parameters(self):
+        """
+        Initialize parameters following the way proposed in the paper.
+        (Normalization helps training of quantized lstm?)
+        implementation from associated github repository
+        """
+
+        init.orthogonal(self.i_to_h.weight.data)
+
+        weight_hh_data = torch.eye(self.hidden_size)
+        weight_hh_data = weight_hh_data.repeat(1, 4)
+
+        with torch.no_grad():
+            self.h_to_h.data = weight_hh_data
+
+        # The bias is just set to zero vectors.
+        if self.use_bias:
+            init.constant(self.i_to_h.bias.data, val=0)
 
     def __repr__(self):
         s = '{name}({input_size}, {hidden_size})'
         return s.format(name=self.__class__.__name__, **self.__dict__)
 
 
-class BNLSTMCell(nn.Module):
+class QBNLSTMCell(nn.Module):
 
     """A BN-LSTM cell."""
 
@@ -213,12 +296,12 @@ class BNLSTMCell(nn.Module):
         self.bn_hh.weight.data.fill_(0.1)
         self.bn_c.weight.data.fill_(0.1)
 
-    def forward(self, input_, hx, time):
+    def forward(self, input_, hc, time):
         """
         Args:
             input_: A (batch, input_size) tensor containing input
                 features.
-            hx: A tuple (h_0, c_0), which contains the initial hidden
+            hc: A tuple (h_0, c_0), which contains the initial hidden
                 and cell state, where the size of both states is
                 (batch, hidden_size).
             time: The current timestep value, which is used to
@@ -228,7 +311,7 @@ class BNLSTMCell(nn.Module):
             h_1, c_1: Tensors containing the next hidden and cell state.
         """
 
-        h_0, c_0 = hx
+        h_0, c_0 = hc
         batch_size = h_0.size(0)
         bias_batch = (self.bias.unsqueeze(0)
                       .expand(batch_size, *self.bias.size()))
@@ -244,7 +327,7 @@ class BNLSTMCell(nn.Module):
         return h_1, c_1
 
 
-class LSTM(nn.Module):
+class QLSTM(nn.Module):
 
     """A module that runs multiple steps of LSTM."""
 
@@ -252,10 +335,11 @@ class LSTM(nn.Module):
             self, cell_class, input_size, hidden_size, num_layers=1,
             use_bias=True, batch_first=False, dropout=0,
             time_window=32,
+            qkwargs: Optional[Dict]=None,
             **kwargs
          ):
 
-        super(LSTM, self).__init__()
+        super(QLSTM, self).__init__()
         self.cell_class = cell_class
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -269,10 +353,31 @@ class LSTM(nn.Module):
             layer_input_size = input_size if layer == 0 else hidden_size
             cell = cell_class(input_size=layer_input_size,
                               hidden_size=hidden_size,
+                              qkwargs=qkwargs,
                               **kwargs)
             setattr(self, 'cell_{}'.format(layer), cell)
         self.dropout_layer = nn.Dropout(dropout)
         self.reset_parameters()
+
+        self.init_quant_stub = QuantStub(**qkwargs)
+
+        self.init_listener = QListener(self.init_quant_stub, **qkwargs)
+        self.qmask = QBoolMask(**qkwargs)
+
+        self.addh = QAdd(**qkwargs)
+        self.addhl = QListener(self.addh, **qkwargs)
+        self.addc = QAdd(**qkwargs)
+        self.addcl = QListener(self.addc, **qkwargs)
+
+        # quantizable concatenation modules (rescale)
+        self.qstack = QStack(**qkwargs)
+        self.qstack_l = QListener(self.qstack, **qkwargs)
+
+        self.hstack = QStack(**qkwargs)
+        self.hstack_l = QListener(self.hstack, **qkwargs)
+
+        self.cstack = QStack(**qkwargs)
+        self.cstack_l = QListener(self.cstack, **qkwargs)
 
     def get_cell(self, layer):
         return getattr(self, 'cell_{}'.format(layer))
@@ -282,30 +387,39 @@ class LSTM(nn.Module):
             cell = self.get_cell(layer)
             cell.reset_parameters()
 
-    @staticmethod
-    def _forward_rnn(cell, input_, length, hx):
+    def _forward_rnn(self, cell, input_, length, hc):
 
         T = input_.size(0)
         output = []
 
         for time in range(T):
-            if isinstance(cell, BNLSTMCell):
-                h_next, c_next = cell(input_=input_[time], hx=hx, time=time)
+            if isinstance(cell, QBNLSTMCell):
+                raise NotImplementedError(QBNLSTMCell)
+                h_next, c_next = cell(input_=input_[time], hc=hc, time=time)
             else:
-                h_next, c_next = cell(input_=input_[time], hx=hx)
+                h_next, c_next = cell(input_=input_[time], hc=hc)
+            as_ = h_next._t if isinstance(h_next, QTensor) else h_next
 
-            mask = (time < length).float().unsqueeze(1).expand_as(h_next)
-            h_next = h_next*mask + hx[0]*(1 - mask)
-            c_next = c_next*mask + hx[1]*(1 - mask)
-            hx_next = (h_next, c_next)
+            mask = (time < length).float().unsqueeze(1).expand_as(as_)
+            inv_mask = 1-mask
+
+            hnextmasked = self.qmask(h_next, mask)
+            hprevmasked = self.qmask(hc[0], inv_mask)
+            cnextmasked = self.qmask(c_next, mask)
+            cprevmasked = self.qmask(hc[1], inv_mask)
+
+            h_next = self.addhl(self.addh(hnextmasked, hprevmasked))
+            c_next = self.addcl(self.addc(cnextmasked, cprevmasked))
+            hc_next = (h_next, c_next)
             output.append(h_next)
-            hx = hx_next
+            hc = hc_next
 
-        output = torch.stack(output, 0)
+        output = self.qstack(output, 0)
+        output = self.qstack_l(output)
 
-        return output, hx
+        return output, hc
 
-    def forward(self, input_, length=None, hx=None):
+    def forward(self, input_, length=None, hc=None):
 
         if self.batch_first:
             input_ = input_.transpose(0, 1)
@@ -313,29 +427,33 @@ class LSTM(nn.Module):
         T, batch_size, _ = input_.size()
 
         if length is None:
-            length = Variable(torch.LongTensor([self.time_window] * batch_size))
+            length = torch.LongTensor([self.time_window] * batch_size)
             if input_.is_cuda:
                 device = input_.get_device()
                 length = length.cuda(device)
 
-        if hx is None:
+        if hc is None:
             # init hidden and cell if not given
-            hx = (
-                Variable(
+            hc = [
                     xavier_uniform(
                         input_.device,
                         self.num_layers, batch_size, self.hidden_size,
                         dtype=input_.dtype
-                        )
-                ),
-                Variable(
+                    ),
                     xavier_uniform(
                         input_.device,
                         self.num_layers, batch_size, self.hidden_size,
                         dtype=input_.dtype
-                        )
-                )
-            )
+                    )
+            ]
+            # NOTE:
+            # one shared qtensor should  be enough here as both tensors are initialized the same
+            # could also look at xavier uniform and set scale, zero by hand
+            hc = [self.init_quant_stub(t) for t in hc ]
+
+            h0 = self.init_listener(hc[0])
+            c0 = self.init_listener(hc[1])
+            hc = [h0, c0]
 
         h_n = []
         c_n = []
@@ -343,22 +461,29 @@ class LSTM(nn.Module):
 
         for layer in range(self.num_layers):
             cell = self.get_cell(layer)
-            hx_layer = (hx[0][layer,:,:], hx[1][layer,:,:])
+
+            # TODO make QTensor:
+            hc_layer = (hc[0][layer,:,:], hc[1][layer,:,:])
 
             if layer == 0:
-                layer_output, (layer_h_n, layer_c_n) = LSTM._forward_rnn(
-                    cell=cell, input_=input_, length=length, hx=hx_layer)
+                layer_output, (layer_h_n, layer_c_n) = self._forward_rnn(
+                    cell=cell, input_=input_, length=length, hc=hc_layer
+                )
             else:
-                layer_output, (layer_h_n, layer_c_n) = LSTM._forward_rnn(
-                    cell=cell, input_=layer_output, length=length, hx=hx_layer)
+                layer_output, (layer_h_n, layer_c_n) = self._forward_rnn(
+                    cell=cell, input_=layer_output, length=length, hc=hc_layer
+                )
 
             input_ = self.dropout_layer(layer_output)
             h_n.append(layer_h_n)
             c_n.append(layer_c_n)
 
         output = layer_output
-        h_n = torch.stack(h_n, 0)
-        c_n = torch.stack(c_n, 0)
+
+        h_n = self.hstack(h_n, 0)
+        h_n = self.hstack_l(h_n)
+        c_n = self.cstack(c_n, 0)
+        c_n = self.cstack_l(c_n)
 
         return output, (h_n, c_n)
 
@@ -487,16 +612,16 @@ class SingleStackLSTM(nn.Module):
         self.task = task = task.lower()
 
         # construct task head
-        head_list = [nn.Dropout(fc_dropout)] if fc_dropout else []
+        head = [nn.Dropout(fc_dropout)] if fc_dropout else []
 
         if "cl" in task:
             # (add extra dropout as, according to nn.LSTM docs, last layer is not succeeded by dropout
-            head_list.append(nn.Linear(dim, n_labels))
-            head_list.append(nn.LogSoftmax(dim=-1))
+            head.append(nn.Linear(dim, n_labels))
+            head.append(nn.LogSoftmax(dim=-1))
 
         elif "vaeenc" in task:
             # used by VAE encoder
-            head_list += [
+            head += [
                 nn.Flatten(1),
                 nn.Linear(
                     num_layers * 2 * dim,
@@ -505,18 +630,18 @@ class SingleStackLSTM(nn.Module):
             ]
         elif "vaedec" in task:
             # used by VAE decoder
-            head_list += [
+            head += [
                 nn.Linear(dim, n_labels),
             ]
 
-        self.head = nn.Sequential(*head_list)
+        self.head = nn.Sequential(*head)
 
         self.num_layers = num_layers
         self.dim = dim
 
-    def forward(self, x: torch.Tensor, mask=None, hx=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask=None, hc=None) -> torch.Tensor:
         # unroll internally
-        intermediate, encoder_states = self.rnn(x, hx=hx)
+        intermediate, encoder_states = self.rnn(x, hc=hc)
         if "cl" in self.task or "vaedec" in self.task:
             out = self.head(intermediate[:,-1,:])
         elif "vaeenc" in self.task:
@@ -529,10 +654,9 @@ class SingleStackLSTM(nn.Module):
         return out
 
 
-class TSLSTM(nn.Module):
-    # to be used as comparison to TSTModel
+class QTSLSTM(nn.Module):
 
-    # this module has same IO batch shapes as TSTModel:
+    # this module has same IO batch shapes as QTSTModel:
     # in: batch x time x src_dim
     # out: batch x n_labels
 
@@ -550,64 +674,98 @@ class TSLSTM(nn.Module):
             task: str = "pretrain", # regression/pretraining/classification
             n_labels: int = 7,
             lstm: str = "batch",
+            qkwargs: Dict = None,
             **kwargs
         ):
         super().__init__()
 
+        self.quantStub = QuantStub(**qkwargs)
+        self.input_listener = QListener(self.quantStub, calibration="minmax", **qkwargs)
+
+        self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
+        self.emb_listener = QListener(self.embedding, **qkwargs)
+
         if freeze:
             raise NotImplementedError("freeze")
 
-        lstm_cell = BNLSTMCell if "batch" in lstm.lower() else LSTMCell
+        assert not "batch" in lstm.lower(), "TODO implement QBNLSTMCell"
+        lstm_cell = QBNLSTMCell if "batch" in lstm.lower() else QLSTMCell
 
         # lstm
-        self.rnn = LSTM(
+        self.rnn = QLSTM(
             cell_class=lstm_cell,
-            input_size=src_dim,
+            input_size=dim,
             hidden_size=dim, # confirm intermediate layers all use hidden dim
             max_length=time_window,
             num_layers=num_layers,
             use_bias=True,
             batch_first=True,
             dropout=dropout,
-            # **kwargs
+            qkwargs=qkwargs,
+            **kwargs
         )
 
         self.task = task = task.lower()
 
-        head_list = [nn.Dropout(fc_dropout)] if fc_dropout else [] # from https://github.com/timeseriesAI/tsai/blob/main/tsai/models/TST.py
+        head = [nn.Dropout(fc_dropout)] if fc_dropout else [] # from https://github.com/timeseriesAI/tsai/blob/main/tsai/models/TST.py
 
         if "pre" in task:
             # pretrain: reconstruct input
-            head_list += [
-                nn.Linear(dim, src_dim)
+            head += [
+                QLinear(dim, src_dim, qkwargs=qkwargs)
+            ]
+            head += [
+                QListener(head[-1], **qkwargs),
+                DeQuantStub(**qkwargs),
             ]
 
         elif "reg" in task:
             # regression: predict n scalars
-            head_list += [
+            head += [
                 nn.Flatten(1),
-                nn.Linear(dim, n_labels)
+                QLinear(dim, n_labels, qkwargs=qkwargs)
             ]
+            head += [
+                QListener(head[-1], **qkwargs),
+                DeQuantStub(**qkwargs),
+            ]
+
         elif "cl" in task:
             # classification: predict distribution over n labels (Softmax in CrossEntropyLoss)
-            head_list += [
+            head += [
                 nn.Flatten(1),
-                nn.Linear(dim, n_labels),
+                QLinear(dim, n_labels, qkwargs=qkwargs),
+            ]
+            head += [
+                QListener(head[-1], **qkwargs),
+                DeQuantStub(**qkwargs),
                 nn.LogSoftmax(dim=-1),
             ]
+
         elif "vaeenc" in task:
             # VAE encoder
-            head_list = []
+            head = []
         else:
             raise NotImplementedError(task)
 
         self.head = nn.Sequential(
-            *head_list
+            *head
         )
 
     def forward(self, x: torch.Tensor, mask=None, **kwargs) -> torch.Tensor:
-        # unroll internally
+
+        x = self.quantStub(x)
+        x = self.input_listener(x)
+
+        x = self.embedding(x)
+        x = self.emb_listener(x)
+
+        if self.quantStub.stage == QuantStage.QAT:
+            assert type(x) == QTensor
+
+        # QLSTM unrolls the cell
         intermediate, _ = self.rnn(x, **kwargs)
+
         out = self.head(intermediate[-1,:,:])
         return out
 

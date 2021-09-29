@@ -158,8 +158,8 @@ def qat_prepare(
         warnings.warn(f"Dont know how to prepare parameterized leaf module '{module_number}', an instance of {type(module)}")
     else:
         is_leaf = descendants_module_number == module_number + 1
-        if is_leaf:
-            print(f"Don't know how to prepare leaf module '{module_number}', an instance of {type(module)}")
+        # if is_leaf:
+        #     print(f"Don't know how to prepare leaf module '{module_number}', an instance of {type(module)}")
 
 
     # ---------- END PREPARE DIFFERENT MODULES CASE BY CASE ---------

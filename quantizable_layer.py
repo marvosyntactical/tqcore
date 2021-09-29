@@ -10,7 +10,7 @@ from torch.nn.modules.utils import _pair
 import math
 import copy
 from enum import Enum
-from typing import Optional, Union, Tuple, Dict, Union, Callable
+from typing import Optional, Union, Tuple, Dict, Union, Callable, List
 from collections import defaultdict
 import warnings
 
@@ -178,7 +178,7 @@ class QMul(QuantizableModule):
         return a * b
 
     def forward_qat(self, a: QTensor, b: QTensor):
-        super().forward_qat(x)
+        super().forward_qat()
         # NO affine transformation; multiply in float but keep track of scale
         rfloat = a._t * b._t
         r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
@@ -313,7 +313,37 @@ class QAdd(QuantizableModule):
             self.num_bits, self.num_bits_weight
         )
 
-class QMask(QuantizableModule):
+class QStack(QuantizableModule):
+    def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out=None) -> QTensor:
+        qt0 = qtensors[0]
+        assert type(qt0) == QTensor, type(qt0)
+        quantized = qt0.quantized
+        scale = qt0.scale
+        zero = qt0.zero
+        requantized: List[Tensor] = []
+        for qt in qtensors[1:]:
+            assert type(qt) == QTensor, type(qt)
+            assert qt.quantized == quantized
+            # assert qt.scale == scale, (qt.scale, scale)
+            # assert qt.zero == zero
+            fp_tensor = qt.dequantize()
+            requantized = fp_tensor / self.scale + self.zero
+            requantized += [requantized]
+
+        r: Tensor = torch.stack(requantized, dim=dim, out=out)
+        qr: QTensor = QTensor(r, scale=scale, zero=zero, quantized=quantized)
+        return qr
+
+
+    def forward_fp(self, *args, **kwargs):
+        return torch.stack(*args, **kwargs)
+
+    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out=None):
+        super().forward_qat()
+        r = torch.stack([qt._t for qt in qtensors])
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+
+class QFill(QuantizableModule):
     def __init__(self, fp_neg_val: float=-1e5, **qkwargs):
         super().__init__(**qkwargs)
         self.fp_neg_val = float(fp_neg_val)
@@ -323,13 +353,32 @@ class QMask(QuantizableModule):
         return scores
 
     def forward_qat(self, scores, mask):
-        super().forward_qat(x)
+        super().forward_qat()
         scores = scores._t.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
         return QTensor(scores, self.scale, self.zero, quantized=False)
 
     def forward_quantized(self, scores, mask):
         scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero)
-        return QTensor(scores, self.scale, self.zero)
+        return QTensor(scores, self.scale, self.zero, quantized=True)
+
+class QBoolMask(QuantizableModule):
+    # NOTE does not require a listener/qparam attributes.
+    # TODO: either
+    # 1. distinguish between QuantizableModules which need a QListener or not
+    # 2. implement this module as a method of QTensor instead
+    def forward_fp(self, x: Tensor, mask: torch.BoolTensor):
+        return x * mask
+
+    def forward_qat(self, x: QTensor, mask: torch.BoolTensor):
+        super().forward_qat()
+        r = x._t * mask
+        return QTensor(r, x.scale, x.zero, quantized=False)
+
+    def forward_quantized(self, x: QTensor, mask: torch.BoolTensor):
+        r = x._t.masked_fill(mask==torch.as_tensor(False), x.zero)
+        return QTensor(r, x.scale, x.zero, quantized=True)
+
+
 
 class QSoftmax(QuantizableModule):
 
@@ -358,7 +407,9 @@ class QSoftmax(QuantizableModule):
 
         # this ALSO records stats of normed output (which will be between 0 and 1 anyway),
         # but is used mainly because of fake quantizing
-        self.norm_listener = QListener(self, name="normed", **qkwargs)
+        # self.norm_listener = QListener(self, name="normed", **qkwargs)
+
+        self.plot_step_counter = 0
 
     def _scaled_exp(self, inp: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
         # (differentiable)
@@ -373,8 +424,11 @@ class QSoftmax(QuantizableModule):
         return out
 
     def _set_exp_lkp(self):
-        # this range is tailored to uniformquantization
+        # this range is tailored to UniformQuantization
         self.EXP_STEP_FUN = self._scaled_exp(torch.arange(2.**self.num_bits)).round()
+        # import matplotlib.pyplot as plt
+        # plt.plot(self.EXP_STEP_FUN.detach().numpy())
+        # plt.show()
 
     def _exp_lkp(self, long_tensor: torch.LongTensor):
         # (not differentiable)
@@ -385,23 +439,16 @@ class QSoftmax(QuantizableModule):
 
     def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.softmax(dim=self.dim)
-        # print("Softmax return:")
-        # print(torch.unique(out))
         return out
 
     def forward_qat(self, inp: QTensor) -> torch.Tensor:
         super().forward_qat()
         self.exp_listener(inp)
-
-        # LogSumExp trick:
-        numerator = self._scaled_exp(inp-inp.max())
+        # LogSumExp trick in comment
+        numerator = self._scaled_exp(inp._t) # -inp._t.max())
         out = numerator/numerator.sum(dim=self.dim).unsqueeze(self.dim)
-
-        out = self.norm_listener(out)
-
-        # print("Softmax return:")
-        # print(torch.unique(out))
-        assert isinstance(out, QTensor), type(out)
+        out = QTensor(out, scale=self.scale, zero=self.zero, quantized=False)
+        # out = self.norm_listener(out)
         return out
 
     def quantize(self):
@@ -410,35 +457,29 @@ class QSoftmax(QuantizableModule):
 
     def forward_quantized(self, inp: QTensor) -> QTensor:
 
-        print(f"Softmax quantized fwd debug:")
-        print(self.exp_scale, self.exp_zero)
-        print(self.normed_scale, self.normed_zero)
-        print(f"mean of inp: {inp._t.mean().item()} (if high, logsumexp can help!)")
-        print("^^^^^^^^^^^^^^^^^^^^^^^^^^")
-
-        exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0 to 255 here already!
+        exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0-255 here already!
         zeroed_exp =  exponentiated._t - exponentiated.zero
-        M = exponentiated.scale / (self.normed_scale * self.alpha)
-        normed_exp = (zeroed_exp * M) + self.normed_zero
+        # M = exponentiated.scale / self.normed_scale
+        norm_scale = 1./(2**self.num_bits)
+        M = exponentiated.scale / norm_scale
+        normed_exp = (zeroed_exp * M) # + self.normed_zero
         r = self.quantization.tensor_clamp(normed_exp, num_bits=self.num_bits)
-
-        # print("Softmax return:")
-        # print(torch.unique(r))
+        print_qt_stats("qsoftmax out", r, stage=self.stage, step=self.plot_step_counter, p=.1)
 
         # NOTE: v Dequantized Implementation, leads to random performance after quantizing
         # r: torch.Tensor = (QTensor(inp._t * self.alpha, scale=inp.scale, zero=inp.zero)).dequantize().softmax(dim=self.dim)
 
         # r: QTensor = self.quantization.quantize_to_qtensor_using_params(
         #     r,
-        #     self.normed_scale_next,
-        #     self.normed_zero_next,
+        #     self.normed_scale,
+        #     self.normed_zero,
         #     num_bits=self.num_bits
         # )
 
         # denominator = self.quantization.quantize_to_qtensor_using_params(
         #     1/exponentiated.sum(dim=self.dim).unsqueeze(-1),
-        #     scale=1/self.exp_scale_next,
-        #     zero=self.exp_zero_next,
+        #     scale=1/self.exp_scale,
+        #     zero=self.exp_zero,
         #     num_bits=self.num_bits
         # )
 
@@ -446,11 +487,12 @@ class QSoftmax(QuantizableModule):
 
         # r = qmul(
         #     numerator, denominator, 1.,
-        #     self.normed_scale_next, self.normed_zero_next,
+        #     self.normed_scale, self.normed_zero,
         #     torch.mul,
         #     self.quantization, self.weight_quantization,
         #     self.num_bits, self.num_bits_weight
         # )
+        self.plot_step_counter += 1
 
         return r
 
@@ -486,13 +528,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
     def forward_qat(self, *args, **kwargs) -> torch.Tensor:
         super().forward_qat()
         # print_qt_stats("nonQ QAT", args[0], stage=QuantStage.QAT, p=1.)
-        try:
-            print_qt_stats("nonQ QAT", args[0], stage=QuantStage.QAT, p=1.)
-        except AssertionError as AE:
-            print(f"GOT AssertionError: {AE}")
-            # self.quantize()
-            # return self.forward(*args, **kwargs)
-            # raise AE
+        # print_qt_stats("mhattn", args[0], stage=QuantStage.QAT, p=1.)
 
         fp_args = [a._t if isinstance(a, QTensor) else a for a in args]
 
@@ -529,7 +565,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
         return tuple(fakeq_out) if len(fakeq_out) > 1 else fakeq_out[0]
 
     def forward_quantized(self, *args, **kwargs) -> QTensor:
-        print_qt_stats("nonQ Quantized", args[0], stage=QuantStage.Quantized, p=1.)
+        # print_qt_stats("nonQ Quantized", args[0], stage=QuantStage.Quantized, p=1.)
 
         fp_args = [a.dequantize() if isinstance(a, QTensor) else a for a in args]
 
@@ -551,32 +587,129 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         return tuple(q_outs) if len(q_outs) > 1 else q_outs[0]
 
+
 class QReLU6(QuantizableModule):
+    def __init__(self, *args, **kwargs):
+        super().__init__(**kwargs)
+        self.plot_step_counter = 0
 
     def forward_fp(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.functional.relu6(x)
+        out = nn.functional.relu6(x)
+        print_qt_stats("relu6", out, stage=self.stage, step=self.plot_step_counter)
+        self.plot_step_counter += 1
+        return out
 
-    def forward_qat(self, x: torch.Tensor) -> torch.Tensor:
-        super().forward_qat(x)
+    def forward_qat(self, x: QTensor) -> QTensor:
+        super().forward_qat()
         scale, zero = self.scale, self.zero
         six = round(6 / scale + zero)
         out = x.clamp(min=zero, max=six)
-        # followed by fakeQuantization
+
+        print_qt_stats("relu6", out, stage=self.stage, step=self.plot_step_counter)
+        self.plot_step_counter += 1
         return out
 
     def forward_quantized(self, x: QTensor) -> QTensor:
 
         scale = self.scale
         zero = self.zero
-        six = round(6 / scale + zero)
-        out = x._t.clamp(min=zero, max=six)
 
+        # this should be the case if self's QListener records the previous module
+        # as well. the below rescaling is therefore usually unnecessary
+        # in the case that these lines raise ASsertionError,
+        # either:
+        # 1. make QListener listen to previous module as well
+        # (init w/ e.g. QListener(linear, relu, **qkwargs))
+        # 2. comment out these assertions
         assert round(scale, 5) == round(x.scale, 5), \
                 (scale, x.scale)
         assert round(zero, 5) == round(x.zero, 5), \
                 (zero, x.zero)
 
-        return QTensor(out, scale=scale, zero=zero)
+        inp = x.dequantize()
+        inp = inp / scale + zero
+        six = round(6. / scale + zero)
+        out = inp.clamp(min=zero, max=six)
+
+        out =  QTensor(out, scale=scale, zero=zero)
+        print_qt_stats("relu6", out, stage=self.stage, step=self.plot_step_counter)
+        self.plot_step_counter += 1
+        return out
+
+
+class QHSigmoid(QuantizableModule):
+
+    def forward_fp(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.hardsigmoid(x)
+
+    def forward_qat(self, x: QTensor) -> QTensor:
+        super().forward_qat()
+        r = nn.functional.hardsigmoid(x._t)
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+
+    def forward_quantized(self, x: QTensor) -> QTensor:
+
+        scale = self.scale
+        zero = self.zero
+
+        # omit zeros here and add it at the end
+        one = round(1. / scale )
+        minus_three = round(-3. / scale )
+        plus_three = round(3. / scale )
+        a_half = round(.5 / scale)
+
+        out = x.dequantize()
+        out = out / scale # + zero
+
+        index_smaller = out <= minus_three + zero
+        index_larger = out >= plus_three + zero
+        idx_middle = 1.-(index_smaller | index_larger)
+
+        out[index_smaller] = zero
+        out[index_larger] = one + zero
+        out[idx_middle] *= 1/.6
+        out[idx_middle] += a_half + zero
+
+        # TODO plot and see if ceil or floor is better!
+        out.round_()
+
+        return QTensor(out, scale=scale, zero=zero, quantized=False)
+
+class QHTanH(QuantizableModule):
+
+    def forward_fp(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.hardtanh(x)
+
+    def forward_qat(self, x: QTensor) -> QTensor:
+        super().forward_qat()
+        r = nn.functional.hardtanh(x._t)
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+
+    def forward_quantized(self, x: QTensor) -> QTensor:
+
+        scale = self.scale
+        zero = self.zero
+
+        # omit zeros here and add it at the end
+        minus_one = round(-1. / scale ) + zero
+        plus_one = round(1. / scale ) + zero
+
+        out = x.dequantize()
+        out = out / scale + zero
+
+        index_smaller = out <= minus_one
+        index_larger = out >= plus_one
+        idx_middle = 1. - (index_smaller | index_larger)
+
+        out[index_smaller] = minus_one
+        out[index_larger] = plus_one
+
+        out.round_()
+
+        return QTensor(out, scale=scale, zero=zero, quantized=True)
+
+
+
 
 def DiscreteHartleyTransform(input):
     # from https://github.com/AlbertZhangHIT/Hartley-spectral-pooling/blob/master/spectralpool.py
@@ -655,8 +788,6 @@ class QPositionalEncoding(QuantizableModule):
             num_bits=self.num_bits_weight,
             quantized=True
         )
-
-
 
 class QListener(QuantizableModule):
     """
@@ -911,6 +1042,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             return (mu - t).item(), (mu + t).item()
 
     def _set_qparams(self):
+        # sets quantization parameters of listened-to modules
         # depends on self.calibration_mode
         try:
             if self.calibration_mode==CalibMode.EMA:
@@ -937,7 +1069,6 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         prefix = self.name + "_" if self.name else ""
 
-
         # set attributes for all listened modules
         for mod in self.mods:
             msg = ("="*20)+"\n"+f"Successfully set {mod}'s qparams: scale, zero"
@@ -954,7 +1085,7 @@ by initializing it with clipped_distr: bool given as kwarg.
         s = f"QListener(mods={self.mods}, dist={self.distribution_kind}, calib={self.calibration_mode})"
         return s
 
-# these must be updated in every module that adds QuantizableModules that belong here
+# these must be updated in every module that adds QuantizableModules in need of a listener
 global CLIPPING_MODULES, SYMMETRIZING_MODULES
 CLIPPING_MODULES = [
     QReLU6,
@@ -966,6 +1097,6 @@ SYMMETRIZING_MODULES = [
     nn.BatchNorm2d,
     nn.Linear,
     QMatMul,
-    QMask,
-]
+    QFill,
+] # comprehensive list of modules that output symmetric distribution
 

@@ -139,7 +139,7 @@ def convert_module(
 
     dont_quantize = leave_first_and_last_layer and ( module_number in leave_layers )
 
-    is_layer = True in [issubclass(mod_type, layer) for layer in OPS]
+    is_candidate = True in [issubclass(mod_type, layer) for layer in OPS]
 
     # delete fake quantizer:
     if hasattr(module, "_fakeQ"):
@@ -150,7 +150,8 @@ def convert_module(
         module.quantize()
         assert module.stage==QuantStage.Quantized
 
-    elif is_layer and not dont_quantize:
+    elif is_candidate and not dont_quantize:
+        assert False, type(module)
 
         module.forward = _factory_convert_layer_forward_impl(module)
 

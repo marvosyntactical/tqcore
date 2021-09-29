@@ -145,7 +145,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
 
     def forward_qat(self, input: Tensor) -> Tensor:
-        super().forward_qat(input)
+        super().forward_qat()
         bn_training, exponential_average_factor = self._do_checks(input)
 
         out = F.batch_norm(
@@ -165,19 +165,18 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
     def freeze(self):
         # to stop recording running stats;
-        # make self never trainable again.
+        # make self never trainable using self.train() again.
         print("="*30)
         print(self, " stopped recording.")
         print("="*30)
         self.track_running_stats = False
-        self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after freeze!"); return self
+        self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after it was frozen!"); return self
 
     def quantize(self):
         QuantizableModule.quantize(self)
 
         self.running_std = torch.sqrt(self.running_var)
-        eps = self.eps
-        self.eps = torch.sqrt(torch.Tensor([eps]))
+        eps = torch.sqrt(torch.Tensor([self.eps]))
 
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
         self.folded_weight = (self.weight * inv_running_std)\
@@ -379,7 +378,6 @@ class ConvBNfoldable(QuantizableModule):
 
         if self.has_relu:
             x = self.relu(x)
-
         return x
 
 class QBNFoldableTranspose(QuantizableModule):

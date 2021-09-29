@@ -6,7 +6,7 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 
 from copy import deepcopy
-from typing import Callable
+from typing import Callable, List, Dict, Tuple
 
 import logging
 logging.basicConfig(level="INFO")
@@ -50,7 +50,7 @@ class QTensor:
         self.symmetric: bool = bool(symmetric)
         self.shape: Tensor = self._t.shape
 
-        if self.quantized:
+        if self.quantized and not self._t.dtype==torch.bool:
             assert torch.allclose(self._t, self._t.round()), f"quantized QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
             # TODO remove this costly assertion after testing !!!!! FIXME:
             if not symmetric and __DEBUG__:
@@ -82,7 +82,7 @@ class QTensor:
             kwargs = {}
 
         quantized_or_not = [a.quantized for a in args if isinstance(a, QTensor)]
-        assert len(set(quantized_or_not)) == 1, [type(a) for a in args] # either all quantized or none quantized
+        # assert len(set(quantized_or_not)) == 1, (func, [type(a) for a in args]) # either all quantized or none quantized
 
         if func in HANDLED_FUNCTIONS and all(
                 issubclass(t, (torch.Tensor, QTensor))
@@ -198,6 +198,15 @@ class QTensor:
         string += ")"
         return  string
 
+    def split(self, *args, **kwargs):
+        tup_out: Tuple[Tensor] = self._t.split(*args, **kwargs)
+        outs: List = [QTensor(o,
+            scale=self.scale, zero=self.zero,
+            quantized=self.quantized,
+            symmetric=self.symmetric,
+        ) for o in tup_out]
+        return tuple(outs)
+
     def to(self, *args, **kwargs):
         return QTensor(self._t.to(*args, **kwargs), scale=self.scale, zero=self.zero,
                 quantized=self.quantized)
@@ -218,10 +227,9 @@ class QTensor:
         return self._t.any(*args, **kwargs)
 
 
-
 HANDLED_FUNCTIONS = {
     torch.add: QTensor.__add__,
-    torch.matmul: QTensor.__matmul__
+    torch.matmul: QTensor.__matmul__,
 }
 
 

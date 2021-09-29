@@ -151,8 +151,17 @@ class UniformQuantization(Quantization):
     def dequantize_qtensor(self, q_x: QTensor) -> torch.Tensor:
         return q_x.scale * (q_x._t - q_x.zero)
 
-    def tensor_clamp(self, x: torch.Tensor, num_bits) -> torch.Tensor:
-        return x.round().clamp(0, 2. ** num_bits - 1.)
+    def tensor_clamp(self, x: torch.Tensor, num_bits, up=True) -> torch.Tensor:
+        if up is not None:
+            if up:
+                # round up
+                round_fn = torch.ceil
+            else:
+                # round down
+                round_fn = torch.floor
+        else:
+            round_fn = torch.round
+        return round_fn(x).clamp(0, 2. ** num_bits - 1.)
 
     def quantize_to_qtensor_given_scale(self, x:torch.Tensor, scale, zero, num_bits=32, quantized=True) -> QTensor:
         """Bias Quantization"""

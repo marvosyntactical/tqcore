@@ -10,6 +10,7 @@ from .quantizable_layer import *
 
 from .batchnorm import *
 from .transformer import QTSTModel
+from .lstm import QTSLSTM
 from .models import *
 
 from .histogram import *

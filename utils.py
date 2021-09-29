@@ -10,11 +10,10 @@ from .config import QuantStage
 
 import numpy as np
 
-__PLOT__ = 0
+__PLOT__ = 1
 __DEBUG__ = 0
 
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t) if __DEBUG__ else True
-
 
 def print_qt_stats(
         name,
@@ -25,7 +24,7 @@ def print_qt_stats(
         p=0.01,
         num_bits=8
     ):
-    plot_dir = "/home/silversurfer42/Desktop/quant_plots/sep19/" # TODO add to cfg/CLI or read from datetime
+    plot_dir = "/home/silversurfer42/Desktop/quant_plots/qatfull/" # TODO add to cfg/CLI or read from datetime
     plot_str = plot_dir + "{}_{}_{}.png"
 
     bins = None
@@ -73,7 +72,7 @@ def print_qt_stats(
         # print(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
     # sometimes show matplotlib histogram
-    if __PLOT__ and torch.rand(1) < p: # and stage==QuantStage.Quantized:
+    if __PLOT__ and torch.rand(1) <= p: # and stage==QuantStage.Quantized:
         plot_data = data.detach().reshape(-1).numpy()
         plt.hist(plot_data, bins=bins)
         stage_ = "QAT" if stage == QuantStage.QAT else ("FP32" if stage==QuantStage.FP32 else \

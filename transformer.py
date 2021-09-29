@@ -19,7 +19,7 @@ from .quantizable_layer import \
     QAdd, QMul, QMatMul, \
     QSoftmax, \
     QPositionalEncoding, \
-    QMask, \
+    QFill, \
     QReLU6, \
     QLinear, \
     FFT, \
@@ -67,6 +67,7 @@ class MultiHeadedAttention(nn.Module):
 
         self.output_layer = nn.Linear(dim, dim)
         self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Optional[Tensor] = None):
         """
@@ -242,7 +243,7 @@ class QMultiHeadedAttention(nn.Module):
         self.qkMatMul = QMatMul(factor=scale, **qkwargs)
         self.qkl = QListener(self.qkMatMul, **qkwargs)
 
-        self.qMask = QMask(**qkwargs)
+        self.qMask = QFill(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
         qsoft = 0
@@ -253,7 +254,6 @@ class QMultiHeadedAttention(nn.Module):
                 nn.Softmax(dim=-1), **qkwargs
             )
         self.dropout = nn.Dropout(dropout)
-
 
         self.avMatMul = QMatMul(**qkwargs)
         self.avl = QListener(self.avMatMul, **qkwargs)
@@ -340,7 +340,7 @@ class QPositionwiseFeedForward(nn.Module):
         :param dropout:
         """
         super().__init__()
-        activation = eval(activ.strip())()
+        activation = eval(activ.strip())(**qkwargs)
         print(f"Initiated QFeedFwd with activation={activation}")
 
         modules = [
@@ -486,6 +486,7 @@ class QTransformerEncoderLayer(nn.Module):
 
         if self.has_mix:
             h = self.mix(x, mask)
+            print_qt_stats("attn", h, stage=self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)].stage, p=1., step=self.plot_step_counter)
         else:
             h = x
 
@@ -501,7 +502,7 @@ class QTransformerEncoderLayer(nn.Module):
             h = self.norm1(res1)
             if not self.has_res2:
                 h = self.norm1l(h)
-            print_qt_stats("norm1", h, stage=self.norm1.stage, step=self.plot_step_counter)
+            print_qt_stats("norm1", h, stage=self.norm1.stage, step=self.plot_step_counter, p=.1)
         else:
             h = res1
 
@@ -572,7 +573,7 @@ class QTransformerEncoder(nn.Module):
         self.emb_listener = QListener(self.embedding, **qkwargs)
 
         # TODO FIXME add these again
-        self.has_pe = 1
+        self.has_pe = 0
         self.wrapped_pe = 0
         if self.has_pe:
             if self.wrapped_pe:
