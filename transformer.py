@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.autograd import Variable
 
-from .utils import print_qt_stats
 from .quantizable_layer import \
     QuantStub, DeQuantStub, \
     QListener, \
@@ -24,6 +23,7 @@ from .quantizable_layer import \
     QLinear, \
     FFT, \
     NonQuantizableModuleWrap, \
+    QPlotter, \
     CLIPPING_MODULES, \
     SYMMETRIZING_MODULES
 from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
@@ -246,6 +246,8 @@ class QMultiHeadedAttention(nn.Module):
         self.qMask = QFill(**qkwargs)
         self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
 
+        self.scores_plotter = QPlotter("scores", **qkwargs)
+
         qsoft = 0
         if qsoft:
             self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
@@ -305,7 +307,8 @@ class QMultiHeadedAttention(nn.Module):
             print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
             self.qMaskl(scores)
 
-        print_qt_stats("scores", scores, stage=self.qMaskl.stage, step=self.plot_step_counter, p=.1)
+        # print_qt_stats("scores", scores, stage=self.qMaskl.stage, step=self.plot_step_counter, p=.1)
+        self.scores_plotter(scores)
 
         # # normalize context vectors.
         attention = self.qsoftmax(scores)
@@ -430,6 +433,7 @@ class QTransformerEncoderLayer(nn.Module):
                 self.mixer = NonQuantizableModuleWrap(FFT(), **qkwargs)
                 mix_output_layer = []
                 self.mix = lambda x, mask: self.mixer(x, mask)
+            self.mix_plotter = QPlotter("mix", **qkwargs)
 
         if self.has_res1:
             self.dropout1 = nn.Dropout(dropout)
@@ -439,10 +443,12 @@ class QTransformerEncoderLayer(nn.Module):
                 clipped_distr=False,
                 **qkwargs,
             )
+            self.res1_plotter = QPlotter("res1", **qkwargs)
         if self.has_bn:
             self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             if not self.has_res2:
                 self.norm1l = QListener(self.norm1, **qkwargs)
+            self.norm1_plotter = QPlotter("norm1", **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim,
@@ -464,9 +470,11 @@ class QTransformerEncoderLayer(nn.Module):
                 clipped_distr=False,
                 **qkwargs
             )
+            self.res2_plotter = QPlotter("res2", **qkwargs)
         if self.has_bn:
             self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm2l = QListener(self.norm2, **qkwargs)
+            self.norm2_plotter = QPlotter("norm2", **qkwargs)
 
         self.plot_step_counter = 0
 
@@ -486,7 +494,7 @@ class QTransformerEncoderLayer(nn.Module):
 
         if self.has_mix:
             h = self.mix(x, mask)
-            print_qt_stats("attn", h, stage=self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)].stage, p=1., step=self.plot_step_counter)
+            self.mix_plotter(h)
         else:
             h = x
 
@@ -494,7 +502,7 @@ class QTransformerEncoderLayer(nn.Module):
             res1 = self.add1(h, self.dropout1(x))
             # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
-            print_qt_stats("res1", res1, stage=self.norm1.stage, step=self.plot_step_counter)
+            self.res1_plotter(res1)
         else:
             res1 = h
 
@@ -502,23 +510,23 @@ class QTransformerEncoderLayer(nn.Module):
             h = self.norm1(res1)
             if not self.has_res2:
                 h = self.norm1l(h)
-            print_qt_stats("norm1", h, stage=self.norm1.stage, step=self.plot_step_counter, p=.1)
+            self.norm1_plotter(h)
         else:
             h = res1
 
         ff_out = self.feed_forward(h)
-        # print_qt_stats("ff", h, stage=self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)].stage, step=self.plot_step_counter)
 
         if self.has_res2:
             res2 = self.add2(ff_out, self.dropout2(h))
             res2 = self.add2l(res2)
-            print_qt_stats("res2", res2, stage=self.norm1.stage, step=self.plot_step_counter)
+            self.res2_plotter(res2)
         else:
             res2 = ff_out
 
         if self.has_bn:
             o = self.norm2(res2)
             o = self.norm2l(o)
+            self.norm2_plotter(o)
             # print_qt_stats("norm2", o, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             o = res2
@@ -627,6 +635,7 @@ class QTransformerEncoder(nn.Module):
         """
         self.plot_step_counter += 1
 
+        # data normalization happens in data.py
         # x = (x - x.mean()) / x.std()
 
         x = self.quantStub(x)

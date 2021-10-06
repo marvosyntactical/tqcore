@@ -43,6 +43,8 @@ class QTensor:
             symmetric:bool=False,
             **kwargs
         ):
+        # TODO add num bits attribute for architectures with activations with differing bitwidths
+
         self._t: Tensor = torch.as_tensor(data, **kwargs)
         self.scale: float = scale
         self.zero: int = zero
@@ -94,6 +96,13 @@ class QTensor:
                 logqt.info("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
                 return HANDLED_FUNCTIONS[func](*args, **kwargs)
+        elif func in PROHIBITED_FUNCTIONS:
+            logqt.warning("VVVVV Invoked QTensor __torch_function__ with prohibited func VVVVV\n")
+            logqt.warning(func)
+            logqt.warning(types)
+            logqt.warning("There is another way to accomplish this operation:")
+            logqt.warning(PROHIBITED_FUNCTIONS[func])
+            logqt.error("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
         else:
 
             logqt.warning("VVVVV Invoked QTensor __torch_function__ with unkown func VVVVV\n")
@@ -230,6 +239,9 @@ class QTensor:
 HANDLED_FUNCTIONS = {
     torch.add: QTensor.__add__,
     torch.matmul: QTensor.__matmul__,
+}
+PROHIBITED_FUNCTIONS = {
+    torch.stack: "Use QTensor.split instead"
 }
 
 

@@ -3,10 +3,11 @@ from torch import Tensor
 from torch.nn import Parameter
 
 from typing import Union, Callable, Tuple
+import warnings
 
 from .qtensor import QTensor
 from .quantization_functions import Quantization
-from .utils import print_qt_stats, is_integer
+from .utils import is_integer
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul
 # (the terminology "kernel" is from https://github.com/google/gemmlowp : low bit compute functions)
@@ -158,8 +159,13 @@ def qmul(
     r = quantization.tensor_clamp(r, num_bits=num_bits)
 
     # Make sure we didnt move outside of EMA range:
-    assert r.min() != r.max(), \
-        (scale_next, zero_next, r.min(), a._t.min(), a._t.max(), b._t.min(), b._t.max(), r_float.min(), r_float.max(), r_unclamped.min(), r_unclamped.max(), multiplier, factor)
+    if r.min() == r.max():
+        expressions = ["scale_next", "zero_next", "r.min()", "a._t.min()", "a._t.max()", "b._t.min()", "b._t.max()", "r_float.min()", "r_float.max()", "r_unclamped.min()", "r_unclamped.max()", "multiplier", "factor"]
+        msg = "\n"
+        for expression in expressions:
+            msg += expression+ "\t = \t"+ str(eval(expression)) + "\n"
+        warnings.warn(msg)
+        # assert False, msg
 
     return QTensor(r, scale=scale_next, zero=zero_next, quantized=quantize)
 

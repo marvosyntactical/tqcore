@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from .quantizable_layer import QuantizableModule, print_qt_stats, SYMMETRIZING_MODULES
+from .quantizable_layer import QuantizableModule, SYMMETRIZING_MODULES
 from .kernel import qmul, qadd
 from .qtensor import QTensor
 from .quantization_functions import FakeQuant

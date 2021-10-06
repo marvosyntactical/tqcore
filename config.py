@@ -1,11 +1,41 @@
 from enum import Enum
-from typing import NamedTuple, Union
+from typing import NamedTuple, Union, Dict
 import json
 
 """Options used by various quantization routines, in descending scope"""
 
 class QuantConfigurationError(Exception):
     pass
+
+class QConfig(NamedTuple):
+    """
+    Hyperparameters for QAT and Quantization of
+    already trained TSTModel
+    """
+    # quantization parameters
+    num_bits_weight: int = 8
+    num_bits: int = 8
+    num_bits_bias: int = 32
+    leave_first_and_last: bool = False # ignore first and last layer during quantization?
+    tuning: str = "qat"
+    calib_mode: str = "minandmax"
+    thresholds: str = "conjugate"
+    calib_num_bins: int = 2048
+    calib_eps: int = 5
+    record_n_batches_bn: int =  30
+    record_n_batches_qlistener: int =  60
+    plot_p: float = 0.01
+    stage_plot_indices: Dict = {
+            "FP32":[],
+            "Calibration":[],
+            "QAT":[],
+            "Quantized":[],
+        }
+    @classmethod
+    def from_json(cls, file):
+        cfg = json.load(open(file, "r"))
+        return cls(**cfg)
+
 
 class TuningMode(Enum):
     # used in ../quantize.py ("which quantization workflow?")
@@ -43,28 +73,4 @@ class ThresholdMode(Enum):
     Independent = 1
     Conjugate = 2
 
-class QConfig(NamedTuple):
-    """
-    Hyperparameters for QAT and Quantization of
-    already trained TSTModel
-    """
-    # quantization parameters
-    num_bits_weight: int = 8
-    num_bits: int = 8
-    num_bits_bias: int = 32
-    leave_first_and_last: bool = False # ignore first and last layer during quantization?
-    tuning: str = "qat"
-    calib_mode: str = "minandmax"
-    thresholds: str = "conjugate"
-    calib_num_bins: int = 2048
-    calib_eps: int = 5
-    record_n_batches_bn: int =  30
-    record_n_batches_qlistener: int =  60
 
-    @classmethod
-    def from_json(cls, file): # load config from json file
-        return cls(**json.load(open(file, "r")))
-
-    @classmethod
-    def from_yaml(cls, file): # load config from json file
-        return cls(**yaml.load(open(file, "r")))
