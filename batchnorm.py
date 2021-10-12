@@ -63,7 +63,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         # TODO replace below code by quantized_layer.quantized_linear call
         # / abstract with replaceable mul kernel (matmul/mul)
 
-        assert not self.track_running_stats, "<-- this attr indicates whether we are training; forward_quantized is for inference only"
+        # assert not self.track_running_stats, "<-- this attr indicates whether we are training; forward_quantized is for inference only"
 
         x_zeroed = x._t - x.zero
         gamma_zeroed = gamma._t - gamma.zero
@@ -144,12 +144,12 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             self.eps
         )
 
-    def forward_qat(self, input: Tensor) -> Tensor:
+    def forward_qat(self, input: QTensor) -> QTensor:
         super().forward_qat()
         bn_training, exponential_average_factor = self._do_checks(input)
 
         out = F.batch_norm(
-            input,
+            input._t,
             # If buffers are not to be tracked, ensure that they won't be updated
             self.running_mean if not self.training or self.track_running_stats else None,
             self.running_var if not self.training or self.track_running_stats else None,
@@ -161,7 +161,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
         if self.n_qat_batches == self.record_n_batches:
             self.freeze()
-        return out
+        return QTensor(out, scale=self.scale, zero=self.zero, quantized=False)
 
     def freeze(self):
         # to stop recording running stats;
@@ -169,7 +169,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         print("="*30)
         print(self, " stopped recording.")
         print("="*30)
-        self.track_running_stats = False
+        self.track_running_stats = True
         self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after it was frozen!"); return self
 
     def quantize(self):
@@ -213,6 +213,16 @@ class QBatchNorm1dTranspose(_QBatchNorm, nn.BatchNorm1d):
     def forward_quantized(self, x):
         x = torch.transpose(x,1,2)
         x = _QBatchNorm.forward_quantized(self, x)
+        x = torch.transpose(x,1,2)
+        return x
+
+class FPBatchNorm1dTranspose(nn.BatchNorm1d):
+    def __init__(self, *args, **kwargs):
+        nn.BatchNorm1d.__init__(self, *args, **kwargs)
+
+    def forward(self, x):
+        x = torch.transpose(x,1,2)
+        x = nn.BatchNorm1d.forward(self, x)
         x = torch.transpose(x,1,2)
         return x
 

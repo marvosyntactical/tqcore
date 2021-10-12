@@ -26,7 +26,7 @@ from .quantizable_layer import \
     QPlotter, \
     CLIPPING_MODULES, \
     SYMMETRIZING_MODULES
-from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose
+from .batchnorm import QBatchNorm1dTranspose, QBNFoldableTranspose, FPBatchNorm1dTranspose
 from .qtensor import QTensor
 from .config import QuantStage
 
@@ -212,7 +212,7 @@ class QMultiHeadedAttention(nn.Module):
     https://github.com/joeynmt/joeynmt/blob/master/joeynmt/transformer_layers.py
     """
 
-    def __init__(self, num_heads: int, dim: int, dropout: float = 0.1, **qkwargs):
+    def __init__(self, num_heads: int, dim: int, dropout: float = 0.1, layer_num: int = 0, **qkwargs):
         """
         Create a multi-headed attention layer.
         :param num_heads: the number of heads
@@ -223,32 +223,32 @@ class QMultiHeadedAttention(nn.Module):
 
         assert dim % num_heads == 0
 
+        pn = lambda s: s + " " + str(layer_num)
+
         self.head_size = head_size = dim // num_heads
         self.model_size = dim
         self.num_heads = num_heads
 
         self.k_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
-        self.post_kl = QListener(self.k_layer, **qkwargs)
+        self.post_kl = QListener(self.k_layer, plot_name=pn("k_layer"), **qkwargs)
 
         self.v_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
-        self.post_vl = QListener(self.v_layer, **qkwargs)
+        self.post_vl = QListener(self.v_layer, plot_name=pn("v_layer"), **qkwargs)
 
         self.q_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
-        self.post_ql = QListener(self.q_layer, **qkwargs)
+        self.post_ql = QListener(self.q_layer, plot_name=pn("q_layer"), **qkwargs)
 
         scale = 1./head_size**6
         # scale = 1./math.sqrt(self.head_size)
         # assert False, "remember to correct scale"
 
         self.qkMatMul = QMatMul(factor=scale, **qkwargs)
-        self.qkl = QListener(self.qkMatMul, **qkwargs)
+        self.qkl = QListener(self.qkMatMul, plot_name=pn("qk matmul"),**qkwargs)
 
         self.qMask = QFill(**qkwargs)
-        self.qMaskl = QListener(self.qMask, dont_fakeQ=True, **qkwargs)
+        self.qMaskl = QListener(self.qMask, dont_fakeQ=True, plot_name=pn("qmask"), **qkwargs)
 
-        self.scores_plotter = QPlotter("scores", **qkwargs)
-
-        qsoft = 0
+        qsoft = qkwargs["transformer"]["qsoftmax"]
         if qsoft:
             self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
         else:
@@ -258,7 +258,7 @@ class QMultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         self.avMatMul = QMatMul(**qkwargs)
-        self.avl = QListener(self.avMatMul, **qkwargs)
+        self.avl = QListener(self.avMatMul, plot_name=pn("av matmul"), **qkwargs)
 
         self.output_layer = linear_cls(dim, dim, qkwargs=qkwargs)
         self.plot_step_counter = 0
@@ -307,9 +307,6 @@ class QMultiHeadedAttention(nn.Module):
             print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
             self.qMaskl(scores)
 
-        # print_qt_stats("scores", scores, stage=self.qMaskl.stage, step=self.plot_step_counter, p=.1)
-        self.scores_plotter(scores)
-
         # # normalize context vectors.
         attention = self.qsoftmax(scores)
         # attention = scores
@@ -335,7 +332,7 @@ class QPositionwiseFeedForward(nn.Module):
     Projects to ff_size and then back down to input_size.
     """
 
-    def __init__(self, input_size, ff_size, time_window, dropout=0.1, activ: str="nn.ReLU6", **qkwargs):
+    def __init__(self, input_size, ff_size, time_window, dropout=0.1, activ: str="nn.ReLU6", layer_num: int =0, **qkwargs):
         """
         Initializes position-wise feed-forward layer.
         :param input_size: dimensionality of the input.
@@ -345,17 +342,18 @@ class QPositionwiseFeedForward(nn.Module):
         super().__init__()
         activation = eval(activ.strip())(**qkwargs)
         print(f"Initiated QFeedFwd with activation={activation}")
+        pn = lambda s: s + " " + str(layer_num)
 
         modules = [
             linear_cls(input_size, ff_size, qkwargs=qkwargs),
             activation,
         ]
         modules += [
-            QListener(*modules, clipped_distribution=True, **qkwargs),
+            QListener(*modules, clipped_distribution=True, plot_name=pn("pwff "+activ), **qkwargs),
             linear_cls(ff_size, input_size, qkwargs=qkwargs)
         ]
         modules += [
-            QListener(modules[-1], **qkwargs),
+            QListener(modules[-1], plot_name=pn("pwff out"), **qkwargs),
         ]
         self.pwff_layer = nn.Sequential(*modules)
 
@@ -382,6 +380,7 @@ class QTransformerEncoderLayer(nn.Module):
              activ: str = "QReLU6",
              fft: bool = False,
              qkwargs: Dict = None,
+             layer_num: int = 0,
              **kwargs
         ):
         """
@@ -394,22 +393,38 @@ class QTransformerEncoderLayer(nn.Module):
         """
         super().__init__()
 
+        # for unique plotnames:
+        pn = lambda s: s + " " + str(layer_num)
+
+        self.fft = fft
+
         # NOTE DEBUG TODO:
         # add these as cfg params
         # (preferrably dont leave them out entirely once NonQuant works)
         # => mix (NonQuant) quantization has priority
-        self.simulate_folding = 0
-        self.has_mix = 1
-        self.qattn = 1
-        self.fft = fft
-        self.has_res1 = 1
-        self.has_bn = 1
-        self.has_res2 = 1
+        qtransf_kwargs = qkwargs["transformer"]
 
-        if self.simulate_folding:
-            BatchNormMod = QBNFoldableTranspose
-        else:
+        self.has_mix = qtransf_kwargs["has_mix"]
+        self.qattn = qtransf_kwargs["qattn"]
+        self.has_res1 = qtransf_kwargs["has_res1"]
+        self.has_bn = qtransf_kwargs["has_bn"]
+        self.qbn= qtransf_kwargs["qbn"]
+        self.has_res2 = qtransf_kwargs["has_res2"]
+
+        # self.simulate_folding = 0 # NOTE deprecated
+        # if self.simulate_folding:
+        #     BatchNormMod = QBNFoldableTranspose
+
+        if self.qbn:
             BatchNormMod = QBatchNorm1dTranspose
+        else:
+            def wrapped_bn(dim, momentum=None, qkwargs=None, **kwargs):
+                return NonQuantizableModuleWrap(
+                    FPBatchNorm1dTranspose(
+                        dim, momentum=momentum, **kwargs
+                    ), **qkwargs
+                )
+            BatchNormMod = wrapped_bn
 
         mix_output_layer = []
         if self.has_mix:
@@ -417,7 +432,8 @@ class QTransformerEncoderLayer(nn.Module):
                 if self.qattn:
                     self.mixer = QMultiHeadedAttention(
                         num_heads, dim,
-                        dropout=dropout, **qkwargs)
+                        dropout=dropout,
+                        layer_num=layer_num, **qkwargs)
                     mix_output_layer = [self.mixer.output_layer]
                 else:
                     self.mixer = NonQuantizableModuleWrap(
@@ -433,7 +449,6 @@ class QTransformerEncoderLayer(nn.Module):
                 self.mixer = NonQuantizableModuleWrap(FFT(), **qkwargs)
                 mix_output_layer = []
                 self.mix = lambda x, mask: self.mixer(x, mask)
-            self.mix_plotter = QPlotter("mix", **qkwargs)
 
         if self.has_res1:
             self.dropout1 = nn.Dropout(dropout)
@@ -441,14 +456,13 @@ class QTransformerEncoderLayer(nn.Module):
             self.add1l = QListener(
                 * [self.add1] + mix_output_layer,
                 clipped_distr=False,
+                plot_name=pn("residual 1"),
                 **qkwargs,
             )
-            self.res1_plotter = QPlotter("res1", **qkwargs)
         if self.has_bn:
             self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             if not self.has_res2:
-                self.norm1l = QListener(self.norm1, **qkwargs)
-            self.norm1_plotter = QPlotter("norm1", **qkwargs)
+                self.norm1l = QListener(self.norm1, plot_name=pn("norm 1"), **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim,
@@ -456,6 +470,7 @@ class QTransformerEncoderLayer(nn.Module):
             dropout=dropout,
             time_window=time_window,
             activ=activ,
+            layer_num=layer_num,
             **qkwargs
         )
 
@@ -468,13 +483,12 @@ class QTransformerEncoderLayer(nn.Module):
                 self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
                 self.norm1,
                 clipped_distr=False,
+                plot_name=pn("residual 2"),
                 **qkwargs
             )
-            self.res2_plotter = QPlotter("res2", **qkwargs)
         if self.has_bn:
             self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-            self.norm2l = QListener(self.norm2, **qkwargs)
-            self.norm2_plotter = QPlotter("norm2", **qkwargs)
+            self.norm2l = QListener(self.norm2, plot_name=pn("norm 2"), **qkwargs)
 
         self.plot_step_counter = 0
 
@@ -494,15 +508,12 @@ class QTransformerEncoderLayer(nn.Module):
 
         if self.has_mix:
             h = self.mix(x, mask)
-            self.mix_plotter(h)
         else:
             h = x
 
         if self.has_res1:
             res1 = self.add1(h, self.dropout1(x))
-            # print("res1 output type:",type(res1))
             res1 = self.add1l(res1)
-            self.res1_plotter(res1)
         else:
             res1 = h
 
@@ -510,7 +521,6 @@ class QTransformerEncoderLayer(nn.Module):
             h = self.norm1(res1)
             if not self.has_res2:
                 h = self.norm1l(h)
-            self.norm1_plotter(h)
         else:
             h = res1
 
@@ -519,20 +529,14 @@ class QTransformerEncoderLayer(nn.Module):
         if self.has_res2:
             res2 = self.add2(ff_out, self.dropout2(h))
             res2 = self.add2l(res2)
-            self.res2_plotter(res2)
         else:
             res2 = ff_out
 
         if self.has_bn:
             o = self.norm2(res2)
             o = self.norm2l(o)
-            self.norm2_plotter(o)
-            # print_qt_stats("norm2", o, stage=self.norm1.stage, step=self.plot_step_counter)
         else:
             o = res2
-
-        # if self.mixer.stage == QuantStage.Quantized:
-        #     assert o.quantized
 
         self.plot_step_counter += 1
         return o
@@ -575,10 +579,10 @@ class QTransformerEncoder(nn.Module):
         super().__init__()
 
         self.quantStub = QuantStub(**qkwargs)
-        self.input_listener = QListener(self.quantStub, calibration="minmax", **qkwargs)
+        self.input_listener = QListener(self.quantStub, calibration="minmax", plot_name="input", **qkwargs)
 
         self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
-        self.emb_listener = QListener(self.embedding, **qkwargs)
+        self.emb_listener = QListener(self.embedding, plot_name="embedding", **qkwargs)
 
         # TODO FIXME add these again
         self.has_pe = 0
@@ -591,7 +595,7 @@ class QTransformerEncoder(nn.Module):
                 )
             else:
                 self.pe = QPositionalEncoding(dim, time_window)
-            self.pe_listener = QListener(self.pe, **qkwargs)
+            self.pe_listener = QListener(self.pe, plot_name=pn("pos enc"), **qkwargs)
 
         self.emb_dropout = nn.Dropout(p=emb_dropout)
 
@@ -601,9 +605,10 @@ class QTransformerEncoder(nn.Module):
                 dim=dim, ff_size=ff_size,
                 num_heads=num_heads, dropout=dropout,
                 time_window=time_window, activ=activ,
-                fft=fft, qkwargs=qkwargs
+                fft=fft, qkwargs=qkwargs,
+                layer_num=l # for unique plot names
             )
-            for _ in range(num_layers)
+            for l in range(num_layers)
         ])
         # for i in range(self.layers):
         #     setattr(self.layers["{i}"], "i", i)
@@ -745,7 +750,7 @@ class QTSTModel(nn.Module):
                 linear_cls(dim, src_dim, qkwargs=qkwargs),
             ]
             head += [
-                QListener(head[-1], **qkwargs),
+                QListener(head[-1], plot_name="head", **qkwargs),
                 DeQuantStub(**qkwargs),
             ]
 
@@ -756,17 +761,17 @@ class QTSTModel(nn.Module):
                 linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
             ]
             head += [
-                QListener(head[-1], **qkwargs),
+                QListener(head[-1], plot_name="head", **qkwargs),
                 DeQuantStub(**qkwargs),
             ]
         elif "cl" in task:
             # classification: predict distribution over n labels (Softmax in CrossEntropyLoss)
-            head = [
+            head += [
                 nn.Flatten(1),
                 linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
             ]
             head += [
-                QListener(head[-1], **qkwargs),
+                QListener(head[-1], plot_name="head", **qkwargs),
                 DeQuantStub(**qkwargs),
                 nn.LogSoftmax(dim=-1),
             ]

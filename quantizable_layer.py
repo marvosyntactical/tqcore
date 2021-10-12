@@ -163,7 +163,7 @@ class QuantStub(QuantizableModule):
 class DeQuantStub(QuantizableModule):
     """
     Dequantizes incoming torch.Tensors into tqcore.QTensors if necessary.
-    Functionality Analogous to torch.quantization.DeQuantStub
+    Functionality analogous to torch.quantization.DeQuantStub
     """
     def __init__(self, **qkwargs):
         super().__init__(**qkwargs)
@@ -412,7 +412,7 @@ class QSoftmax(QuantizableModule):
         # this records EMA stats of exponential, and is not used for fake quant effect
         self.exp_listener = QListener(
             self,
-            name="exp",
+            listener_name="exp",
             function=self._scaled_exp,
             dont_fakeQ=True,
             **qkwargs
@@ -847,9 +847,8 @@ class QListener(QuantizableModule):
         # attach plotter to self if plot_name is given
         if plot_name is not None:
             self.qplotter = QPlotter(plot_name=plot_name, **qkwargs)
-            # self.qplot_hook_handle = self.register_forward_hook(self.qplotter.forward)
         else:
-            self.qplotter = lambda x: None
+            self.qplotter = lambda x, **kwargs: x
 
         # CalibMode
         calib_mode = qkwargs["calib_mode"].lower() if calibration is None else calibration
@@ -928,7 +927,20 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         self._qparams_set = False
 
-    def forward_calib(self, x: Tensor):
+    def freeze(self):
+        print("="*30)
+        print(self, " stopped recording.")
+        print("="*30)
+        assert not self.set_qparams_during_quantization, "stats must have been set during qat to freeze"
+
+        # TODO call super().forward_qat .. how can I use self in method?
+        self.forward_qat = lambda x: x
+
+    def forward_fp(self, x:Tensor, dont_plot=False):
+        x = self.qplotter(x, dont_plot=dont_plot)
+        return x
+
+    def forward_calib(self, x: Tensor, dont_plot=False):
         """
         Save histograms for Calibration as in
         https://on-demand.gputechconf.com/gtc/2017/presentation/s7310-8-bit-inference-with-tensorrt.pdf
@@ -941,17 +953,10 @@ by initializing it with clipped_distr: bool given as kwarg.
             self._update_ema(x)
         if not self.set_qparams_during_quantization:
             self._set_qparams()
-        self.qplotter(x)
+        x = self.qplotter(x, dont_plot=dont_plot)
         return x
 
-    def freeze(self):
-        print("="*30)
-        print(self, " stopped recording.")
-        print("="*30)
-        assert not self.set_qparams_during_quantization, "stats must have been set during qat to freeze"
-        self.forward_qat = super().forward_qat()
-
-    def forward_qat(self, x: QTensor):
+    def forward_qat(self, x: QTensor, dont_plot=False):
         """
         Collect stats, optionally fakequantize;
         per default also set qparams of monitored modules
@@ -984,10 +989,10 @@ by initializing it with clipped_distr: bool given as kwarg.
         if self.n_qat_batches == self.record_n_batches:
             self.freeze()
         assert not x.quantized
-        self.qplotter(x)
+        x = self.qplotter(x, dont_plot=dont_plot)
         return x
 
-    def forward_quantized(self, x: QTensor) -> QTensor:
+    def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
 
         if __ASSERT__:
             # costly! remove these! TODO FIXME
@@ -996,7 +1001,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             assert is_integer(x._t)
             assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
             assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
-        self.qplotter(x)
+        x = self.qplotter(x, dont_plot=dont_plot)
         return x
 
     def _update_ema(self, x: Union[Tensor, QTensor]):
@@ -1106,13 +1111,17 @@ by initializing it with clipped_distr: bool given as kwarg.
         s = f"QListener(mods={self.mods}, dist={self.distribution_kind}, calib={self.calibration_mode})"
         return s
 
-
 class QPlotter(QuantizableModule):
     def __init__(
             self,
             plot_name,
-            plot_p=0.01,
-            stage_plot_indices: Dict = {
+            stage_plot_freqs: Dict[str,int] = {
+                "FP32": -1,
+                "Calibration": -1,
+                "QAT": -1,
+                "Quantized": -1,
+            },
+            stage_plot_indices: Dict[str, List[int]] = {
                 "FP32":[],
                 "Calibration":[],
                 "QAT":[],
@@ -1121,65 +1130,100 @@ class QPlotter(QuantizableModule):
             **qkwargs
         ):
         super().__init__(**qkwargs)
+        ext = "png"
 
         self.float_bins = qkwargs.get("calib_num_bins", 1000)
 
         self.name = plot_name.replace(" ","_")
-        self.p = plot_p if not "plot_p" in qkwargs else qkwargs["plot_p"]
+        self.stage_plot_freqs = stage_plot_freqs if \
+                not "stage_plot_freqs" in qkwargs else qkwargs["stage_plot_freqs"]
         self.stage_plot_indices = stage_plot_indices if not "stage_plot_indices" in qkwargs else qkwargs["stage_plot_indices"]
 
         # FIXME TODO NOTE get log directory name and run name from TrainMan
         plots_dir = os.path.join("logs", qkwargs["name"], "plots")
         if not os.path.exists(plots_dir):
             os.mkdir(plots_dir)
+
         plot_dir = os.path.join(plots_dir, self.name)
         self.plot_dir = plot_dir # TODO add to cfg/CLI or read from datetime
-        self.plot_tmpl = "{}_{}_{}.png"
+
+        self.plot_tmpl = "{}_{}_{}."+ext
 
         sub_dirs = [os.path.join(self.plot_dir, stage) for stage in list(self.stage_dict.values())]
         if not os.path.exists(self.plot_dir):
             os.mkdir(self.plot_dir)
-            print(f"Created directory {self.plot_dir}!")
+            # print(f"Created directory {self.plot_dir}!")
         for sub_dir in sub_dirs:
             if not os.path.exists(sub_dir):
                 os.mkdir(sub_dir)
-                print(f"Created directory {sub_dir}!")
+                # print(f"Created directory {sub_dir}!")
 
         self.logger = logging.getLogger(name=self.name)
-        self.counter_for_current_stage = 1
+        # increase when dont_plot is not True in forward call
+        self.stage_counters = {
+            "FP32": 0,
+            "Calibration": 0,
+            "QAT": 0,
+            "Quantized": 0,
+        }
+
+        # FOR MODEL GRAPH VISUALIZATION:
+        latests_dir = os.path.join("logs", qkwargs["name"], "latest_plots")
+        if not os.path.exists(latests_dir):
+            os.mkdir(latests_dir)
+        # will create copy of file when plotting:
+        latest_copy = self.name+"_latest." + ext
+        self.latest_path = os.path.join(latests_dir, latest_copy)
+
+        # encoding of path of copy of latest png for saving in backward context
+        self.encoded_latest_copy = torch.Tensor(list(map(ord, latest_copy)))
 
         class PlotHackFn(torch.autograd.Function):
-            pass # NOTE TODO
+            """
+            Hacky torch.autograd.Function used by tst_pytorch.QPlotter
+            to save the path of the latest saved image.
+            For visualizing the activations with pytorchviz
+            """
+            @staticmethod
+            def forward(ctx, x: torch.Tensor):
+                ctx.save_for_backward(self.encoded_latest_copy)
+                return x
 
-    def forward_fp(self, x: Tensor) -> None:
-        self._log(x)
-        self.counter_for_current_stage += 1
+            @staticmethod
+            def backward(ctx, grad_output):
+                """ Identity """
+                return grad_output
+
+        self.plot_hack_fn = PlotHackFn.apply
+
+    def forward_fp(self, x: Tensor, dont_plot=False) -> None:
+        self._log(x, dont_plot=dont_plot)
+        return self.plot_hack_fn(x)
 
     def forward_calib(self, *args, **kwargs):
-        self._log(x)
-        self.counter_for_current_stage += 1
+        self._log(x, **kwargs)
+        return self.plot_hack_fn(x)
 
-    def forward_qat(self, x: Optional[QTensor] = None,) -> QTensor:
-        self._log(x)
-        self.counter_for_current_stage += 1
+    def forward_qat(self, x: Optional[QTensor] = None, dont_plot = False) -> QTensor:
+        self._log(x, dont_plot=dont_plot)
+        out = self.plot_hack_fn(x._t)
+        return QTensor(out, scale=x.scale, zero=x.zero, quantized=False)
 
-    def forward_quantized(self, x: QTensor) -> QTensor:
-        self._log(x)
-        self.counter_for_current_stage += 1
+    def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
+        self._log(x, dont_plot=dont_plot)
+        out = self.plot_hack_fn(x._t)
+        return QTensor(out, scale=x.scale, zero=x.zero, quantized=True)
 
     def calibration_prepare(self):
         super().calibration_prepare()
-        self.counter_for_current_stage = 1
 
     def qat_prepare(self):
         super().qat_prepare()
-        self.counter_for_current_stage = 1
 
     def quantize(self):
         super().quantize()
-        self.counter_for_current_stage = 1
 
-    def _log(self,x: Union[Tensor, QTensor]):
+    def _log(self,x: Union[Tensor, QTensor], dont_plot=False):
 
         bins = None
         if isinstance(x, QTensor):
@@ -1226,16 +1270,29 @@ class QPlotter(QuantizableModule):
             # weighted_var = shifts.var()/(data.max()-data.min())
             # print(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
+        c = self.stage_counters[self.stage_str()]
+
         # sometimes store matplotlib histogram
-        if self.counter_for_current_stage in self.stage_plot_indices[self.stage_str()] or torch.rand(1) <= self.p: # and stage==QuantStage.Quantized:
+        plot_because_idx = c in self.stage_plot_indices[self.stage_str()]
+        freq = self.stage_plot_freqs[self.stage_str()]
+        plot_because_freq = False if freq == -1 else c % freq == 0
+        if not dont_plot and (plot_because_idx or plot_because_freq): # and stage==QuantStage.Quantized:
             plot_data = data.detach().reshape(-1).numpy()
             plt.hist(plot_data, bins=bins)
             stage_str = self.stage_str()
-            plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{self.counter_for_current_stage}"+info, ylabel="Frequency of bin")
-            plt.savefig(os.path.join(self.plot_dir, stage_str, self.plot_tmpl.format(stage_str, self.name, self.counter_for_current_stage)))
+            plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{c}"+info, ylabel="Frequency of bin")
+
+            # save
+            fig_path = os.path.join(self.plot_dir, stage_str, self.plot_tmpl.format(stage_str, self.name, c))
+
+            plt.savefig(fig_path)
+            # update latest png (have to write png instead of symlink to above fig_path,
+            # because graphviz considers symlinks unsafe)
+            plt.savefig(self.latest_path)
             plt.gcf().clear()
 
-
+        if not dont_plot:
+            self.stage_counters[self.stage_str()] += 1
 
 
 # these must be updated in every module that adds QuantizableModules in need of a listener

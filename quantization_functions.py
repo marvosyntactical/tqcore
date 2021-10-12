@@ -63,7 +63,6 @@ class UniformQuantization(Quantization):
         self.nudge_zero = nudge_zero
 
     def _quantize_tensor_using_params(self, x: torch.Tensor, scale: float, zero=0, num_bits=8):
-
         q_x = x / scale + zero
         q_x = self.tensor_clamp(q_x, num_bits=num_bits)
         return q_x
@@ -261,7 +260,7 @@ class FakeQuant(torch.autograd.Function):
     @staticmethod
     def forward(
             ctx,
-            x: Union[QTensor,torch.Tensor],
+            x: torch.Tensor,
             quant: Quantization,
             num_bits: int,
             min_val: float,

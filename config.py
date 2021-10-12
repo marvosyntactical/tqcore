@@ -24,13 +24,20 @@ class QConfig(NamedTuple):
     calib_eps: int = 5
     record_n_batches_bn: int =  30
     record_n_batches_qlistener: int =  60
-    plot_p: float = 0.01
+    stage_plot_freqs: Dict = {
+            "FP32":-1,
+            "Calibration":-1,
+            "QAT":-1,
+            "Quantized":-1,
+    }
     stage_plot_indices: Dict = {
             "FP32":[],
             "Calibration":[],
             "QAT":[],
             "Quantized":[],
-        }
+    }
+    transformer: Dict = {}
+    lstm: Dict = {}
     @classmethod
     def from_json(cls, file):
         cfg = json.load(open(file, "r"))

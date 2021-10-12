@@ -113,12 +113,16 @@ class QLSTMCell(nn.Module):
             input_size,
             hidden_size,
             use_bias=True,
+            layer_num: int = 0,
             qkwargs: Dict = None,
             **kwargs
         ):
         """
         Most parts are copied from torch.nn.LSTMCell.
         """
+
+        # plotname for this layer: extend by layer num
+        pn = lambda s: s + " " + str(layer_num)
 
         super(QLSTMCell, self).__init__()
         self.input_size = input_size
@@ -134,52 +138,54 @@ class QLSTMCell(nn.Module):
                 functools.partial(NonQuantizableModuleWrap, nn.Hardtanh())
 
         self.i_to_h = QLinear(input_size, 4 * hidden_size, bias=False, qkwargs=qkwargs)
+        self.i_to_h_l = QListener(self.i_to_h, plot_name=pn("inp to hidden"), **qkwargs)
         self.h_to_h = QLinear(hidden_size, 4 * hidden_size, bias=use_bias, qkwargs=qkwargs)
+        self.h_to_h_l = QListener(self.h_to_h, plot_name=pn("hidden to hidden"), **qkwargs)
 
         self.add1 = QAdd(**qkwargs)
-        self.add1l = QListener(self.add1, plot_name="add1", **qkwargs)
+        self.add1l = QListener(self.add1, plot_name=pn("add1"), **qkwargs)
 
         # activation functions and their listeners
         self.forget_ = sigmoid_cls(**qkwargs)
-        self.forget_l = QListener(self.forget_, plot_name="forget", **qkwargs)
-        self.f_ = lambda f: self.forget_l(self.forget_(f))
+        self.forget_l = QListener(self.forget_, plot_name=pn("forget"), **qkwargs)
+        self.f_ = lambda f, **kwargs: self.forget_l(self.forget_(f), **kwargs)
 
         self.input_ = sigmoid_cls(**qkwargs)
-        self.input_l = QListener(self.input_, plot_name="input", **qkwargs)
-        self.i_ = lambda i: self.input_l(self.input_(i))
+        self.input_l = QListener(self.input_, plot_name=pn("input"), **qkwargs)
+        self.i_ = lambda i, **kwargs: self.input_l(self.input_(i), **kwargs)
 
         self.gate_ = tanh_cls(**qkwargs)
-        self.gate_l = QListener(self.gate_, plot_name="gate", **qkwargs)
-        self.g_ = lambda g: self.gate_l(self.gate_(g))
+        self.gate_l = QListener(self.gate_, plot_name=pn("gate"), **qkwargs)
+        self.g_ = lambda g, **kwargs: self.gate_l(self.gate_(g), **kwargs)
 
         self.output_ = sigmoid_cls(**qkwargs)
-        self.output_l = QListener(self.output_, plot_name="output", **qkwargs)
-        self.o_ = lambda o: self.output_l(self.output_(o))
+        self.output_l = QListener(self.output_, plot_name=pn("output"), **qkwargs)
+        self.o_ = lambda o, **kwargs: self.output_l(self.output_(o), **kwargs)
 
         self.cell_ = tanh_cls(**qkwargs)
-        self.cell_l = QListener(self.cell_, plot_name="cell", **qkwargs)
-        self.c_ = lambda c: self.cell_l(self.cell_(c))
+        self.cell_l = QListener(self.cell_, plot_name=pn("cell"), **qkwargs)
+        self.c_ = lambda c, **kwargs: self.cell_l(self.cell_(c), **kwargs)
 
         # multiplications and additions:
         self.new_m  = QMul(**qkwargs)
-        self.new_m_l  = QListener(self.new_m, plot_name="new mul", **qkwargs)
-        self.new_mul = lambda a, b: self.new_m_l(self.new_m(a,b))
+        self.new_m_l  = QListener(self.new_m, plot_name=pn("new mul"), **qkwargs)
+        self.new_mul = lambda a, b, **kwargs: self.new_m_l(self.new_m(a,b), **kwargs)
 
         self.old_m  = QMul(**qkwargs)
-        self.old_m_l  = QListener(self.old_m, plot_name="old mul", **qkwargs)
-        self.old_mul = lambda a, b: self.old_m_l(self.old_m(a,b))
+        self.old_m_l  = QListener(self.old_m, plot_name=pn("old mul"), **qkwargs)
+        self.old_mul = lambda a, b, **kwargs: self.old_m_l(self.old_m(a,b), **kwargs)
 
         self.cell_a  = QAdd(**qkwargs)
-        self.cell_a_l  = QListener(self.cell_a, plot_name="cell add",**qkwargs)
-        self.cell_add = lambda a, b: self.cell_a_l(self.cell_a(a,b))
+        self.cell_a_l  = QListener(self.cell_a, plot_name=pn("cell add"),**qkwargs)
+        self.cell_add = lambda a, b, **kwargs: self.cell_a_l(self.cell_a(a,b), **kwargs)
 
         self.hidden_m  = QMul(**qkwargs)
-        self.hidden_m_l  = QListener(self.hidden_m, plot_name="hidden mul", **qkwargs)
-        self.hidden_mul = lambda a, b: self.hidden_m_l(self.hidden_m(a,b))
+        self.hidden_m_l  = QListener(self.hidden_m, plot_name=pn("hidden mul"), **qkwargs)
+        self.hidden_mul = lambda a, b, **kwargs: self.hidden_m_l(self.hidden_m(a,b))
 
         self.reset_parameters()
 
-    def forward(self, input_, hc):
+    def forward(self, input_, hc, dont_plot=False):
         """
         Args:
             input_: A (batch, input_size) tensor containing input
@@ -195,21 +201,25 @@ class QLSTMCell(nn.Module):
         h_0, c_0 = hc
 
         wi = self.i_to_h(input_)
+        wi = self.i_to_h_l(wi, dont_plot=dont_plot)
+
         wh_b = self.h_to_h(h_0)
+        wh_b = self.h_to_h_l(wh_b, dont_plot=dont_plot)
 
         h_x4 = self.add1(wh_b, wi)
-        h_x4 = self.add1l(h_x4)
+        h_x4 = self.add1l(h_x4, dont_plot=dont_plot)
 
+        # see QTensor.split
         f, i, o, g = h_x4.split(self.hidden_size, dim=1)
 
         # update cell
-        new = self.new_mul(self.i_(i), self.g_(g))
-        old = self.old_mul(self.f_(f), c_0)
+        new = self.new_mul(self.i_(i, dont_plot=dont_plot), self.g_(g, dont_plot=dont_plot), dont_plot=dont_plot)
+        old = self.old_mul(self.f_(f, dont_plot=dont_plot), c_0, dont_plot=dont_plot)
 
-        c_1 = self.cell_add(old, new)
+        c_1 = self.cell_add(old, new, dont_plot=dont_plot)
 
         # use hidden and cell to update hidden
-        h_1 = self.hidden_mul(self.o_(o), self.c_(c_1))
+        h_1 = self.hidden_mul(self.o_(o, dont_plot=dont_plot), self.c_(c_1, dont_plot=dont_plot), dont_plot=dont_plot)
 
         return h_1, c_1
 
@@ -350,6 +360,7 @@ class QLSTM(nn.Module):
             layer_input_size = input_size if layer == 0 else hidden_size
             cell = cell_class(input_size=layer_input_size,
                               hidden_size=hidden_size,
+                              layer_num=layer, # for disambiguation of tracked plots
                               qkwargs=qkwargs,
                               **kwargs)
             setattr(self, 'cell_{}'.format(layer), cell)
@@ -390,11 +401,12 @@ class QLSTM(nn.Module):
         output = []
 
         for time in range(T):
+            dont_plot = time > 0 # only create plot on first time step
             if isinstance(cell, QBNLSTMCell):
                 raise NotImplementedError(QBNLSTMCell)
-                h_next, c_next = cell(input_=input_[time], hc=hc, time=time)
+                h_next, c_next = cell(input_=input_[time], hc=hc, time=time, dont_plot=dont_plot)
             else:
-                h_next, c_next = cell(input_=input_[time], hc=hc)
+                h_next, c_next = cell(input_=input_[time], hc=hc, dont_plot=dont_plot)
             as_ = h_next._t if isinstance(h_next, QTensor) else h_next
 
             mask = (time < length).float().unsqueeze(1).expand_as(as_)
@@ -405,8 +417,8 @@ class QLSTM(nn.Module):
             cnextmasked = self.qmask(c_next, mask)
             cprevmasked = self.qmask(hc[1], inv_mask)
 
-            h_next = self.addhl(self.addh(hnextmasked, hprevmasked))
-            c_next = self.addcl(self.addc(cnextmasked, cprevmasked))
+            h_next = self.addhl(self.addh(hnextmasked, hprevmasked), dont_plot=dont_plot)
+            c_next = self.addcl(self.addc(cnextmasked, cprevmasked), dont_plot=dont_plot)
             hc_next = (h_next, c_next)
             output.append(h_next)
             hc = hc_next
@@ -432,21 +444,21 @@ class QLSTM(nn.Module):
         if hc is None:
             # init hidden and cell if not given
             hc = [
-                    xavier_uniform(
-                        input_.device,
-                        self.num_layers, batch_size, self.hidden_size,
-                        dtype=input_.dtype
-                    ),
-                    xavier_uniform(
-                        input_.device,
-                        self.num_layers, batch_size, self.hidden_size,
-                        dtype=input_.dtype
-                    )
+                xavier_uniform(
+                    input_.device,
+                    self.num_layers, batch_size, self.hidden_size,
+                    dtype=input_.dtype
+                ),
+                xavier_uniform(
+                    input_.device,
+                    self.num_layers, batch_size, self.hidden_size,
+                    dtype=input_.dtype
+                )
             ]
             # NOTE:
             # one shared qtensor should  be enough here as both tensors are initialized the same
             # could also look at xavier uniform and set scale, zero by hand
-            hc = [self.init_quant_stub(t) for t in hc ]
+            hc = [self.init_quant_stub(t) for t in hc]
 
             h0 = self.init_listener(hc[0])
             c0 = self.init_listener(hc[1])
@@ -459,7 +471,6 @@ class QLSTM(nn.Module):
         for layer in range(self.num_layers):
             cell = self.get_cell(layer)
 
-            # TODO make QTensor:
             hc_layer = (hc[0][layer,:,:], hc[1][layer,:,:])
 
             if layer == 0:
@@ -679,8 +690,8 @@ class QTSLSTM(nn.Module):
         self.quantStub = QuantStub(**qkwargs)
         self.input_listener = QListener(self.quantStub, calibration="minmax", **qkwargs)
 
-        self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
-        self.emb_listener = QListener(self.embedding, **qkwargs)
+        # self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
+        # self.emb_listener = QListener(self.embedding, plot_name="embed", **qkwargs)
 
         if freeze:
             raise NotImplementedError("freeze")
@@ -691,7 +702,7 @@ class QTSLSTM(nn.Module):
         # lstm
         self.rnn = QLSTM(
             cell_class=lstm_cell,
-            input_size=dim,
+            input_size=src_dim,
             hidden_size=dim, # confirm intermediate layers all use hidden dim
             max_length=time_window,
             num_layers=num_layers,
@@ -734,7 +745,7 @@ class QTSLSTM(nn.Module):
                 QLinear(dim, n_labels, qkwargs=qkwargs),
             ]
             head += [
-                QListener(head[-1], **qkwargs),
+                QListener(head[-1], plot_name="head", **qkwargs),
                 DeQuantStub(**qkwargs),
                 nn.LogSoftmax(dim=-1),
             ]
@@ -754,16 +765,14 @@ class QTSLSTM(nn.Module):
         x = self.quantStub(x)
         x = self.input_listener(x)
 
-        x = self.embedding(x)
-        x = self.emb_listener(x)
-
-        if self.quantStub.stage == QuantStage.QAT:
-            assert type(x) == QTensor
+        # x = self.embedding(x)
+        # x = self.emb_listener(x)
 
         # QLSTM unrolls the cell
         intermediate, _ = self.rnn(x, **kwargs)
 
         out = self.head(intermediate[-1,:,:])
         return out
+
 
 
