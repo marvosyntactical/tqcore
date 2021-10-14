@@ -416,8 +416,8 @@ class QBNFoldableTranspose(QuantizableModule):
         self.bn = nn.BatchNorm1d(hidden, momentum=momentum, eps=eps)
         self._fakeQ = FakeQuant.apply_wrapper
 
-    def qat_prepare(self):
-        super().qat_prepare()
+    def qat_prepare(self, **qkwargs):
+        super().qat_prepare(**qkwargs)
         if 0:
             def debug_fold_backward(module, grad_in, grad_out):
                 # sanity check if weights have been updated since last backward pass

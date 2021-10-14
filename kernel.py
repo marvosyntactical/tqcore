@@ -85,6 +85,7 @@ def qadd(
     a_rq = a_dq / scale_next + zero_next
     b_rq = b_dq / scale_next + zero_next
 
+    # NOTE should zero_next be scaled by the relatice fraction?
     a_rq *= a_frac
     b_rq *= b_frac
 
@@ -117,7 +118,7 @@ def qadd(
 
     # r = a_requantized._t + b_requantized._t
     # r = r.clamp(0., (2.**num_bits)-1.)
-    r = QTensor(r, scale=scale_next, zero=zero_next)
+    r = QTensor(r, scale=scale_next, zero=zero_next, quantized=True)
 
     # print_qt_stats("qadd result", r)
 
@@ -136,7 +137,6 @@ def qmul(
         weight_quantization: Quantization,
         num_bits: int,
         num_bits_weight: int,
-        quantize=True,
     ) -> QTensor:
     # mock low bitwidth kernel for mul and matmul
 
@@ -167,6 +167,6 @@ def qmul(
         warnings.warn(msg)
         # assert False, msg
 
-    return QTensor(r, scale=scale_next, zero=zero_next, quantized=quantize)
+    return QTensor(r, scale=scale_next, zero=zero_next, quantized=True)
 
 

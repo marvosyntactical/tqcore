@@ -250,7 +250,7 @@ class QMultiHeadedAttention(nn.Module):
 
         qsoft = qkwargs["transformer"]["qsoftmax"]
         if qsoft:
-            self.qsoftmax = QSoftmax(dim=-1, **qkwargs)
+            self.qsoftmax = QSoftmax(dim=-1, layer_num=layer_num, **qkwargs)
         else:
             self.qsoftmax = NonQuantizableModuleWrap(
                 nn.Softmax(dim=-1), **qkwargs
@@ -439,7 +439,7 @@ class QTransformerEncoderLayer(nn.Module):
                     self.mixer = NonQuantizableModuleWrap(
                         MultiHeadedAttention(
                             num_heads, dim, dropout=dropout
-                        ), **qkwargs
+                        ), plot_name=pn("fp softmax"), **qkwargs
                     )
 
                     mix_output_layer = [] # layer that should be updated by next listener
@@ -585,17 +585,17 @@ class QTransformerEncoder(nn.Module):
         self.emb_listener = QListener(self.embedding, plot_name="embedding", **qkwargs)
 
         # TODO FIXME add these again
-        self.has_pe = 0
-        self.wrapped_pe = 0
+        self.has_pe = qkwargs["transformer"]["has_pe"]
+        self.qpe = qkwargs["transformer"]["qpe"]
         if self.has_pe:
-            if self.wrapped_pe:
+            if not self.qpe:
                 self.pe = NonQuantizableModuleWrap(
                     QPositionalEncoding(dim, time_window)
                     ,**qkwargs
                 )
             else:
                 self.pe = QPositionalEncoding(dim, time_window)
-            self.pe_listener = QListener(self.pe, plot_name=pn("pos enc"), **qkwargs)
+                self.pe_listener = QListener(self.pe, plot_name="pos enc", **qkwargs)
 
         self.emb_dropout = nn.Dropout(p=emb_dropout)
 
@@ -659,7 +659,8 @@ class QTransformerEncoder(nn.Module):
 
         if self.has_pe:
             x = self.pe(x) # add position encoding to word embeddings
-            x = self.pe_listener(x)
+            if self.qpe:
+                x = self.pe_listener(x)
 
         x = self.emb_dropout(x)
 

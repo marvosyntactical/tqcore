@@ -54,7 +54,23 @@ class QuantizableModule(nn.Module):
     zero = FLOAT_ZERO
     # on successive QAT forward passes, QListener has updated these values using recorded stats
 
-    def __init__(
+    def __init__(self, **qkwargs):
+        nn.Module.__init__(self) # super().__init__ somehow calls __init__ of _QBatchNorm for subclasses of it FIXME
+        self._set_qkwargs(**qkwargs)
+
+        self.stage_dict = {
+            QuantStage.FP32: "FP32",
+            QuantStage.Calibration: "Calibration",
+            QuantStage.QAT: "QAT",
+            QuantStage.Quantized: "Quantized",
+        }
+
+        self.n_qat_batches = 0
+
+        self.stage = QuantStage.FP32
+        self.forward = self.forward_fp # changes from stage to stage
+
+    def _set_qkwargs(
             self,
             quantization: Quantization = UniformQuantization,
             weight_quantization: Quantization = UniformSymmetricQuantization,
@@ -64,24 +80,12 @@ class QuantizableModule(nn.Module):
             nudge_zero: bool = False,
             **qkwargs,
         ):
-        nn.Module.__init__(self) # super().__init__ somehow calls __init__ of _QBatchNorm for subclasses of it FIXME
 
         self.num_bits = num_bits
         self.quantization = quantization(nudge_zero=nudge_zero)
         self.num_bits_weight = num_bits_weight
         self.weight_quantization = weight_quantization(nudge_zero=nudge_zero)
         self.num_bits_bias = num_bits_bias
-
-        self.stage_dict = {
-            QuantStage.FP32: "FP32",
-            QuantStage.Calibration: "Calibration",
-            QuantStage.QAT: "QAT",
-            QuantStage.Quantized: "Quantized",
-        }
-        self.stage = QuantStage.FP32
-        self.forward = self.forward_fp # changes from stage to stage
-
-        self.n_qat_batches = 0
 
     def stage_str(self) -> str:
         return self.stage_dict[self.stage]
@@ -102,7 +106,9 @@ class QuantizableModule(nn.Module):
         self.stage = QuantStage.Calibration
         self.forward = self.forward_calib
 
-    def qat_prepare(self):
+    def qat_prepare(self, **qkwargs):
+        self._set_qkwargs(**qkwargs)
+
         self.stage = QuantStage.QAT
         self.forward = self.forward_qat
 
@@ -395,7 +401,7 @@ class QBoolMask(QuantizableModule):
 
 class QSoftmax(QuantizableModule):
 
-    def __init__(self, dim=-1, time_window: int = 144, alpha:float = None, **qkwargs):
+    def __init__(self, dim=-1, time_window: int = 144, alpha:float = None, layer_num: int =0, **qkwargs):
         super().__init__(**qkwargs)
 
         self.dim = int(dim)
@@ -414,13 +420,14 @@ class QSoftmax(QuantizableModule):
             self,
             listener_name="exp",
             function=self._scaled_exp,
-            dont_fakeQ=True,
+            plot_name="softmax exp"+ str(layer_num),
+            dont_fakeQ=False,
             **qkwargs
         )
 
-        # this ALSO records stats of normed output (which will be between 0 and 1 anyway),
-        # but is used mainly because of fake quantizing
-        # self.norm_listener = QListener(self, name="normed", **qkwargs)
+        # this records stats of normed output (which will be between 0 and 1 anyway),
+        # but is used only for fake quantizing
+        self.norm_listener = QListener(self, plot_name="softmax normed"+ str(layer_num), **qkwargs)
 
         self.plot_step_counter = 0
 
@@ -439,16 +446,11 @@ class QSoftmax(QuantizableModule):
     def _set_exp_lkp(self):
         # this range is tailored to UniformQuantization
         self.EXP_STEP_FUN = self._scaled_exp(torch.arange(2.**self.num_bits)).round()
+
+        # debug:
         # import matplotlib.pyplot as plt
         # plt.plot(self.EXP_STEP_FUN.detach().numpy())
         # plt.show()
-
-    def _exp_lkp(self, long_tensor: torch.LongTensor):
-        # (not differentiable)
-        return QTensor(
-            self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale, zero=self.exp_zero,
-            quantized=False
-        )
 
     def forward_fp(self, inp: torch.Tensor) -> torch.Tensor:
         out = inp.softmax(dim=self.dim)
@@ -460,18 +462,31 @@ class QSoftmax(QuantizableModule):
         # LogSumExp trick in comment
         numerator = self._scaled_exp(inp._t) # -inp._t.max())
         out = numerator/numerator.sum(dim=self.dim).unsqueeze(self.dim)
-        out = QTensor(out, scale=self.scale, zero=self.zero, quantized=False)
-        # out = self.norm_listener(out)
+
+        # scale and zero are arbitrary here
+        out = QTensor(out, scale=1., zero=0., quantized=False)
+        # fake quantize:
+        out = self.norm_listener(out)
+        # # self.scale, self.zero are set by norm_listener
+        # out = QTensor(out, scale=self.scale, zero=self.zero, quantized=False)
         return out
 
     def quantize(self):
         super().quantize()
         self._set_exp_lkp()
 
+    def _exp_lkp(self, long_tensor: torch.LongTensor):
+        assert hasattr(self, "EXP_STEP_FUN"), f"{self}._set_exp_lkp() must be called before it can perform a lookup"
+        # (not differentiable)
+        return QTensor(
+            self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale, zero=self.exp_zero,
+            quantized=True
+        )
+
     def forward_quantized(self, inp: QTensor) -> QTensor:
 
         exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0-255 here already!
-        zeroed_exp =  exponentiated._t - exponentiated.zero
+        zeroed_exp = exponentiated._t - exponentiated.zero
         # M = exponentiated.scale / self.normed_scale
         norm_scale = 1./(2**self.num_bits)
         M = exponentiated.scale / norm_scale
@@ -511,7 +526,7 @@ class QSoftmax(QuantizableModule):
 
 class NonQuantizableModuleWrap(QuantizableModule):
 
-    def __init__(self, module, **qkwargs):
+    def __init__(self, module, plot_name=None, **qkwargs):
         super().__init__(**qkwargs)
 
         self.fp_module = module
@@ -526,7 +541,8 @@ class NonQuantizableModuleWrap(QuantizableModule):
         self.out_listener = QListener(
             self,
             dont_fakeQ=False,
-            clipped_distr=False, # FIXME this is specifically for MHATTN; make custom for non quant relu etc
+            plot_name=plot_name,
+            clipped_distr=False, # NOTE FIXME this is specifically for MHATTN; make custom for non quant relu etc
             **qkwargs
         )
 
@@ -540,7 +556,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
     def forward_qat(self, *args, **kwargs) -> torch.Tensor:
         super().forward_qat()
-        # print_qt_stats("nonQ QAT", args[0], stage=QuantStage.QAT, p=1.)
+        # print_qt_stats("nonQ QAT", args[1], stage=QuantStage.QAT, p=1.)
         # print_qt_stats("mhattn", args[0], stage=QuantStage.QAT, p=1.)
 
         fp_args = [a._t if isinstance(a, QTensor) else a for a in args]
@@ -578,7 +594,6 @@ class NonQuantizableModuleWrap(QuantizableModule):
         return tuple(fakeq_out) if len(fakeq_out) > 1 else fakeq_out[0]
 
     def forward_quantized(self, *args, **kwargs) -> QTensor:
-        # print_qt_stats("nonQ Quantized", args[0], stage=QuantStage.Quantized, p=1.)
 
         fp_args = [a.dequantize() if isinstance(a, QTensor) else a for a in args]
 
@@ -786,8 +801,9 @@ class QPositionalEncoding(QuantizableModule):
         return qadd(
             self._w, X, 1.,
             self.scale, self.zero, torch.add,
-            self.quantization, self.weight_quantization,
-            self.num_bits, self.num_bits_weight
+            self.quantization,
+            self.quantization, # use uniform quantization for bias weight
+            self.num_bits, self.num_bits_bias
         )
 
     def quantize(self):
@@ -795,7 +811,7 @@ class QPositionalEncoding(QuantizableModule):
         # nn.Parameter W is replaced by QTensor
         self._w = self.weight_quantization.quantize_to_qtensor_using_range(
             self.W.data,
-            num_bits=self.num_bits_weight,
+            num_bits=self.num_bits_bias,
             quantized=True
         )
 
@@ -967,12 +983,6 @@ by initializing it with clipped_distr: bool given as kwarg.
             self._update_ema(x)
 
         if not self.dont_fakeQ:
-            # scale, zero = self.quantization.calc_params(
-            #     self.__stats__["min"],
-            #     self.__stats__["max"],
-            #     num_bits=self.num_bits
-            # )
-
             x = self.fake_quantize(
                 x,
                 self.quantization,
@@ -1168,7 +1178,7 @@ class QPlotter(QuantizableModule):
         }
 
         # FOR MODEL GRAPH VISUALIZATION:
-        latests_dir = os.path.join("logs", qkwargs["name"], "latest_plots")
+        latests_dir = os.path.join(plot_dir, "LATEST_PLOTS")
         if not os.path.exists(latests_dir):
             os.mkdir(latests_dir)
         # will create copy of file when plotting:
@@ -1213,15 +1223,6 @@ class QPlotter(QuantizableModule):
         self._log(x, dont_plot=dont_plot)
         out = self.plot_hack_fn(x._t)
         return QTensor(out, scale=x.scale, zero=x.zero, quantized=True)
-
-    def calibration_prepare(self):
-        super().calibration_prepare()
-
-    def qat_prepare(self):
-        super().qat_prepare()
-
-    def quantize(self):
-        super().quantize()
 
     def _log(self,x: Union[Tensor, QTensor], dont_plot=False):
 

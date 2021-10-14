@@ -58,6 +58,7 @@ def qat_prepare(
         is_root_module: bool = True,
         _handles: Dict = None,
         _module_types: Dict = None, # convenience to search for next activation during conversion
+        qkwargs: Dict = None,
     ) -> (nn.Module, int):
     """
     prep module for QAT,
@@ -112,7 +113,8 @@ def qat_prepare(
             inplace=True, # only deepcopy once, at top level
             is_root_module=False,
             _handles=_handles,
-            _module_types=_module_types
+            _module_types=_module_types,
+            qkwargs=qkwargs
         )
 
     # ---------- PREPARE DIFFERENT MODULES CASE BY CASE --------- #
@@ -123,7 +125,7 @@ def qat_prepare(
 
     if isinstance(module, QuantizableModule):
         # most custom modules in .quantizable_layer; _QBatchNorm in .batchnorm
-        module.qat_prepare()
+        module.qat_prepare(**qkwargs)
 
     elif isinstance(module, nn.Linear) or \
            isinstance(module, nn.Conv2d) or \
