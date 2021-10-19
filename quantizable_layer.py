@@ -201,6 +201,27 @@ class DeQuantStub(QuantizableModule):
         return self._dequant_outputs(outputs, f)
 
 class QMul(QuantizableModule):
+    def __init__(self, type_a="activ", type_b="activ", **qkwargs):
+        super().__init__(**qkwargs)
+        for c, typ in zip("ab", [type_a, type_b]):
+            typ = str(typ).lower()
+            msg = f"Specify if tensor is of type activation, weight or bias (Got type_{c}={typ})"
+            if "a" in typ:
+                quant = self.quantization
+                nb = self.num_bits
+            elif "w" in typ:
+                quant = self.weight_quantization
+                nb = self.num_bits_weight
+            else:
+                assert "b" in typ, msg
+                quant = self.weight_quantization
+                nb = self.num_bits_bias
+
+            setattr(self, "quant_"+c, quant)
+            setattr(self, "num_bits_"+c, nb)
+
+
+
     def forward_fp(self, a: torch.Tensor, b: torch.Tensor):
         return a * b
 
@@ -217,15 +238,34 @@ class QMul(QuantizableModule):
             b: Union[QTensor, torch.Tensor, nn.Parameter, float, int],
         ):
         # affine transformation; simulates low bit multiplication
-        return qmul(a, b, 1., self.scale, self.zero, torch.mul,
-                self.quantization, self.weight_quantization,
-                self.num_bits, self.num_bits_weight)
+        return qmul(
+            a=a, b=b, factor=1.,
+            scale_next=self.scale, zero_next=self.zero, op=torch.mul,
+            quant_a=self.quant_a, quant_b=self.quant_b,
+            num_bits_a=self.num_bits_a, num_bits_b=self.num_bits_b
+        )
 
 
 class QMatMul(QuantizableModule):
-    def __init__(self, *args, factor: float=1., **qkwargs):
-        super().__init__(*args, **qkwargs)
+    def __init__(self, type_a="activ", type_b="activ", factor: float=1., **qkwargs):
+        super().__init__(**qkwargs)
         self.factor = float(factor)
+        for c, typ in zip("ab", [type_a, type_b]):
+            typ = str(typ).lower()
+            msg = "Specify if tensor is of type activation, weight or bias"
+            if "a" in typ:
+                quant = self.quantization
+                nb = self.num_bits
+            elif "w" in typ:
+                quant = self.weight_quantization
+                nb = self.num_bits_weight
+            else:
+                assert "b" in typ, msg
+                quant = self.weight_quantization
+                nb = self.num_bits_bias
+
+            setattr(self, "quant_"+c, quant)
+            setattr(self, "num_bits_"+c, nb)
 
     def forward_fp(self, a, b):
         return self.factor * ( a @ b )
@@ -238,9 +278,13 @@ class QMatMul(QuantizableModule):
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
         return qmul(
-                a, b, self.factor, self.scale, self.zero, torch.matmul,
-                self.quantization, self.weight_quantization,
-                self.num_bits, self.num_bits_weight)
+            a=a, b=b, factor=self.factor,
+            scale_next=self.scale, zero_next=self.zero, op=torch.matmul,
+            quant_a=self.quant_a, quant_b=self.quant_b,
+            quant_out=self.quantization,
+            num_bits_a=self.num_bits_a, num_bits_b=self.num_bits_b,
+            num_bits_out=self.num_bits
+        )
 
 class QLinear(QuantizableModule, nn.Linear):
     def __init__(self, *args, qkwargs: Dict, dont_fakeQ: bool=False, **kwargs):
@@ -250,7 +294,6 @@ class QLinear(QuantizableModule, nn.Linear):
         self.dont_fakeQ = dont_fakeQ
         if not self.dont_fakeQ:
             self.fake_quantize = FakeQuant.apply_wrapper
-        self.plot_step_counter = 0
 
     def forward_fp(self, x: Tensor):
         return F.linear(x, self.weight, self.bias)
@@ -307,16 +350,28 @@ class QLinear(QuantizableModule, nn.Linear):
         # round and clamp values
         out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
-        self.plot_step_counter += 1
-
         return QTensor(out, scale=self.scale, zero=self.zero, quantized=True)
 
 
-
-
 class QAdd(QuantizableModule):
-    def __init__(self, *args, **qkwargs):
-        super().__init__(*args, **qkwargs)
+    def __init__(self, type_a="activ", type_b="activ", **qkwargs):
+        super().__init__(**qkwargs)
+        for c, typ in zip("ab", [type_a, type_b]):
+            typ = str(typ).lower()
+            msg = "Specify if tensor is of type activation, weight or bias"
+            if "a" in typ:
+                quant = self.quantization
+                nb = self.num_bits
+            elif "w" in typ:
+                quant = self.weight_quantization
+                nb = self.num_bits_weight
+            else:
+                assert "b" in typ, msg
+                quant = self.weight_quantization
+                nb = self.num_bits_bias
+
+            setattr(self, "quant_"+c, quant)
+            setattr(self, "num_bits_"+c, nb)
 
     def forward_fp(self, a, b):
         return a + b
@@ -328,15 +383,13 @@ class QAdd(QuantizableModule):
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
-        # print("start qt stats in QAdd:")
-        # print_qt_stats("left", a)
-        # print_qt_stats("right", b)
-        # print("end qt stats in QAdd:")
         return qadd(
-            a, b, 1.,
-            self.scale, self.zero, torch.add,
-            self.quantization, self.weight_quantization,
-            self.num_bits, self.num_bits_weight
+            a=a, b=b,
+            scale_next=self.scale, zero_next=self.zero, op=torch.add,
+            quant_a=self.quant_a, quant_b=self.quant_b,
+            quant_out=self.quantization,
+            num_bits_a=self.num_bits_a, num_bits_b=self.num_bits_b,
+            num_bits_out=self.num_bits
         )
 
 class QStack(QuantizableModule):
@@ -359,8 +412,6 @@ class QStack(QuantizableModule):
         super().forward_qat()
         r = torch.stack([qt._t for qt in qtensors])
         return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
-
-
 
 class QFill(QuantizableModule):
     def __init__(self, fp_neg_val: float=-1e5, **qkwargs):
@@ -429,8 +480,6 @@ class QSoftmax(QuantizableModule):
         # but is used only for fake quantizing
         self.norm_listener = QListener(self, plot_name="softmax normed"+ str(layer_num), **qkwargs)
 
-        self.plot_step_counter = 0
-
     def _scaled_exp(self, inp: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
         # (differentiable)
         if isinstance(inp, Tensor):
@@ -492,35 +541,6 @@ class QSoftmax(QuantizableModule):
         M = exponentiated.scale / norm_scale
         normed_exp = (zeroed_exp * M) # + self.normed_zero
         r = self.quantization.tensor_clamp(normed_exp, num_bits=self.num_bits)
-        # print_qt_stats("qsoftmax out", r, stage=self.stage, step=self.plot_step_counter, p=.1)
-
-        # NOTE: v Dequantized Implementation, leads to random performance after quantizing
-        # r: torch.Tensor = (QTensor(inp._t * self.alpha, scale=inp.scale, zero=inp.zero)).dequantize().softmax(dim=self.dim)
-
-        # r: QTensor = self.quantization.quantize_to_qtensor_using_params(
-        #     r,
-        #     self.normed_scale,
-        #     self.normed_zero,
-        #     num_bits=self.num_bits
-        # )
-
-        # denominator = self.quantization.quantize_to_qtensor_using_params(
-        #     1/exponentiated.sum(dim=self.dim).unsqueeze(-1),
-        #     scale=1/self.exp_scale,
-        #     zero=self.exp_zero,
-        #     num_bits=self.num_bits
-        # )
-
-        # print("denominator: scale=",denominator.scale, "zero=",denominator.zero)
-
-        # r = qmul(
-        #     numerator, denominator, 1.,
-        #     self.normed_scale, self.normed_zero,
-        #     torch.mul,
-        #     self.quantization, self.weight_quantization,
-        #     self.num_bits, self.num_bits_weight
-        # )
-        self.plot_step_counter += 1
 
         return r
 
@@ -530,13 +550,6 @@ class NonQuantizableModuleWrap(QuantizableModule):
         super().__init__(**qkwargs)
 
         self.fp_module = module
-
-        # self.in_listener = QListener(
-        #     self.fp_module,
-        #     name="in",
-        #     dont_fakeQ=True,
-        #     **qkwargs
-        # )
 
         self.out_listener = QListener(
             self,
@@ -554,10 +567,12 @@ class NonQuantizableModuleWrap(QuantizableModule):
         r = self.fp_module(*args, **kwargs)
         return r
 
+    def forward_caliib(self, x, *args, **kwargs):
+        r = self.fp_module(x, *args, **kwargs)
+        return self.out_listener(r)
+
     def forward_qat(self, *args, **kwargs) -> torch.Tensor:
         super().forward_qat()
-        # print_qt_stats("nonQ QAT", args[1], stage=QuantStage.QAT, p=1.)
-        # print_qt_stats("mhattn", args[0], stage=QuantStage.QAT, p=1.)
 
         fp_args = [a._t if isinstance(a, QTensor) else a for a in args]
 
@@ -619,11 +634,9 @@ class NonQuantizableModuleWrap(QuantizableModule):
 class QReLU6(QuantizableModule):
     def __init__(self, *args, **kwargs):
         super().__init__(**kwargs)
-        self.plot_step_counter = 0
 
     def forward_fp(self, x: torch.Tensor) -> torch.Tensor:
         out = nn.functional.relu6(x)
-        self.plot_step_counter += 1
         return out
 
     def forward_qat(self, x: QTensor) -> QTensor:
@@ -632,7 +645,6 @@ class QReLU6(QuantizableModule):
         six = round(6 / scale + zero)
         out = x.clamp(min=zero, max=six)
 
-        self.plot_step_counter += 1
         return out
 
     def forward_quantized(self, x: QTensor) -> QTensor:
@@ -658,7 +670,6 @@ class QReLU6(QuantizableModule):
         out = inp.clamp(min=zero, max=six)
 
         out =  QTensor(out, scale=scale, zero=zero)
-        self.plot_step_counter += 1
         return out
 
 
@@ -799,11 +810,13 @@ class QPositionalEncoding(QuantizableModule):
 
     def forward_quantized(self, X: QTensor):
         return qadd(
-            self._w, X, 1.,
-            self.scale, self.zero, torch.add,
-            self.quantization,
-            self.quantization, # use uniform quantization for bias weight
-            self.num_bits, self.num_bits_bias
+            a=X, b=self._w,
+            scale_next=self.scale, zero_next=self.zero, op=torch.add,
+            quant_a=self.quantization, quant_b=self.weight_quantization, # use uniform quantization for bias weight
+            quant_out=self.quantization,
+            num_bits_a=self.num_bits,
+            num_bits_b=self.num_bits_bias,# _bias, # TODO
+            num_bits_out=self.num_bits
         )
 
     def quantize(self):
@@ -811,7 +824,7 @@ class QPositionalEncoding(QuantizableModule):
         # nn.Parameter W is replaced by QTensor
         self._w = self.weight_quantization.quantize_to_qtensor_using_range(
             self.W.data,
-            num_bits=self.num_bits_bias,
+            num_bits=self.num_bits_bias, # _bias # TODO
             quantized=True
         )
 
@@ -910,8 +923,8 @@ by initializing it with clipped_distr: bool given as kwarg.
                         raise QuantConfigurationError(errmsg)
                     else:
                         # errmsg += "(The problem is due to some input modules producing a symmetric, others a clipped distribution.)"
-                        # assume clipping is applied to everything
-                        warnings.warn(f"QListeneder encountered some clipping, some symmetrizing input modules. Assuming everything is clipped.")
+                        # NOTE assume clipping is applied to everything
+                        warnings.warn(f"QListener encountered some clipping, some symmetrizing input modules. Assuming everything is clipped.")
                         self.distribution_kind = DistKind.CLIPPED
                         distkind = "clipped"
                 warnings.warn(f"QListener listening to\n{self.mods}\ndecided on {distkind}")
@@ -1178,7 +1191,7 @@ class QPlotter(QuantizableModule):
         }
 
         # FOR MODEL GRAPH VISUALIZATION:
-        latests_dir = os.path.join(plot_dir, "LATEST_PLOTS")
+        latests_dir = os.path.join(plots_dir, "LATEST_PLOTS")
         if not os.path.exists(latests_dir):
             os.mkdir(latests_dir)
         # will create copy of file when plotting:
@@ -1210,7 +1223,7 @@ class QPlotter(QuantizableModule):
         self._log(x, dont_plot=dont_plot)
         return self.plot_hack_fn(x)
 
-    def forward_calib(self, *args, **kwargs):
+    def forward_calib(self, x, *args, **kwargs):
         self._log(x, **kwargs)
         return self.plot_hack_fn(x)
 

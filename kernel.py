@@ -4,6 +4,7 @@ from torch.nn import Parameter
 
 from typing import Union, Callable, Tuple
 import warnings
+import math
 
 from .qtensor import QTensor
 from .quantization_functions import Quantization
@@ -18,36 +19,37 @@ from .utils import is_integer
 def _convert_to_qtensor_for_kernel(
         a,
         b,
-        quantization,
-        weight_quantization,
-        num_bits,
-        num_bits_weight,
-        quantize=True,
+        quant_a,
+        quant_b,
+        num_bits_a,
+        num_bits_b,
+        quantized=True,
     ) -> Tuple[torch.Tensor]:
     # helper function
 
     ab = [a,b]
-    for i, t in enumerate(ab):
+    for i, (t, Q, nb) in enumerate(zip(ab, [quant_a, quant_b], [num_bits_a, num_bits_b])):
         if not isinstance(t, QTensor):
             if isinstance(t, Tensor):
                 if isinstance(t, Parameter):
                     # e.g. elementwise mul with parameter
-                    t = weight_quantization.quantize_to_qtensor_using_range(
+                    t = Q.quantize_to_qtensor_using_range(
                         t,
                         min_val=t.min().item(),
                         max_val=t.max().item(),
-                        num_bits=num_bits_weight,
-                        quantized=quantize
+                        num_bits=nb,
+                        quantized=quantized
                     )
                 else:
-                    # e.g. rescale in mhattn
-                    t = quantization.quantize_to_qtensor_using_range(
-                        t,
-                        min_val=t.min().item(),
-                        max_val=t.max().item(),
-                        num_bits=num_bits,
-                        quantized=quantize
-                    )
+                    assert False
+                    # # e.g. rescale in mhattn
+                    # t = Q.quantize_to_qtensor_using_range(
+                    #     t,
+                    #     min_val=t.min().item(),
+                    #     max_val=t.max().item(),
+                    #     num_bits=nb,
+                    #     quantized=quantized
+                    # )
             else:
                 assert False, (t, type(t))
                 # t = QTensor(torch.as_tensor(t), scale=1., zero=0.)
@@ -57,27 +59,25 @@ def _convert_to_qtensor_for_kernel(
 def qadd(
         a: Union[Tensor, QTensor, Parameter],
         b: Union[Tensor, QTensor, Parameter],
-        factor: float,
         scale_next: float,
         zero_next: float,
-        op: Callable,
-        quantization: Quantization,
-        weight_quantization: Quantization,
-        num_bits: int,
-        num_bits_weight: int
+        quant_a: Quantization,
+        quant_b: Quantization,
+        quant_out: Quantization,
+        num_bits_a: int,
+        num_bits_b: int,
+        num_bits_out: int,
+        op: Callable = torch.add,
     ) -> QTensor:
     # mock low bit addition kernel
 
-    # tensor wrapper version of the earlier "globalparams" implementation:
-    # https://cegit.ziti.uni-heidelberg.de/mkoss/tqcore/-/blob/globalparams/quantized_layer.py#L206
+    # NOTE TODO
+    # assumes both a and b are activations; or that weight quantization is the same
+    # as activation quantization at least
 
     a, b = _convert_to_qtensor_for_kernel(
-        a, b, quantization, weight_quantization, num_bits, num_bits_weight
+        a, b, quant_a, quant_b, num_bits_a, num_bits_b
     )
-
-    denom = a.scale + b.scale
-    a_frac = a.scale / denom
-    b_frac = b.scale / denom
 
     a_dq = (a._t - a.zero) * a.scale
     b_dq = (b._t - b.zero) * b.scale
@@ -85,42 +85,40 @@ def qadd(
     a_rq = a_dq / scale_next + zero_next
     b_rq = b_dq / scale_next + zero_next
 
-    # NOTE should zero_next be scaled by the relatice fraction?
-    a_rq *= a_frac
-    b_rq *= b_frac
+    denom = a.scale + b.scale
+    a_rq *= a.scale / denom
+    b_rq *= b.scale / denom
 
     # NOTE:
     # for accurate simulation of quantization, it is crucial that round() and clamp() happen
-    # before the tensors get added
-    bits = (num_bits-1)
-    a_rq = a_rq.round().clamp(0, (2.**bits)-1.)
-    b_rq = b_rq.round().clamp(0, (2.**bits)-1.)
+    # before the tensors get added:
 
-    r = a_rq + b_rq
+    # a_rq = a_rq.round().clamp(0, (2.**num_bits_out)-1.)
+    a_rq = quant_a.tensor_clamp(a_rq, num_bits_a)
 
-    # r = a_rq + b_rq
-    # r = r.round()
+    # b_rq = b_rq.round().clamp(0, (2.**num_bits_out)-1.)
+    b_rq = quant_b.tensor_clamp(b_rq, num_bits_b)
 
-    # a_requantized = quantization.quantize_to_qtensor_using_params(
-    #     a.dequantize() * factor,
-    #     scale=scale_next*.5,
-    #     zero=zero_next,
-    #     num_bits=num_bits # half the scale
-    # )
-    # print_qt_stats("qadd a", a_requantized)
-    # b_requantized = quantization.quantize_to_qtensor_using_params(
-    #     b.dequantize() * factor,
-    #     scale=scale_next*.5,
-    #     zero=zero_next,
-    #     num_bits=num_bits # half the scale
-    # )
-    # print_qt_stats("qadd b", b_requantized)
+    # NOTE perform addition
+    r = op(a_rq, b_rq)
 
-    # r = a_requantized._t + b_requantized._t
-    # r = r.clamp(0., (2.**num_bits)-1.)
-    r = QTensor(r, scale=scale_next, zero=zero_next, quantized=True)
+    scale=scale_next
+    zero=zero_next
 
-    # print_qt_stats("qadd result", r)
+    # rescale if necessary:
+    # if (r > (2.**num_bits_out)-1.).any():
+    # print(f"\nit did that thing :(\n")
+    # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
+    # re_scale = r.max().item() / ((2.**num_bits_out)-1.)
+    # r = r / re_scale
+    # # r = r.round().clamp(0, (2.**num_bits_out)-1.)
+    # r = quant_out.tensor_clamp(r, num_bits_out)
+
+    # # NOTE adjust parameters after scaling
+    # zero = zero / re_scale
+    # scale = scale * re_scale
+
+    r = QTensor(r, scale=scale, zero=zero, quantized=True)
 
     assert is_integer(r._t), r
 
@@ -133,15 +131,17 @@ def qmul(
         scale_next: float,
         zero_next: float,
         op: Callable,
-        quantization: Quantization,
-        weight_quantization: Quantization,
-        num_bits: int,
-        num_bits_weight: int,
+        quant_a: Quantization,
+        quant_b: Quantization,
+        quant_out: Quantization,
+        num_bits_a: int,
+        num_bits_b: int,
+        num_bits_out: int,
     ) -> QTensor:
     # mock low bitwidth kernel for mul and matmul
 
     a, b = _convert_to_qtensor_for_kernel(
-        a, b, quantization, weight_quantization, num_bits, num_bits_weight
+        a, b, quant_a, quant_b, num_bits_a, num_bits_b
     )
 
     a_zeroed = a._t - round(a.zero)
@@ -156,16 +156,17 @@ def qmul(
     r_unclamped = r
 
     # round and clamp
-    r = quantization.tensor_clamp(r, num_bits=num_bits)
+    r = quant_out.tensor_clamp(r, num_bits=num_bits_out)
 
-    # Make sure we didnt move outside of EMA range:
+    # DEBUG: Make sure we didnt move outside of EMA range:
     if r.min() == r.max():
         expressions = ["scale_next", "zero_next", "r.min()", "a._t.min()", "a._t.max()", "b._t.min()", "b._t.max()", "r_float.min()", "r_float.max()", "r_unclamped.min()", "r_unclamped.max()", "multiplier", "factor"]
         msg = "\n"
         for expression in expressions:
             msg += expression+ "\t = \t"+ str(eval(expression)) + "\n"
         warnings.warn(msg)
-        # assert False, msg
+
+    assert is_integer(r), r
 
     return QTensor(r, scale=scale_next, zero=zero_next, quantized=True)
 

@@ -238,9 +238,8 @@ class QMultiHeadedAttention(nn.Module):
         self.q_layer = linear_cls(dim, num_heads * head_size, qkwargs=qkwargs)
         self.post_ql = QListener(self.q_layer, plot_name=pn("q_layer"), **qkwargs)
 
-        scale = 1./head_size**6
-        # scale = 1./math.sqrt(self.head_size)
-        # assert False, "remember to correct scale"
+        # scale = 1./head_size**6
+        scale = 1./math.sqrt(self.head_size)
 
         self.qkMatMul = QMatMul(factor=scale, **qkwargs)
         self.qkl = QListener(self.qkMatMul, plot_name=pn("qk matmul"),**qkwargs)
@@ -318,7 +317,8 @@ class QMultiHeadedAttention(nn.Module):
         context = self.avl(context)
 
         context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, num_heads * self.head_size)
+            batch_size, -1, num_heads * self.head_size
+        )
 
         output = self.output_layer(context)
         self.plot_step_counter += 1

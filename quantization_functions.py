@@ -68,6 +68,7 @@ class UniformQuantization(Quantization):
         return q_x
 
     def _quantize_tensor(self, x:torch.Tensor, min_val=None, max_val=None, num_bits=8) -> Tuple[torch.Tensor, float, float]:
+        # assert not num_bits==8, num_bits # NOTE debug, remove if assert
 
         if not min_val and not max_val:
             # weight quantization: dont actually clamp (use full range)
@@ -150,7 +151,7 @@ class UniformQuantization(Quantization):
     def dequantize_qtensor(self, q_x: QTensor) -> torch.Tensor:
         return q_x.scale * (q_x._t - q_x.zero)
 
-    def tensor_clamp(self, x: torch.Tensor, num_bits, up=True) -> torch.Tensor:
+    def tensor_clamp(self, x: torch.Tensor, num_bits, up=None) -> torch.Tensor:
         if up is not None:
             if up:
                 # round up
@@ -239,7 +240,8 @@ class FakeQuant(torch.autograd.Function):
     @staticmethod
     def apply_wrapper(*args, handling_qtensors):
         if handling_qtensors:
-            args = [a._t if isinstance(a, QTensor) else a for a in args]
+            num_bits = args[0].num_bits
+            args = [args[0]._t] + list(args[1:])
 
         out, scale, zero = FakeQuant.apply(*args)
         # try:
@@ -254,7 +256,7 @@ class FakeQuant(torch.autograd.Function):
         if handling_qtensors:
             # scale did not actually change, but need to give QTensor these qparams
             # for them to be accessible by NonQuantized layers
-            out = QTensor(out, scale, zero, quantized=False)
+            out = QTensor(out, scale, zero, quantized=False, num_bits=num_bits)
         return out
 
     @staticmethod
