@@ -268,11 +268,11 @@ class QMatMul(QuantizableModule):
             setattr(self, "num_bits_"+c, nb)
 
     def forward_fp(self, a, b):
-        return self.factor * ( a @ b )
+        return self.factor * torch.matmul( a , b )
 
     def forward_qat(self, a, b):
         super().forward_qat()
-        r = self.factor * (a._t @ b._t)
+        r = self.factor * torch.matmul(a._t, b._t)
         r = QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
         return r
 
@@ -355,6 +355,7 @@ class QLinear(QuantizableModule, nn.Linear):
 
 class QAdd(QuantizableModule):
     def __init__(self, type_a="activ", type_b="activ", **qkwargs):
+        self.rescale = qkwargs["qadd_rescale"]
         super().__init__(**qkwargs)
         for c, typ in zip("ab", [type_a, type_b]):
             typ = str(typ).lower()
@@ -389,7 +390,8 @@ class QAdd(QuantizableModule):
             quant_a=self.quant_a, quant_b=self.quant_b,
             quant_out=self.quantization,
             num_bits_a=self.num_bits_a, num_bits_b=self.num_bits_b,
-            num_bits_out=self.num_bits
+            num_bits_out=self.num_bits,
+            rescale=self.rescale
         )
 
 class QStack(QuantizableModule):
@@ -782,14 +784,14 @@ class QPositionalEncoding(QuantizableModule):
     Learnable Position Encoding (A W x D bias matrix that we add to the input)
     """
     def __init__(self,
-                 dim: int = 0,
-                 time_window: int = 24,
-                 init_fn: Callable = torch.rand,
-                 **qkwargs
-
-                 ):
+            dim: int = 0,
+            time_window: int = 24,
+            init_fn: Callable = torch.rand,
+            **qkwargs
+        ):
         super().__init__(**qkwargs)
 
+        self.rescale = qkwargs["qadd_rescale"]
         self.W = nn.Parameter(init_fn(time_window, dim))
 
     def forward_fp(self, X: torch.Tensor):
@@ -816,7 +818,8 @@ class QPositionalEncoding(QuantizableModule):
             quant_out=self.quantization,
             num_bits_a=self.num_bits,
             num_bits_b=self.num_bits_bias,# _bias, # TODO
-            num_bits_out=self.num_bits
+            num_bits_out=self.num_bits,
+            rescale=self.rescale
         )
 
     def quantize(self):
@@ -1220,7 +1223,7 @@ class QPlotter(QuantizableModule):
         self.plot_hack_fn = PlotHackFn.apply
 
     def forward_fp(self, x: Tensor, dont_plot=False) -> None:
-        self._log(x, dont_plot=dont_plot)
+        # self._log(x, dont_plot=dont_plot)
         return self.plot_hack_fn(x)
 
     def forward_calib(self, x, *args, **kwargs):
@@ -1284,20 +1287,20 @@ class QPlotter(QuantizableModule):
             # weighted_var = shifts.var()/(data.max()-data.min())
             # print(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
-        c = self.stage_counters[self.stage_str()]
-
+        count = self.stage_counters[self.stage_str()]
         # sometimes store matplotlib histogram
-        plot_because_idx = c in self.stage_plot_indices[self.stage_str()]
+        plot_because_idx = count in self.stage_plot_indices[self.stage_str()]
         freq = self.stage_plot_freqs[self.stage_str()]
-        plot_because_freq = False if freq == -1 else c % freq == 0
+        plot_because_freq = False if freq <= 0 else count % freq == 0
+
         if not dont_plot and (plot_because_idx or plot_because_freq): # and stage==QuantStage.Quantized:
             plot_data = data.detach().reshape(-1).numpy()
             plt.hist(plot_data, bins=bins)
             stage_str = self.stage_str()
-            plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{c}"+info, ylabel="Frequency of bin")
+            plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{count}"+info, ylabel="Frequency of bin")
 
             # save
-            fig_path = os.path.join(self.plot_dir, stage_str, self.plot_tmpl.format(stage_str, self.name, c))
+            fig_path = os.path.join(self.plot_dir, stage_str, self.plot_tmpl.format(stage_str, self.name, count))
 
             plt.savefig(fig_path)
             # update latest png (have to write png instead of symlink to above fig_path,

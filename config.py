@@ -17,24 +17,25 @@ class QConfig(NamedTuple):
     num_bits: int = 8
     num_bits_bias: int = 32
     leave_first_and_last: bool = False # ignore first and last layer during quantization?
-    tuning: str = "qat"
+    tuning: str = "qat" # qat, calibration, or calibrationthenqat. if using torch.quantization, qat means eager mode, calibration means fx mode
     calib_mode: str = "minandmax"
     thresholds: str = "conjugate"
     calib_num_bins: int = 2048
     calib_eps: int = 5
-    record_n_batches_bn: int =  30
-    record_n_batches_qlistener: int =  60
+    record_n_batches_bn: int =  300
+    record_n_batches_qlistener: int =  600
+    qadd_rescale: bool = True # whether to rescale after addition overflow in kernel.qadd
     stage_plot_freqs: Dict = {
-            "FP32":-1,
-            "Calibration":-1,
-            "QAT":-1,
-            "Quantized":-1,
+        "FP32":-1,
+        "Calibration":-1,
+        "QAT":-1,
+        "Quantized":-1,
     }
     stage_plot_indices: Dict = {
-            "FP32":[],
-            "Calibration":[],
-            "QAT":[],
-            "Quantized":[],
+        "FP32":[],
+        "Calibration":[],
+        "QAT":[],
+        "Quantized":[],
     }
     transformer: Dict = {}
     lstm: Dict = {}

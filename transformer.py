@@ -260,8 +260,6 @@ class QMultiHeadedAttention(nn.Module):
         self.avl = QListener(self.avMatMul, plot_name=pn("av matmul"), **qkwargs)
 
         self.output_layer = linear_cls(dim, dim, qkwargs=qkwargs)
-        self.plot_step_counter = 0
-
 
     def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Tensor = None):
         """
@@ -321,7 +319,6 @@ class QMultiHeadedAttention(nn.Module):
         )
 
         output = self.output_layer(context)
-        self.plot_step_counter += 1
 
         return output
 
@@ -490,8 +487,6 @@ class QTransformerEncoderLayer(nn.Module):
             self.norm2 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
             self.norm2l = QListener(self.norm2, plot_name=pn("norm 2"), **qkwargs)
 
-        self.plot_step_counter = 0
-
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:
         """
         Forward pass for a single transformer encoder layer.
@@ -538,7 +533,6 @@ class QTransformerEncoderLayer(nn.Module):
         else:
             o = res2
 
-        self.plot_step_counter += 1
         return o
 
 
@@ -594,7 +588,7 @@ class QTransformerEncoder(nn.Module):
                     ,**qkwargs
                 )
             else:
-                self.pe = QPositionalEncoding(dim, time_window)
+                self.pe = QPositionalEncoding(dim, time_window, **qkwargs)
                 self.pe_listener = QListener(self.pe, plot_name="pos enc", **qkwargs)
 
         self.emb_dropout = nn.Dropout(p=emb_dropout)
@@ -610,13 +604,9 @@ class QTransformerEncoder(nn.Module):
             )
             for l in range(num_layers)
         ])
-        # for i in range(self.layers):
-        #     setattr(self.layers["{i}"], "i", i)
 
         if freeze:
             raise NotImplementedError("TODO Implement Freezing everything but head as in TST paper")
-
-        self.plot_step_counter = 0
 
     def forward(self,
                 x: Tensor,
@@ -638,7 +628,6 @@ class QTransformerEncoder(nn.Module):
             - hidden_concat: last hidden state with
                 shape (batch_size, directions*hidden)
         """
-        self.plot_step_counter += 1
 
         # data normalization happens in data.py
         # x = (x - x.mean()) / x.std()
@@ -650,7 +639,6 @@ class QTransformerEncoder(nn.Module):
         # if self_is_quant:
         #     assert x.quantized, self.input_listener.forward
 
-        # print_qt_stats("input", x, stage=self.quantStub.stage, step=self.plot_step_counter, plot="always")
         x = self.embedding(x)
         x = self.emb_listener(x)
 

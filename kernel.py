@@ -68,6 +68,7 @@ def qadd(
         num_bits_b: int,
         num_bits_out: int,
         op: Callable = torch.add,
+        rescale=True
     ) -> QTensor:
     # mock low bit addition kernel
 
@@ -85,6 +86,7 @@ def qadd(
     a_rq = a_dq / scale_next + zero_next
     b_rq = b_dq / scale_next + zero_next
 
+    # TODO derive this rescaling
     denom = a.scale + b.scale
     a_rq *= a.scale / denom
     b_rq *= b.scale / denom
@@ -105,18 +107,19 @@ def qadd(
     scale=scale_next
     zero=zero_next
 
-    # rescale if necessary:
-    # if (r > (2.**num_bits_out)-1.).any():
-    # print(f"\nit did that thing :(\n")
-    # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
-    # re_scale = r.max().item() / ((2.**num_bits_out)-1.)
-    # r = r / re_scale
-    # # r = r.round().clamp(0, (2.**num_bits_out)-1.)
-    # r = quant_out.tensor_clamp(r, num_bits_out)
+    if rescale:
+        # rescale if necessary:
+        if (r > (2.**num_bits_out)-1.).any():
+            # print(f"\nit did that thing :(\n")
+            # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
+            re_scale = r.max().item() / ((2.**num_bits_out)-1.)
+            r = r / re_scale
+            # r = r.round().clamp(0, (2.**num_bits_out)-1.)
+            r = quant_out.tensor_clamp(r, num_bits_out)
 
-    # # NOTE adjust parameters after scaling
-    # zero = zero / re_scale
-    # scale = scale * re_scale
+            # NOTE adjust parameters after scaling
+            zero = zero / re_scale
+            scale = scale * re_scale
 
     r = QTensor(r, scale=scale, zero=zero, quantized=True)
 

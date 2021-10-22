@@ -85,7 +85,8 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         return out # QTensor(out, scale=self.scale, zero=self.zero)
 
     def _do_checks(self, input: Tensor) -> Tensor:
-        self._check_input_dim(input)
+        # NOTE uncomment TODO
+        # self._check_input_dim(input)
 
         # exponential_average_factor is set to self.momentum
         # (when it is available) only so that it gets updated
