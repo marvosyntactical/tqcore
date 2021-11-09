@@ -532,8 +532,28 @@ class QTransformerEncoderLayer(nn.Module):
             o = self.norm2l(o)
         else:
             o = res2
-
         return o
+
+    def __repr__(self):
+        s = "QTransformerEncoderLayer(\n"
+        if self.has_mix:
+            s += f"\t(mix): {self.mix}\n"
+
+        if self.has_res1:
+            s += f"\t(res1): {self.add1}\n"
+
+        if self.has_bn:
+            s += f"\t(bn1): {self.norm1}\n"
+
+        s += f"\t(ff): {self.feed_forward}\n"
+
+        if self.has_res2:
+            s += f"\t(res2): {self.add2}\n"
+
+        if self.has_bn:
+            s += f"\t(bn2): {self.norm2}\n"
+        s += ")"
+        return s
 
 
 class QTransformerEncoder(nn.Module):
@@ -662,8 +682,6 @@ class QTransformerEncoder(nn.Module):
             assert not isinstance(mask, Tensor)
         elif self.quantStub.stage == QuantStage.QAT:
             pass
-            # print(f"{x}\nquantized?")
-
         for i, layer in enumerate(self.layers):
             x = layer(x, mask)
 
@@ -678,7 +696,14 @@ class QTransformerEncoder(nn.Module):
             #     self.layers[0].mixer.fp_module.num_heads,
             #     self.layers[0].mixer.num_heads,
             # )
-            s="f{self.__class__.__name__}:(FIXME display info)"
+            s = f"{self.__class__.__name__}:(\n"
+            s += f"\t(quantStub): {self.quantStub}\n"
+            s += f"\t(embedding): {self.embedding}\n"
+            if self.has_pe:
+                s += f"\t(pe): {self.pe}\n"
+            s += f"\t(emb_dropout): {self.emb_dropout}\n"
+            s += str(self.layers)
+            s += ")"
         else:
             s = "%s(num_layers=%r, fft=True)" % (
                 self.__class__.__name__, len(self.layers)
