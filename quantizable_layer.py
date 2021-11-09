@@ -72,8 +72,8 @@ class QuantizableModule(nn.Module):
 
     def _set_qkwargs(
             self,
-            quantization: Quantization = UniformQuantization,
-            weight_quantization: Quantization = UniformSymmetricQuantization,
+            quantization: type = UniformQuantization,
+            weight_quantization: type = UniformSymmetricQuantization,
             num_bits: int = 8,
             num_bits_weight: int = 8,
             num_bits_bias: int = 32,
@@ -220,7 +220,6 @@ class QMul(QuantizableModule):
 
             setattr(self, "quant_"+c, quant)
             setattr(self, "num_bits_"+c, nb)
-
 
     def forward_fp(self, a: torch.Tensor, b: torch.Tensor):
         return a * b
@@ -671,10 +670,8 @@ class QReLU6(QuantizableModule):
     def forward_qat(self, x: QTensor) -> QTensor:
         super().forward_qat()
         assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
-        scale, zero = self.scale, self.zero
-        six = round(6 / scale + zero)
-        out = x.clamp(min=zero, max=six)
-        out =  QTensor(out._t, scale=scale, zero=zero, num_bits=self.num_bits, quantized=False)
+        out = nn.functional.relu6(x._t)
+        out =  QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=False)
         return out
 
     def forward_quantized(self, x: QTensor) -> QTensor:

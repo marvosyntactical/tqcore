@@ -302,7 +302,7 @@ class QMultiHeadedAttention(nn.Module):
             scores = self.qMask(scores, mask)
             print(f"Got mask={mask!=0}")
             print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
-            self.qMaskl(scores)
+            scores = self.qMaskl(scores)
 
         # # normalize context vectors.
         attention = self.qsoftmax(scores)
@@ -317,7 +317,6 @@ class QMultiHeadedAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(
             batch_size, -1, num_heads * self.head_size
         )
-
         output = self.output_layer(context)
 
         return output

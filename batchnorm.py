@@ -177,11 +177,10 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
     def quantize(self):
         QuantizableModule.quantize(self)
 
-        self.running_std = torch.sqrt(self.running_var)
         eps = torch.sqrt(torch.Tensor([self.eps]))
 
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
-        self.folded_weight = (self.weight * inv_running_std)\
+        self.folded_weight = (self.weight * inv_running_std) \
                 .unsqueeze(0).unsqueeze(-1)
 
         self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
