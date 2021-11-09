@@ -534,7 +534,7 @@ class QTransformerEncoderLayer(nn.Module):
             o = res2
         return o
 
-    def __repr__(self):
+    def __str__(self):
         s = "QTransformerEncoderLayer(\n"
         if self.has_mix:
             s += f"\t(mix): {self.mix}\n"
@@ -687,7 +687,7 @@ class QTransformerEncoder(nn.Module):
 
         return x
 
-    def __repr__(self):
+    def __str__(self):
         if not self.layers[0].fft:
             pass
             # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
