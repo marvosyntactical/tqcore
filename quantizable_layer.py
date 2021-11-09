@@ -1324,7 +1324,7 @@ class QPlotter(QuantizableModule):
         plot_because_freq = False if freq <= 0 else count % freq == 0
 
         if not dont_plot and (plot_because_idx or plot_because_freq): # and stage==QuantStage.Quantized:
-            plot_data = data.detach().reshape(-1).numpy()
+            plot_data = data.detach().reshape(-1).cpu().numpy()
             plt.hist(plot_data, bins=bins)
             stage_str = self.stage_str()
             plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{count}"+info, ylabel="Frequency of bin")
