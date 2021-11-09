@@ -44,6 +44,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         :param x: QTensor, quantized input data
         """
+        assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
 
         # TODO assign these tensors permanently during .quantize() ....
         # (this falls under optimization tho and would not appease mr knuth)
@@ -76,7 +77,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
-        out = QTensor(out, scale=self.scale, zero=self.zero)
+        out = QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
 
         assert is_integer(out._t), out
 
@@ -104,7 +105,6 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
                     exponential_average_factor = 1.0 / float(self.num_batches_tracked)
                 else:  # use exponential moving average
                     exponential_average_factor = self.momentum
-
         r"""
         Decide whether the mini-batch stats should be used for normalization rather than the buffers.
         Mini-batch stats are used in training mode, and in eval mode when buffers are None.
@@ -146,6 +146,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
 
     def forward_qat(self, input: QTensor) -> QTensor:
+        assert input.num_bits == self.num_bits, (input.num_bits, self.num_bits)
         super().forward_qat()
         bn_training, exponential_average_factor = self._do_checks(input)
 
@@ -162,7 +163,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         )
         if self.n_qat_batches == self.record_n_batches:
             self.freeze()
-        return QTensor(out, scale=self.scale, zero=self.zero, quantized=False)
+        return QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
 
     def freeze(self):
         # to stop recording running stats;

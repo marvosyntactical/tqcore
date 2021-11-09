@@ -79,6 +79,8 @@ def qadd(
     a, b = _convert_to_qtensor_for_kernel(
         a, b, quant_a, quant_b, num_bits_a, num_bits_b
     )
+    assert a.num_bits==num_bits_a
+    assert b.num_bits==num_bits_b
 
     a_dq = (a._t - a.zero) * a.scale
     b_dq = (b._t - b.zero) * b.scale
@@ -121,7 +123,7 @@ def qadd(
             zero = zero / re_scale
             scale = scale * re_scale
 
-    r = QTensor(r, scale=scale, zero=zero, quantized=True)
+    r = QTensor(r, scale=scale, zero=zero, num_bits=num_bits_out, quantized=True)
 
     assert is_integer(r._t), r
 
@@ -146,6 +148,8 @@ def qmul(
     a, b = _convert_to_qtensor_for_kernel(
         a, b, quant_a, quant_b, num_bits_a, num_bits_b
     )
+    assert a.num_bits==num_bits_a
+    assert b.num_bits==num_bits_b
 
     a_zeroed = a._t - round(a.zero)
     b_zeroed = b._t - round(b.zero)
@@ -171,6 +175,6 @@ def qmul(
 
     assert is_integer(r), r
 
-    return QTensor(r, scale=scale_next, zero=zero_next, quantized=True)
+    return QTensor(r, scale=scale_next, zero=zero_next, num_bits=num_bits_out, quantized=True)
 
 

@@ -51,8 +51,7 @@ class QTensor:
             **kwargs
         ):
         # TODO add num bits attribute for architectures with activations with differing bitwidths
-        if num_bits is not None:
-            assert num_bits == 8, num_bits # FIXME remove me
+        assert num_bits is not None
         self.num_bits = num_bits
 
         self._t: Tensor = torch.as_tensor(data, **kwargs)
@@ -233,55 +232,14 @@ class QTensor:
     def any(self, *args, **kwargs) -> bool:
         return self._t.any(*args, **kwargs)
 
-
 HANDLED_FUNCTIONS = {
 }
 PROHIBITED_FUNCTIONS = {
-    torch.stack: "Use QTensor.split instead",
+    torch.split: "Use QTensor.split instead",
+    torch.stack: "Use tqcore.quantizable_layer.QStack instead",
     torch.add: "Use tqcore.kernel.qadd instead",
     torch.matmul: "Use tqcore.kernel.qmul instead",
     torch.mul: "Use tqcore.kernel.qmul instead",
 }
-
-
-#  DELETE THE BELOW, ONLY FOR TESTING:
-if __name__ == "__main__":
-    qt = QTensor(torch.rand(3,5), scale=0.0015,zero=1)
-    print(qt)
-    print(qt[1:])
-    print(qt+qt)
-    print(torch.add(qt,qt))
-    trans = torch.transpose(qt,0,1)
-    print(trans)
-    print(torch.matmul(qt, trans))
-    print(qt.T)
-    qt = qt.to("cpu")
-    print(qt)
-    print(qt.device)
-    print(deepcopy(qt))
-
-    from functools import wraps
-    import time
-
-    def timeit(my_func):
-        @wraps(my_func)
-        def timed(*args, **kw):
-
-            tstart = time.time()
-            output = my_func(*args, **kw)
-            tend = time.time()
-
-            print('"{}" took {:.3f} s to execute\n'.format(my_func.__name__, (tend - tstart)))
-            return output
-        return timed
-
-    @timeit
-    def torch_softmax(inp):
-        return inp.softmax(dim=-1)
-
-    @timeit
-    def tqcore_softmax(inp):
-        return
-
 
 

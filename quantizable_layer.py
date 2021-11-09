@@ -31,7 +31,7 @@ from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind, 
 from .histogram import HistogramCalibrator
 from .kernel import qadd, qmul
 
-__ASSERT__ = 0
+__ASSERT__ = 1
 
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 class QuantizableModule(nn.Module):
@@ -45,7 +45,7 @@ class QuantizableModule(nn.Module):
     and then a fully quantized stage;
     Each of the stages should be implemented by subclasses.
     """
-    FLOAT_SCALE = 1. # these determines all successive scale / zeros; retrieved by QuantStub
+    FLOAT_SCALE = 1. # these determine all successive scale / zeros; retrieved by QuantStub
     FLOAT_ZERO = 0.
 
     # initialize these default values
@@ -80,11 +80,10 @@ class QuantizableModule(nn.Module):
             nudge_zero: bool = False,
             **qkwargs,
         ):
-
         self.num_bits = num_bits
         self.quantization = quantization(nudge_zero=nudge_zero)
         self.num_bits_weight = num_bits_weight
-        self.weight_quantization = weight_quantization(nudge_zero=nudge_zero)
+        self.weight_quantization = weight_quantization()
         self.num_bits_bias = num_bits_bias
 
     def stage_str(self) -> str:
@@ -122,7 +121,7 @@ class QuantizableModule(nn.Module):
 
         if not [attr for attr in dir(self) if "scale" in attr or "zero" in attr]:
             warnings.warn(
-                f"""
+f"""
 During {self}.quantize(), no scale or zero attribute were found.
 These should be set for this instance of {type(self)}
 by a QListener
@@ -146,8 +145,9 @@ class QuantStub(QuantizableModule):
                 and not isinstance(x, QTensor):
             r = QTensor(
                 x,
-                scale=self.scale,
-                zero=self.zero,
+                scale=self.scale, # initialized to 1.; update this with a qlistener
+                zero=self.zero, # initialized to 0.; update this with a qlistener
+                num_bits=self.num_bits,
                 quantized=False
             )
         return r
@@ -158,9 +158,9 @@ class QuantStub(QuantizableModule):
                 and torch.is_floating_point(x)\
                 and not isinstance(x, QTensor):
             r = self.quantization.quantize_to_qtensor_using_params(
-                x,
-                self.scale,
-                self.zero,
+                x=x,
+                scale=self.scale,
+                zero=self.zero,
                 num_bits=self.num_bits,
                 quantized=True
             )
@@ -183,6 +183,7 @@ class DeQuantStub(QuantizableModule):
 
         for i, out in enumerate(outputs):
             if isinstance(out, QTensor):
+                assert out.num_bits==self.num_bits, (out.num_bits, self.num_bits)
                 outputs[i] = f(out)
 
         if len(outputs) == 1:
@@ -221,15 +222,16 @@ class QMul(QuantizableModule):
             setattr(self, "num_bits_"+c, nb)
 
 
-
     def forward_fp(self, a: torch.Tensor, b: torch.Tensor):
         return a * b
 
     def forward_qat(self, a: QTensor, b: QTensor):
+        assert a.num_bits==self.num_bits_a, (a.num_bits, self.num_bits_a)
+        assert b.num_bits==self.num_bits_b, (b.num_bits, self.num_bits_b)
         super().forward_qat()
         # NO affine transformation; multiply in float but keep track of scale
         rfloat = a._t * b._t
-        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
 
     def forward_quantized(
@@ -272,11 +274,13 @@ class QMatMul(QuantizableModule):
 
     def forward_qat(self, a, b):
         super().forward_qat()
+        assert a.num_bits==self.num_bits_a, (a.num_bits, self.num_bits_a)
+        assert b.num_bits==self.num_bits_b, (b.num_bits, self.num_bits_b)
         r = self.factor * torch.matmul(a._t, b._t)
-        r = QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+        r = QTensor(r, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
 
-    def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
+    def forward_quantized(self, a: QTensor, b: QTensor) -> QTensor:
         return qmul(
             a=a, b=b, factor=self.factor,
             scale_next=self.scale, zero_next=self.zero, op=torch.matmul,
@@ -299,6 +303,7 @@ class QLinear(QuantizableModule, nn.Linear):
         return F.linear(x, self.weight, self.bias)
 
     def forward_qat(self, x: QTensor):
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         # fake quantize w&b
         if not self.dont_fakeQ:
             self.weight.data = self.fake_quantize(
@@ -309,25 +314,27 @@ class QLinear(QuantizableModule, nn.Linear):
                 self.bias.data = self.fake_quantize(
                     self.bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False
                 )
-        return QTensor(F.linear(x._t, self.weight, self.bias), scale=self.scale, zero=self.zero, quantized=False)
+        return QTensor(F.linear(x._t, self.weight, self.bias), scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
 
     def quantize(self):
         super().quantize()
         # nn.Parameter weight is replaced by QTensor
         self.w = self.weight_quantization.quantize_to_qtensor_using_range(
-            self.weight.data,
+            x=self.weight.data,
             num_bits=self.num_bits_weight,
             quantized=True
         )
 
     def forward_quantized(self, x:QTensor):
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
+
         w = self.w
 
         if self.bias is not None:
             b = self.weight_quantization.quantize_to_qtensor_given_scale(
-                self.bias.data,
-                w.scale * x.scale,
-                0,
+                x=self.bias.data,
+                scale=w.scale * x.scale,
+                zero=0,
                 num_bits=self.num_bits_bias,
                 quantized=True
             )
@@ -348,9 +355,9 @@ class QLinear(QuantizableModule, nn.Linear):
         out = out * multiplier + self.zero
 
         # round and clamp values
-        out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
+        out = self.quantization.tensor_clamp(x=out, num_bits=self.num_bits)
 
-        return QTensor(out, scale=self.scale, zero=self.zero, quantized=True)
+        return QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
 
 
 class QAdd(QuantizableModule):
@@ -378,9 +385,11 @@ class QAdd(QuantizableModule):
         return a + b
 
     def forward_qat(self, a: QTensor, b: QTensor):
+        assert a.num_bits==self.num_bits_a, (a.num_bits, self.num_bits_a)
+        assert b.num_bits==self.num_bits_b, (b.num_bits, self.num_bits_b)
         super().forward_qat()
         rfloat = a._t + b._t
-        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
 
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
@@ -395,25 +404,29 @@ class QAdd(QuantizableModule):
         )
 
 class QStack(QuantizableModule):
-    def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out=None) -> QTensor:
+    def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None) -> QTensor:
         requantized: List[Tensor] = []
         for qt in qtensors:
             assert type(qt) == QTensor, type(qt)
+            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
             fp_tensor = qt.dequantize()
             rq = fp_tensor / self.scale + self.zero
-            rq = self.quantization.tensor_clamp(rq, num_bits=self.num_bits)
+            rq = self.quantization.tensor_clamp(x=rq, num_bits=self.num_bits)
             requantized += [rq]
         r: Tensor = torch.stack(requantized, dim=dim, out=out)
-        qr: QTensor = QTensor(r, scale=self.scale, zero=self.zero, quantized=True)
+        qr: QTensor = QTensor(r, scale=self.scale, zero=self.zero, quantized=True, num_bits=self.num_bits)
         return qr
 
     def forward_fp(self, *args, **kwargs):
         return torch.stack(*args, **kwargs)
 
-    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out=None):
+    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None):
         super().forward_qat()
-        r = torch.stack([qt._t for qt in qtensors])
-        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+        for qt in qtensors:
+            assert type(qt) == QTensor, type(qt)
+            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
+        r = torch.stack([qt._t for qt in qtensors], dim=dim, out=out)
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
 
 class QFill(QuantizableModule):
     def __init__(self, fp_neg_val: float=-1e5, **qkwargs):
@@ -426,12 +439,14 @@ class QFill(QuantizableModule):
 
     def forward_qat(self, scores, mask):
         super().forward_qat()
+        assert scores.num_bits == self.num_bits, (scores.num_bits, self.num_bits)
         scores = scores._t.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
-        return QTensor(scores, self.scale, self.zero, quantized=False)
+        return QTensor(scores, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
 
     def forward_quantized(self, scores, mask):
+        assert scores.num_bits == self.num_bits, (scores.num_bits, self.num_bits)
         scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero)
-        return QTensor(scores, self.scale, self.zero, quantized=True)
+        return QTensor(scores, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
 
 class QBoolMask(QuantizableModule):
     # NOTE does not require a listener/qparam attributes.
@@ -443,20 +458,20 @@ class QBoolMask(QuantizableModule):
 
     def forward_qat(self, x: QTensor, mask: torch.BoolTensor):
         super().forward_qat()
+        assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
         r = x._t * mask
-        return QTensor(r, x.scale, x.zero, quantized=False)
+        return QTensor(r, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=False)
 
     def forward_quantized(self, x: QTensor, mask: torch.BoolTensor):
+        assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
         r = x._t.masked_fill(mask==torch.as_tensor(False), x.zero)
-        return QTensor(r, x.scale, x.zero, quantized=True)
-
-
+        return QTensor(r, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
 class QSoftmax(QuantizableModule):
 
-    def __init__(self, dim=-1, time_window: int = 144, alpha:float = None, layer_num: int =0, **qkwargs):
-        super().__init__(**qkwargs)
+    def __init__(self, dim: int=-1, time_window: int = 144, alpha: float = None, layer_num: int=0, **qkwargs):
 
+        super().__init__(**qkwargs)
         self.dim = int(dim)
 
         if alpha is None:
@@ -487,6 +502,7 @@ class QSoftmax(QuantizableModule):
         if isinstance(inp, Tensor):
             exponent = inp * self.alpha
         else:
+            assert inp.num_bits==self.num_bits
             exponent = inp._t * self.alpha
         # out = torch.exp(exponent.clamp(max=78.))
         out = torch.exp(exponent)
@@ -509,6 +525,7 @@ class QSoftmax(QuantizableModule):
 
     def forward_qat(self, inp: QTensor) -> torch.Tensor:
         super().forward_qat()
+        assert inp.num_bits == self.num_bits, (inp.num_bits, self.num_bits)
         self.exp_listener(inp)
         # LogSumExp trick in comment
         numerator = self._scaled_exp(inp._t) # -inp._t.max())
@@ -527,14 +544,15 @@ class QSoftmax(QuantizableModule):
         self._set_exp_lkp()
 
     def _exp_lkp(self, long_tensor: torch.LongTensor):
-        assert hasattr(self, "EXP_STEP_FUN"), f"{self}._set_exp_lkp() must be called before it can perform a lookup"
         # (not differentiable)
+        assert hasattr(self, "EXP_STEP_FUN"), f"{self}._set_exp_lkp() must be called before it can perform a lookup"
         return QTensor(
             self.EXP_STEP_FUN[long_tensor], scale=self.exp_scale, zero=self.exp_zero,
             quantized=True
         )
 
     def forward_quantized(self, inp: QTensor) -> QTensor:
+        assert inp.num_bits==self.num_bits, (inp.num_bits, self.num_bits)
 
         exponentiated: QTensor = self._exp_lkp(inp._t.long()) # NOTE: range from 0-255 here already!
         zeroed_exp = exponentiated._t - exponentiated.zero
@@ -542,7 +560,7 @@ class QSoftmax(QuantizableModule):
         norm_scale = 1./(2**self.num_bits)
         M = exponentiated.scale / norm_scale
         normed_exp = (zeroed_exp * M) # + self.normed_zero
-        r = self.quantization.tensor_clamp(normed_exp, num_bits=self.num_bits)
+        r = self.quantization.tensor_clamp(x=normed_exp, num_bits=self.num_bits)
 
         return r
 
@@ -569,12 +587,17 @@ class NonQuantizableModuleWrap(QuantizableModule):
         r = self.fp_module(*args, **kwargs)
         return r
 
-    def forward_caliib(self, x, *args, **kwargs):
+    def forward_calib(self, x, *args, **kwargs):
         r = self.fp_module(x, *args, **kwargs)
         return self.out_listener(r)
 
     def forward_qat(self, *args, **kwargs) -> torch.Tensor:
         super().forward_qat()
+
+        for arg in args:
+            assert not isinstance(arg, Tensor)
+            if isinstance(arg, QTensor):
+                assert arg.num_bits==self.num_bits, (arg.num_bits, self.num_bits)
 
         fp_args = [a._t if isinstance(a, QTensor) else a for a in args]
 
@@ -600,7 +623,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         fakeq_out = [
                     self.out_listener(
-                        QTensor(fp_o, scale=self.scale, zero=self.zero, quantized=False
+                        QTensor(fp_o, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False
                     ))
                 if not isinstance(fp_o, (QTensor, type(None)))
                 else fp_o
@@ -611,6 +634,10 @@ class NonQuantizableModuleWrap(QuantizableModule):
         return tuple(fakeq_out) if len(fakeq_out) > 1 else fakeq_out[0]
 
     def forward_quantized(self, *args, **kwargs) -> QTensor:
+        for arg in args:
+            assert not isinstance(arg, Tensor)
+            if isinstance(arg, QTensor):
+                assert arg.num_bits==self.num_bits, (arg.num_bits, self.num_bits)
 
         fp_args = [a.dequantize() if isinstance(a, QTensor) else a for a in args]
 
@@ -620,7 +647,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         q_outs = [
             self.quantization.quantize_to_qtensor_using_params(
-                fp_out,
+                x=fp_out,
                 scale=self.scale,
                 zero=self.zero,
                 num_bits=self.num_bits,
@@ -643,13 +670,15 @@ class QReLU6(QuantizableModule):
 
     def forward_qat(self, x: QTensor) -> QTensor:
         super().forward_qat()
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         scale, zero = self.scale, self.zero
         six = round(6 / scale + zero)
         out = x.clamp(min=zero, max=six)
-
+        out =  QTensor(out._t, scale=scale, zero=zero, num_bits=self.num_bits, quantized=False)
         return out
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
 
         scale = self.scale
         zero = self.zero
@@ -669,9 +698,9 @@ class QReLU6(QuantizableModule):
         inp = x.dequantize()
         inp = inp / scale + zero
         six = round(6. / scale + zero)
-        out = inp.clamp(min=zero, max=six)
+        out = inp.round().clamp(min=zero, max=six)
 
-        out =  QTensor(out, scale=scale, zero=zero)
+        out =  QTensor(out, scale=scale, zero=zero, num_bits=self.num_bits, quantized=True)
         return out
 
 
@@ -682,10 +711,12 @@ class QHardSigmoid(QuantizableModule):
 
     def forward_qat(self, x: QTensor) -> QTensor:
         super().forward_qat()
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         r = nn.functional.hardsigmoid(x._t)
-        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
+        return QTensor(r, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
 
         scale = self.scale
         zero = self.zero
@@ -719,11 +750,13 @@ class QHardTanH(QuantizableModule):
         return nn.functional.hardtanh(x)
 
     def forward_qat(self, x: QTensor) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         super().forward_qat()
         r = nn.functional.hardtanh(x._t)
         return QTensor(r, scale=self.scale, zero=self.zero, quantized=False)
 
     def forward_quantized(self, x: QTensor) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
 
         scale = self.scale
         zero = self.zero
@@ -746,9 +779,6 @@ class QHardTanH(QuantizableModule):
 
         return QTensor(out, scale=scale, zero=zero, quantized=True)
 
-
-
-
 def DiscreteHartleyTransform(input):
     # from https://github.com/AlbertZhangHIT/Hartley-spectral-pooling/blob/master/spectralpool.py
     # TODO test as alternative
@@ -764,7 +794,7 @@ class FFT(QuantizableModule):
     # third party code: no normalization
 
     def __init__(self, *args, **kwargs):
-        super().__init__()
+        super().__init__(*args, **kwargs)
 
     def forward_fp(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         if mask is not None:
@@ -806,8 +836,9 @@ class QPositionalEncoding(QuantizableModule):
 
     def forward_qat(self, X: QTensor):
         super().forward_qat()
+        assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
         rfloat = self.W + X._t
-        r = QTensor(rfloat, scale=self.scale, zero=self.zero, quantized=False)
+        r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
 
     def forward_quantized(self, X: QTensor):
@@ -817,7 +848,7 @@ class QPositionalEncoding(QuantizableModule):
             quant_a=self.quantization, quant_b=self.weight_quantization, # use uniform quantization for bias weight
             quant_out=self.quantization,
             num_bits_a=self.num_bits,
-            num_bits_b=self.num_bits_bias,# _bias, # TODO
+            num_bits_b=self.num_bits_bias, # _bias, # TODO
             num_bits_out=self.num_bits,
             rescale=self.rescale
         )
@@ -826,7 +857,7 @@ class QPositionalEncoding(QuantizableModule):
         super().quantize()
         # nn.Parameter W is replaced by QTensor
         self._w = self.weight_quantization.quantize_to_qtensor_using_range(
-            self.W.data,
+            x=self.W.data,
             num_bits=self.num_bits_bias, # _bias # TODO
             quantized=True
         )
@@ -1044,6 +1075,7 @@ by initializing it with clipped_distr: bool given as kwarg.
         :param fp: string, name/identifier of current module
         :return: stats: updated EMA
         """
+        assert not isinstance(x, Tensor), "REMOVE THIS"
         x = x.detach()
         assert not torch.isnan(x).any(), f"fraction of NaNs: {torch.isnan(x).sum().item()/x.nelement()}"
 
@@ -1100,7 +1132,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             if self.calibration_mode==CalibMode.EMA:
                 stats = self.__stats__
                 scale, zero = self.quantization.calc_params(
-                    stats["min"], stats["max"], num_bits=self.num_bits
+                    min_val=stats["min"], max_val=stats["max"], num_bits=self.num_bits
                 )
             else:
                 if self.distribution_kind==DistKind.SYMM:
@@ -1109,12 +1141,12 @@ by initializing it with clipped_distr: bool given as kwarg.
                     a, b = self.hist_calib.compute_range(mu, title=self)
                     lower, upper = self._compute_thresholds(mu, a, b)
                     scale, zero = self.quantization.calc_params(
-                        lower, upper, num_bits=self.num_bits
+                        min_val=lower, max_val=upper, num_bits=self.num_bits
                     )
                 elif self.distribution_kind==DistKind.CLIPPED:
                     a, b = self.hist_calib.compute_one_bound()
                     scale, zero = self.quantization.calc_params(
-                        a, b, num_bits=self.num_bits
+                        min_val=a, max_val=b, num_bits=self.num_bits
                     )
         except KeyError as KE:
             raise Exception(f"Got KeyError: {KE} during conversion of {self}. It was possibly never called during tuning?")
@@ -1231,17 +1263,18 @@ class QPlotter(QuantizableModule):
         return self.plot_hack_fn(x)
 
     def forward_qat(self, x: Optional[QTensor] = None, dont_plot = False) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         self._log(x, dont_plot=dont_plot)
         out = self.plot_hack_fn(x._t)
-        return QTensor(out, scale=x.scale, zero=x.zero, quantized=False)
+        return QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=False)
 
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         self._log(x, dont_plot=dont_plot)
         out = self.plot_hack_fn(x._t)
-        return QTensor(out, scale=x.scale, zero=x.zero, quantized=True)
+        return QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
     def _log(self,x: Union[Tensor, QTensor], dont_plot=False):
-
         bins = None
         if isinstance(x, QTensor):
             data, scale, zero = x._t, x.scale, x.zero

@@ -13,8 +13,9 @@ class QConfig(NamedTuple):
     already trained TSTModel
     """
     # quantization parameters
-    num_bits_weight: int = 8
+    nudge_zero: bool = True
     num_bits: int = 8
+    num_bits_weight: int = 8
     num_bits_bias: int = 32
     leave_first_and_last: bool = False # ignore first and last layer during quantization?
     tuning: str = "qat" # qat, calibration, or calibrationthenqat. if using torch.quantization, qat means eager mode, calibration means fx mode
