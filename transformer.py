@@ -683,18 +683,10 @@ class QTransformerEncoder(nn.Module):
             pass
         for i, layer in enumerate(self.layers):
             x = layer(x, mask)
-
         return x
 
     def __str__(self):
         if not self.layers[0].fft:
-            pass
-            # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
-            # s = "%s(num_layers=%r, num_heads=%r)" % (
-            #     self.__class__.__name__, len(self.layers),
-            #     self.layers[0].mixer.fp_module.num_heads,
-            #     self.layers[0].mixer.num_heads,
-            # )
             s = f"{self.__class__.__name__}:(\n"
             s += f"\t(quantStub): {self.quantStub}\n"
             s += f"\t(embedding): {self.embedding}\n"

@@ -82,16 +82,17 @@ def qadd(
     assert a.num_bits==num_bits_a
     assert b.num_bits==num_bits_b
 
+    denom = a.scale + b.scale
+
     a_dq = (a._t - a.zero) * a.scale
     b_dq = (b._t - b.zero) * b.scale
 
-    # TODO derive this rescaling
-    denom = a.scale + b.scale
-    # a_rq *= a.scale / denom
-    # b_rq *= b.scale / denom
-
     a_rq = a_dq / scale_next + (zero_next * a.scale/denom)
     b_rq = b_dq / scale_next + (zero_next * b.scale/denom)
+
+    # # # TODO derive this rescaling
+    # a_rq *= a.scale / denom
+    # b_rq *= b.scale / denom
 
     # NOTE:
     # for accurate simulation of quantization, it is crucial that round() and clamp() happen
@@ -111,7 +112,8 @@ def qadd(
 
     if rescale:
         if (r > (2.**num_bits_out)-1.).any(): # NOTE rescale only if necessary
-            print(f"\nit did that thing :(\n")
+            print(f"\nquantized addition exceeded upper bound\n")
+
             # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
             re_scale = r.max().item() / ((2.**num_bits_out)-1.)
             r = r / re_scale
