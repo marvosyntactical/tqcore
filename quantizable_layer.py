@@ -289,9 +289,87 @@ class QMatMul(QuantizableModule):
             num_bits_out=self.num_bits
         )
 
+class QConv2d(QuantizableModule, nn.Conv2d):
+    def __init__(self, *args, qkwargs: Dict, **kwargs):
+        QuantizableModule.__init__(self, **qkwargs)
+        nn.Conv2d.__init__(self, *args, **kwargs)
+        self.fake_quantize = FakeQuant.apply_wrapper
+
+    def forward_fp(self, x: Tensor):
+        return nn.Conv2d.forward(self, x)
+
+    def forward_qat(self, x: QTensor):
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
+        # fake quantize w & b
+        self.weight.data = self.fake_quantize(
+            self.weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False
+        )
+
+        if self.bias is not None:
+            self.bias.data = self.fake_quantize(
+                self.bias.data, self.weight_quantization, self.num_bits_bias, None, None, handling_qtensors=False
+            )
+        return QTensor(nn.Conv2d.forward(self, x._t), scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
+
+    def quantize(self):
+        super().quantize()
+        # nn.Parameter weight is replaced by QTensor
+        self.w = self.weight_quantization.quantize_to_qtensor_using_range(
+            x=self.weight.data,
+            num_bits=self.num_bits_weight,
+            quantized=True
+        )
+
+    def forward_quantized(self, x:QTensor):
+        """
+        Quantized convolutional layer, functionality according to https://arxiv.org/pdf/1712.05877.pdf, section 2.
+        """
+        assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
+
+        if layer.bias is not None:
+            b = self.weight_quantization.quantize_to_qtensor_given_scale(
+                self.bias.data,
+                self.w.scale * x.scale,
+                0,
+                num_bits=self.num_bits_bias,
+            )
+            b = b._t
+        else:
+            b = None
+
+        w_zeroed = self.w._t - w.zero
+        x_zeroed = x._t - x.zero
+
+        pad = self._reversed_padding_repeated_twice if hasattr(self, "_reversed_padding_repeated_twice") else tuple(x for x in reversed(self.padding) for _ in range(2))
+
+        out = F.conv2d(
+            F.pad(
+                x_zeroed,
+                pad,
+                mode="constant",
+                value=0,
+            ),
+            w_zeroed,
+            b,
+            self.stride,
+            _pair(0),
+            self.dilation,
+            self.groups,
+        )
+
+        multiplier = ( x.scale * self.w.scale ) / self.scale
+
+        # scale result tensor back to given bit width, saturate to uint if unsigned is used
+        out = out * multiplier + self.zero
+
+        out = quant_input.tensor_clamp(out, num_bits=self.num_bits)
+
+        return QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
+
+
 class QLinear(QuantizableModule, nn.Linear):
     def __init__(self, *args, qkwargs: Dict, dont_fakeQ: bool=False, **kwargs):
-        super().__init__(**qkwargs)
+        # super().__init__(**qkwargs)
         QuantizableModule.__init__(self, **qkwargs)
         nn.Linear.__init__(self, *args, **kwargs)
         self.dont_fakeQ = dont_fakeQ
@@ -563,6 +641,46 @@ class QSoftmax(QuantizableModule):
 
         return r
 
+class QuantModuleWrap(QuantizableModule):
+    """
+    Wraps a given QuantizableModule with QuantStub, DeQuantStub, and QListener.
+    For quantizing only one or few modules in a given architecture.
+    See models/resnet.py in branch 'wrapped'.
+    """
+    def __init__(self, qmodule, plot_name=None, **qkwargs):
+        super().__init__(**qkwargs)
+
+        assert isinstance(qmodule, QuantizableModule), qmodule
+
+        self.quantStub = QuantStub(**qkwargs)
+        # overwrite calibration for input listener incase of KL calibration
+        self.input_listener = QListener(self.quantStub, calibration="minmax", plot_name=plot_name + " input", **qkwargs)
+
+        self.qmodule = qmodule
+        self.out_listener = QListener(self.qmodule, plot_name=plot_name, **qkwargs)
+        self.deQuantStub = DeQuantStub(**qkwargs)
+
+    def forward_fp(self, x) -> torch.Tensor:
+        r = self.qmodule(x)
+        return r
+
+    def forward_calib(self, x):
+        raise NotImplementedError(f"{self}.forward_calib")
+
+    def forward_qat(self, x) -> QTensor:
+        inp: QTensor = self.quantStub(x)
+        out: QTensor = self.qmodule(x)
+        outl: QTensor = self.out_listener(x)
+        outd: QTensor = self.deQuantStub(x)
+        return outd
+
+    def forward_quantized(self, x) -> QTensor:
+        inp: QTensor = self.quantStub(x)
+        out: QTensor = self.qmodule(x)
+        outl: QTensor = self.out_listener(x)
+        outd: QTensor = self.deQuantStub(x)
+        return outd
+
 class NonQuantizableModuleWrap(QuantizableModule):
 
     def __init__(self, module, plot_name=None, **qkwargs):
@@ -578,10 +696,6 @@ class NonQuantizableModuleWrap(QuantizableModule):
             **qkwargs
         )
 
-    def quantize(self):
-        super().quantize()
-        assert self.stage == QuantStage.Quantized
-
     def forward_fp(self, *args, **kwargs) -> torch.Tensor:
         r = self.fp_module(*args, **kwargs)
         return r
@@ -590,7 +704,7 @@ class NonQuantizableModuleWrap(QuantizableModule):
         r = self.fp_module(x, *args, **kwargs)
         return self.out_listener(r)
 
-    def forward_qat(self, *args, **kwargs) -> torch.Tensor:
+    def forward_qat(self, *args, **kwargs) -> QTensor:
         super().forward_qat()
 
         for arg in args:
