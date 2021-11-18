@@ -46,8 +46,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         """
         assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
 
-        # TODO assign these tensors permanently during .quantize() ....
-        # (this falls under optimization tho and would not appease mr knuth)
+        # TODO assign these qtensors permanently during .quantize()
 
         gamma = self.weight_quantization.quantize_to_qtensor_using_range(
             self.folded_weight,

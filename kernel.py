@@ -87,12 +87,12 @@ def qadd(
     a_dq = (a._t - a.zero) * a.scale
     b_dq = (b._t - b.zero) * b.scale
 
-    a_rq = a_dq / scale_next + (zero_next * a.scale/denom)
-    b_rq = b_dq / scale_next + (zero_next * b.scale/denom)
+    a_rq = a_dq / scale_next + zero_next
+    b_rq = b_dq / scale_next + zero_next
 
     # # # TODO derive this rescaling
-    # a_rq *= a.scale / denom
-    # b_rq *= b.scale / denom
+    a_rq *= a.scale / denom
+    b_rq *= b.scale / denom
 
     # NOTE:
     # for accurate simulation of quantization, it is crucial that round() and clamp() happen

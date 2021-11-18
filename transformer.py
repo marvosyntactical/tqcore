@@ -457,8 +457,8 @@ class QTransformerEncoderLayer(nn.Module):
             )
         if self.has_bn:
             self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-            if not self.has_res2:
-                self.norm1l = QListener(self.norm1, plot_name=pn("norm 1"), **qkwargs)
+            # if not self.has_res2:
+            self.norm1l = QListener(self.norm1, plot_name=pn("norm 1"), **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim,
@@ -513,8 +513,8 @@ class QTransformerEncoderLayer(nn.Module):
 
         if self.has_bn:
             h = self.norm1(res1)
-            if not self.has_res2:
-                h = self.norm1l(h)
+            # if not self.has_res2:
+            h = self.norm1l(h)
         else:
             h = res1
 
@@ -649,7 +649,7 @@ class QTransformerEncoder(nn.Module):
         """
 
         # data normalization happens in data.py
-        # x = (x - x.mean()) / x.std()
+        x = (x - x.mean()) / x.std()
 
         x = self.quantStub(x)
         x = self.input_listener(x)

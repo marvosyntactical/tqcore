@@ -311,7 +311,7 @@ class QLinear(QuantizableModule, nn.Linear):
 
             if self.bias is not None:
                 self.bias.data = self.fake_quantize(
-                    self.bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False
+                    self.bias.data, self.weight_quantization, self.num_bits_bias, None, None, handling_qtensors=False
                 )
         return QTensor(F.linear(x._t, self.weight, self.bias), scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
 
@@ -345,7 +345,7 @@ class QLinear(QuantizableModule, nn.Linear):
         w_zeroed = w._t - w.zero
 
         # low bitwidth w @ x + b forward pass
-        out = F.linear(x_zeroed,  w_zeroed, bias=b)
+        out = F.linear(x_zeroed, w_zeroed, bias=b)
 
         # distributivity (see jacob et al 2018, sec 2.2)
         multiplier = (x.scale * w.scale) / self.scale
@@ -622,13 +622,12 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         fakeq_out = [
                     self.out_listener(
-                        QTensor(fp_o, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False
-                    ))
+                        QTensor(fp_o, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
+                    )
                 if not isinstance(fp_o, (QTensor, type(None)))
                 else fp_o
             for fp_o in fp_out
         ]
-
 
         return tuple(fakeq_out) if len(fakeq_out) > 1 else fakeq_out[0]
 
@@ -907,6 +906,7 @@ class QListener(QuantizableModule):
         # attach plotter to self if plot_name is given
         if plot_name is not None:
             self.qplotter = QPlotter(plot_name=plot_name, **qkwargs)
+            self.mods += [self.qplotter] # set stats
         else:
             self.qplotter = lambda x, **kwargs: x
 
@@ -967,9 +967,9 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         if self.distribution_kind != DistKind.CLIPPED:
             self.__stats__ = defaultdict()
-            # TODO FIXME is this still necessary?
-            for module in self.mods:
-                setattr(module, self.name+'__stats__', self.__stats__)
+            # # TODO FIXME is this still necessary?
+            # for module in self.mods:
+            #     setattr(module, self.name+'__stats__', self.__stats__)
 
         threshs = qkwargs["thresholds"].lower()
         if "symm" in threshs:
@@ -1104,8 +1104,8 @@ by initializing it with clipped_distr: bool given as kwarg.
             new_val = dict_new_vals[key]
             self.__stats__[key] -= (1 - self.ema_decay) * (ema - new_val)
 
-        for module in self.mods:
-            setattr(module, self.name+'__stats__', self.__stats__)
+        # for module in self.mods:
+        #     setattr(module, self.name+'__stats__', self.__stats__)
 
     def quantize(self):
         if self.set_qparams_during_quantization:
@@ -1227,11 +1227,11 @@ class QPlotter(QuantizableModule):
         if not os.path.exists(latests_dir):
             os.mkdir(latests_dir)
         # will create copy of file when plotting:
-        latest_copy = self.name+"_latest." + ext
-        self.latest_path = os.path.join(latests_dir, latest_copy)
+        latest_copy = self.name+"_latest_{}." + ext
+        self.latest_path = lambda: os.path.join(latests_dir, latest_copy.format(self.stage_str()))
 
         # encoding of path of copy of latest png for saving in backward context
-        self.encoded_latest_copy = torch.Tensor(list(map(ord, latest_copy)))
+        self.encoded_latest_copy = lambda: torch.Tensor(list(map(ord, latest_copy.format(self.stage_str()))))
 
         class PlotHackFn(torch.autograd.Function):
             """
@@ -1241,7 +1241,7 @@ class QPlotter(QuantizableModule):
             """
             @staticmethod
             def forward(ctx, x: torch.Tensor):
-                ctx.save_for_backward(self.encoded_latest_copy)
+                ctx.save_for_backward(self.encoded_latest_copy())
                 return x
 
             @staticmethod
@@ -1252,7 +1252,7 @@ class QPlotter(QuantizableModule):
         self.plot_hack_fn = PlotHackFn.apply
 
     def forward_fp(self, x: Tensor, dont_plot=False) -> None:
-        # self._log(x, dont_plot=dont_plot)
+        self._log(x, dont_plot=dont_plot)
         return self.plot_hack_fn(x)
 
     def forward_calib(self, x, *args, **kwargs):
@@ -1271,7 +1271,7 @@ class QPlotter(QuantizableModule):
         out = self.plot_hack_fn(x._t)
         return QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
-    def _log(self,x: Union[Tensor, QTensor], dont_plot=False):
+    def _log(self, x: Union[Tensor, QTensor], dont_plot=False):
         bins = None
         if isinstance(x, QTensor):
             data, scale, zero = x._t, x.scale, x.zero
@@ -1280,8 +1280,8 @@ class QPlotter(QuantizableModule):
                 # print(f"Tensor unique values ^")
                 # assert not x.quantized
                 a = ( 0 - zero) * scale
-                b = (255 - zero) * scale
-                size = (b-a)/255
+                b = ((2**self.num_bits-1) - zero) * scale
+                size = (b-a)/(2**self.num_bits-1)
             else:
                 # data is quantized
                 vmin, vmax = data.min(), data.max()
@@ -1301,33 +1301,38 @@ class QPlotter(QuantizableModule):
 
                 assert x.quantized
                 a = 0
-                b = 255
+                b = 2**self.num_bits-1
                 size = 1
             # get bins
             bins = np.arange(a,b+size,size)
-            info = f",scale={round(scale,3)}, zero={round(zero,3)}"
+            info = f";\nscale={round(scale,3)}, zero={round(zero,3)}"
         else:
             bins = self.float_bins
             data = x
             info = ""
+        if hasattr(self, "min"):
+            assert hasattr(self, "max")
+            info += f";\nmin={round(self.min, 2)}, max={round(self.max,2)}"
 
-            # Original idea to investigate binning:
+            # Original idea to investigate binning: Log Variance
             # sorted_data = data.reshape(-1).sort()[0]
             # shifts = (sorted_data - sorted_data.roll(1))
             # weighted_var = shifts.var()/(data.max()-data.min())
             # print(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
-        count = self.stage_counters[self.stage_str()]
+        stage_str = self.stage_str()
+        count = self.stage_counters[stage_str]
         # sometimes store matplotlib histogram
-        plot_because_idx = count in self.stage_plot_indices[self.stage_str()]
-        freq = self.stage_plot_freqs[self.stage_str()]
+        plot_because_idx = count in self.stage_plot_indices[stage_str]
+        freq = self.stage_plot_freqs[stage_str]
         plot_because_freq = False if freq <= 0 else count % freq == 0
 
         if not dont_plot and (plot_because_idx or plot_because_freq): # and stage==QuantStage.Quantized:
             plot_data = data.detach().reshape(-1).cpu().numpy()
             plt.hist(plot_data, bins=bins)
-            stage_str = self.stage_str()
-            plt.gca().set(title=stage_str+f" histogram of {self.name} at batch #{count}"+info, ylabel="Frequency of bin")
+            plt.ylabel("Frequency of bin")
+            plt.title(stage_str+f" hist ({self.name}), batch #{count}"+info, fontsize=10)
+            plt.gcf()
 
             # save
             fig_path = os.path.join(self.plot_dir, stage_str, self.plot_tmpl.format(stage_str, self.name, count))
@@ -1335,11 +1340,11 @@ class QPlotter(QuantizableModule):
             plt.savefig(fig_path)
             # update latest png (have to write png instead of symlink to above fig_path,
             # because graphviz considers symlinks unsafe)
-            plt.savefig(self.latest_path)
+            plt.savefig(self.latest_path())
             plt.gcf().clear()
 
         if not dont_plot:
-            self.stage_counters[self.stage_str()] += 1
+            self.stage_counters[stage_str] += 1
 
 
 # these must be updated in every module that adds QuantizableModules in need of a listener
@@ -1348,12 +1353,15 @@ CLIPPING_MODULES = [
     QReLU6,
     nn.ReLU6,
     nn.ReLU
-] # comprehensive list of modules that output clipped distribution
+] # ^ comprehensive list of modules that output clipped distribution
+
 SYMMETRIZING_MODULES = [
     nn.BatchNorm1d,
     nn.BatchNorm2d,
     nn.Linear,
     QMatMul,
     QFill,
-] # comprehensive list of modules that output symmetric distribution
+] # ^ comprehensive list of modules that output symmetric distribution
 
+# import these lists to files that define relevant modules (batchnorm.py)
+# and add relevant modules to given list

@@ -34,23 +34,16 @@ class Quantization():
     def quantize_to_qtensor_using_range(self, x: Tensor, num_bits: int, min_val: Optional[float]=None, max_val: Optional[float]=None):
         pass
 
-    # def quantize_to_torch_tensor(self, x: Tensor, num_bits: int, min_val: Optional[float]=None, max_val: Optional[float]=None):
-    #     pass
-
     def quantize_to_qtensor_given_scale(self, x: Tensor, scale: float, zero: float, num_bits: int) -> QTensor:
         pass
 
     def calc_params(self, min_val: float, max_val: float, num_bits: int):
         pass
 
-    def dequantize_qtensor(self, q_x: QTensor):
-        pass
 
     def tensor_clamp(self, x: Tensor, num_bits: int):
         pass
 
-    def dequantize(self, qt: QTensor):
-        pass
 
 
 class UniformQuantization(Quantization):
@@ -101,23 +94,6 @@ class UniformQuantization(Quantization):
         q_x = self._quantize_tensor_using_params(x, scale=scale, zero=zero, num_bits=num_bits)
         return QTensor(q_x, scale=scale, zero=zero, quantized=quantized, num_bits=num_bits, symmetric=False)
 
-    # def quantize_to_torch_tensor(
-    #         self,
-    #         x: QTensor,
-    #         qparams: Dict[str, Union[float,int]],
-    #         num_bits: int,
-    #         min_val: Optional[float]=None,
-    #         max_val: Optional[float]=None,
-    #     ) -> Tensor:
-    #     # updates globally used qparams dict in place instead of returning QTensor
-
-    #     q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
-
-    #     qparams["scale"] = scale
-    #     qparams["zero"] = zero
-
-    #     return q_x
-
     def calc_params(self, min_val: float, max_val: float, num_bits: int, nudge: bool=True) -> Tuple[float,Union[float, int]]:
         qmin = 0.
         qmax = 2. ** num_bits - 1.
@@ -129,6 +105,7 @@ class UniformQuantization(Quantization):
         # scale ist quasi die unit länge in der quantisierten range
         scale = (max_val - min_val) / (qmax - qmin)
 
+        # r = s * (q - z)
         initial_zero = qmin - min_val / scale
 
         """
@@ -148,9 +125,6 @@ class UniformQuantization(Quantization):
                 zero = initial_zero
 
         return scale, zero
-
-    def dequantize_qtensor(self, q_x: QTensor) -> Tensor:
-        return q_x.scale * (q_x._t - q_x.zero)
 
     def tensor_clamp(self, x: Tensor, num_bits, up=None) -> Tensor:
         if up is not None:
@@ -174,7 +148,7 @@ class UniformQuantization(Quantization):
 
 class UniformSymmetricQuantization(Quantization):
     """
-    Uniform symmetric quantization.
+    Uniform symmetric quantization, used for most weights. Symmetric around 0. zero == 0, always.
     """
 
     def _quantize_tensor(self, x:Tensor, num_bits, min_val=None, max_val=None) -> Tuple[Tensor, float, float]:
@@ -215,18 +189,6 @@ class UniformSymmetricQuantization(Quantization):
 
         return QTensor(q_x, scale=scale, zero=zero, symmetric=True, num_bits=num_bits, quantized=quantized)
 
-    # def quantize_to_torch_tensor(self, x: Tensor, qparams: Dict[str, float], num_bits: int, min_val: Optional[float]=None, max_val: Optional[float]=None) -> Tensor:
-    #     # updates globally used qparams dict in place instead of returning QTensor
-
-    #     q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
-
-    #     qparams["scale"] = scale
-    #     qparams["zero"] = zero
-
-    #     return q_x
-
-    def dequantize_qtensor(self, qx: QTensor) -> Tensor:
-        return (qx._t - qx.zero) * qx.scale
 
 class FakeQuant(torch.autograd.Function):
     """
@@ -241,13 +203,6 @@ class FakeQuant(torch.autograd.Function):
             args = [args[0]._t] + list(args[1:])
 
         out, scale, zero = FakeQuant.apply(*args)
-        # try:
-        #     out, scale, zero = FakeQuant.apply(*args)
-        # except Exception as e:
-        #     print("got exception in fakequan apply; here are args:")
-        #     print(args)
-        #     print("exception gotten:")
-        #     print(f"{type(e)}:{e}")
         scale, zero = scale.item(), zero.item()
 
         if handling_qtensors:
