@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.nn import functional, init
-from utils import xavier_uniform
+from .utils import xavier_uniform
 from .quantizable_layer import \
     QuantStub, DeQuantStub, \
     QListener, \
