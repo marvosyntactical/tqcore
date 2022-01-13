@@ -82,14 +82,15 @@ def qadd(
     assert a.num_bits==num_bits_a
     assert b.num_bits==num_bits_b
 
+    denom = a.scale + b.scale
+
     a_dq = (a._t - a.zero) * a.scale
     b_dq = (b._t - b.zero) * b.scale
 
     a_rq = a_dq / scale_next + zero_next
     b_rq = b_dq / scale_next + zero_next
 
-    # TODO derive this rescaling
-    denom = a.scale + b.scale
+    # # # TODO derive this rescaling
     a_rq *= a.scale / denom
     b_rq *= b.scale / denom
 
@@ -113,7 +114,6 @@ def qadd(
         # rescale if necessary:
         qmax = (2.**num_bits_out)-1.
         if (r > qmax).any():
-            # print(f"\nit did that thing :(\n")
             # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
             re_scale = r.max().item() / qmax
             r = r / re_scale

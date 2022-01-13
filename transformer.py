@@ -302,7 +302,7 @@ class QMultiHeadedAttention(nn.Module):
             scores = self.qMask(scores, mask)
             print(f"Got mask={mask!=0}")
             print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
-            self.qMaskl(scores)
+            scores = self.qMaskl(scores)
 
         # # normalize context vectors.
         attention = self.qsoftmax(scores)
@@ -317,7 +317,6 @@ class QMultiHeadedAttention(nn.Module):
         context = context.transpose(1, 2).contiguous().view(
             batch_size, -1, num_heads * self.head_size
         )
-
         output = self.output_layer(context)
 
         return output
@@ -458,8 +457,8 @@ class QTransformerEncoderLayer(nn.Module):
             )
         if self.has_bn:
             self.norm1 = BatchNormMod(dim, momentum=bn_mom, qkwargs=qkwargs, **kwargs)
-            if not self.has_res2:
-                self.norm1l = QListener(self.norm1, plot_name=pn("norm 1"), **qkwargs)
+            # if not self.has_res2:
+            self.norm1l = QListener(self.norm1, plot_name=pn("norm 1"), **qkwargs)
 
         self.feed_forward = QPositionwiseFeedForward(
             dim,
@@ -518,8 +517,8 @@ class QTransformerEncoderLayer(nn.Module):
 
         if self.has_bn:
             h = self.norm1(res1)
-            if not self.has_res2:
-                h = self.norm1l(h)
+            # if not self.has_res2:
+            h = self.norm1l(h)
         else:
             h = res1
 
@@ -659,7 +658,7 @@ class QTransformerEncoder(nn.Module):
         """
 
         # data normalization happens in data.py
-        # x = (x - x.mean()) / x.std()
+        x = (x - x.mean()) / x.std()
 
         x = self.quantStub(x)
         x = self.input_listener(x)
@@ -700,13 +699,6 @@ class QTransformerEncoder(nn.Module):
 
     def __str__(self):
         if not self.layers[0].fft:
-            pass
-            # TODO uncomment after removing has_mix/has_bn/has_res .... # FIXME
-            # s = "%s(num_layers=%r, num_heads=%r)" % (
-            #     self.__class__.__name__, len(self.layers),
-            #     self.layers[0].mixer.fp_module.num_heads,
-            #     self.layers[0].mixer.num_heads,
-            # )
             s = f"{self.__class__.__name__}:(\n"
             s += f"\t(quantStub): {self.quantStub}\n"
             s += f"\t(embedding): {self.embedding}\n"

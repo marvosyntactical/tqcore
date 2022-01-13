@@ -46,8 +46,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         """
         assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
 
-        # TODO assign these tensors permanently during .quantize() ....
-        # (this falls under optimization tho and would not appease mr knuth)
+        # TODO assign these qtensors permanently during .quantize()
 
         gamma = self.weight_quantization.quantize_to_qtensor_using_range(
             self.folded_weight,
@@ -180,7 +179,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         eps = torch.sqrt(torch.Tensor([self.eps])).to(self.running_var.device)
 
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
-        self.folded_weight = (self.weight * inv_running_std)\
+        self.folded_weight = (self.weight * inv_running_std) \
                 .unsqueeze(0).unsqueeze(-1)
 
         self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
