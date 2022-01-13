@@ -472,13 +472,17 @@ class QTransformerEncoderLayer(nn.Module):
         )
 
         if self.has_res2:
-            assert self.has_bn
             self.dropout2 = nn.Dropout(dropout)
             self.add2 = QAdd(**qkwargs)
-            self.add2l = QListener(
+            add2_layers = [
                 self.add2,
                 self.feed_forward.pwff_layer._modules[str(len(self.feed_forward.pwff_layer._modules)-1)],
-                self.norm1,
+            ]
+            if hasattr(self, "norm1"):
+                add2_layers += [self.norm1]
+
+            self.add2l = QListener(
+                * add2_layers,
                 clipped_distr=False,
                 plot_name=pn("residual 2"),
                 **qkwargs
@@ -575,7 +579,8 @@ class QTransformerEncoder(nn.Module):
              time_window: int = 24,
              activ: str = "nn.ReLU6",
              fft: bool = False,
-             qkwargs: Dict = None
+             qkwargs: Dict = None,
+             learnable_label: bool = False,
         ):
         """
         Initializes the Transformer. NOTE: you still have to set self.mu, self.sigma later!
@@ -597,6 +602,10 @@ class QTransformerEncoder(nn.Module):
 
         self.embedding = linear_cls(src_dim, dim, qkwargs=qkwargs)
         self.emb_listener = QListener(self.embedding, plot_name="embedding", **qkwargs)
+
+        self.learnable_label = learnable_label
+        if learnable_label:
+            self.label = nn.Parameter(torch.randn(1,1,dim))
 
         # TODO FIXME add these again
         self.has_pe = qkwargs["transformer"]["has_pe"]
@@ -662,6 +671,9 @@ class QTransformerEncoder(nn.Module):
         x = self.embedding(x)
         x = self.emb_listener(x)
 
+        if self.learnable_label:
+            src_embedded = torch.cat([x, self.label.expand(x.shape[0],-1,-1)], dim=1)
+
         # if self_is_quant:
         #     assert x.quantized
 
@@ -684,7 +696,6 @@ class QTransformerEncoder(nn.Module):
             pass
         for i, layer in enumerate(self.layers):
             x = layer(x, mask)
-
         return x
 
     def __str__(self):
@@ -732,9 +743,12 @@ class QTSTModel(nn.Module):
             fc_dropout: float = 0.0,
             fft: bool = False,
             qkwargs: Dict = None,
+            learnable_label: bool = False,
             **kwargs # settings for quantizable modules
         ):
         super().__init__()
+
+        self.learnable_label = learnable_label
 
         if encoder is not None:
             self.encoder = encoder
@@ -752,6 +766,7 @@ class QTSTModel(nn.Module):
                 activ=activ,
                 fft=fft,
                 qkwargs=qkwargs,
+                learnable_label=learnable_label,
             )
 
         self.task = task = task.lower()
@@ -780,10 +795,15 @@ class QTSTModel(nn.Module):
             ]
         elif "cl" in task:
             # classification: predict distribution over n labels (Softmax in CrossEntropyLoss)
-            head += [
-                nn.Flatten(1),
-                linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
-            ]
+            if not self.learnable_label:
+                head += [
+                    nn.Flatten(1),
+                    linear_cls(time_window * dim, n_labels, qkwargs=qkwargs),
+                ]
+            else:
+                head += [
+                    nn.Linear(dim, n_labels),
+                ]
             head += [
                 QListener(head[-1], plot_name="head", **qkwargs),
                 DeQuantStub(**qkwargs),
@@ -799,7 +819,8 @@ class QTSTModel(nn.Module):
     def forward(self, src, mask=None):
 
         h = self.encoder(src, mask)
-        out = self.head(h)
+        head_inp = h if not self.learnable_label else h[:,-1,:]
+        out = self.head(head_inp)
 
         return out
 
