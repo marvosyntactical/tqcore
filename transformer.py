@@ -19,6 +19,7 @@ from .quantizable_layer import \
     QSoftmax, \
     QPositionalEncoding, \
     QFill, \
+    QCat, \
     QReLU6, \
     QLinear, \
     FFT, \
@@ -35,171 +36,171 @@ linear_cls = QLinear
 # NOTE the following modules are copied from tst to avoid this import:
 # from tst.transformer import MultiHeadedAttention, MaskedMSE, XentLoss
 
-class MultiHeadedAttention(nn.Module):
-    """
-    Multi-Head Attention module from "Attention is All You Need".
+# class MultiHeadedAttention(nn.Module):
+#     """
+#     Multi-Head Attention module from "Attention is All You Need".
+#
+#     Implementation modified from JoeyNMT.
+#     https://github.com/joeynmt/joeynmt/blob/master/joeynmt/transformer_layers.py
+#
+#     Implementation therein modified from OpenNMT-py.
+#     https://github.com/OpenNMT/OpenNMT-py
+#     """
 
-    Implementation modified from JoeyNMT.
-    https://github.com/joeynmt/joeynmt/blob/master/joeynmt/transformer_layers.py
+#     def __init__(self, num_heads: int, dim: int, dropout: float = 0.1):
+#         """
+#         Create a multi-headed attention layer.
+#         :param num_heads: the number of heads
+#         :param dim: model dim (must be divisible by num_heads)
+#         :param dropout: probability of dropping a unit
+#         """
+#         super().__init__()
+# 
+#         assert dim % num_heads == 0
+# 
+#         self.head_size = head_size = dim // num_heads
+#         self.model_size = dim
+#         self.num_heads = num_heads
+# 
+#         self.k_layer = nn.Linear(dim, num_heads * head_size)
+#         self.v_layer = nn.Linear(dim, num_heads * head_size)
+#         self.q_layer = nn.Linear(dim, num_heads * head_size)
+# 
+#         self.output_layer = nn.Linear(dim, dim)
+#         self.softmax = nn.Softmax(dim=-1)
+#         self.dropout = nn.Dropout(dropout)
+# 
+#     def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Optional[Tensor] = None):
+#         """
+#         Computes multi-headed attention.
+# 
+#         :param k: keys   [B, W, D] with W being the time window.
+#         :param v: values [B, W, D]
+#         :param q: query  [B, W, D]
+#         :param mask: optional mask [B, 1, W]
+#         :return:
+#         """
+#         batch_size = k.size(0)
+#         num_heads = self.num_heads
+# 
+#         # project the queries (q), keys (k), and values (v)
+#         k = self.k_layer(k)
+#         v = self.v_layer(v)
+#         q = self.q_layer(q)
+# 
+#         # reshape q, k, v for our computation to (batch_size, num_heads, ..., ...)
+#         k = k.view(batch_size, num_heads, self.head_size, -1)
+#         v = v.view(batch_size, num_heads, -1, self.head_size)
+#         q = q.view(batch_size, num_heads, -1, self.head_size)
+# 
+#         # compute scores
+#         q = q / math.sqrt(self.head_size)
+# 
+#         # batch x num_heads x query_len x key_len
+#         scores = q @ k
+# 
+#         # apply the mask (if we have one)
+#         # we add a dimension for the heads to it below: [B, 1, 1, W]
+#         if mask is not None:
+#             mask = mask.unsqueeze(1).unsqueeze(1)
+#             scores = scores.masked_fill(mask==torch.as_tensor(False), float('-inf'))
+#             # scores = scores.masked_fill(~mask, -1e10)
+# 
+#         # DONT apply attention dropout and compute context vectors.
+#         attention = self.softmax(scores)
+#         attention = self.dropout(attention)
+# 
+#         # get context vector (select values with attention) and reshape
+#         # back to [B, W, D]
+#         context = attention @ v
+#         context = context.transpose(1, 2).contiguous().view(
+#             batch_size, -1, num_heads * self.head_size
+#         )
+# 
+#         output = self.output_layer(context)
+# 
+#         return output
+# 
+# 
+# class MaskedMSE(nn.Module):
+#     """
+#     from stackoverflow:
+#     https://discuss.pytorch.org/t/how-to-write-a-loss-function-with-mask/53461/
+#     """
+#     def __init__(self, *args, **kwargs):
+#         super().__init__()
+# 
+#     def forward(self, pred, trgt, mask):
+#         # mask is
+#         # 1 where loss should be considered,
+#         # 0 where it should be dropped
+#         return (((pred-trgt)*mask)**2).sum() / mask.sum()
+# 
+# class XentLoss(nn.Module):
+#     """
+#     taken from: https://github.com/joeynmt/joeynmt/blob/master/joeynmt/loss.py
+#     Cross-Entropy Loss with optional label smoothing
+#     """
+# 
+#     def __init__(self, n_labels: int, smoothing: float = 0.0):
+#         super().__init__()
+# 
+#         self.smoothing = smoothing
+#         self.n_labels = n_labels
+# 
+#         if self.smoothing <= 0.0:
+#             # standard xent loss
+#             self.criterion = nn.NLLLoss(reduction='sum')
+#         else:
+#             # custom label-smoothed loss, computed with KL divergence loss
+#             self.criterion = nn.KLDivLoss(reduction='sum')
+# 
+#     def _smooth_targets(self, targets: Tensor, n_labels: int = None):
+#        """
+#        Smooth target distribution. All non-reference words get uniform
+#        probability mass according to "smoothing".
+#        :param targets: target indices, batch
+#        :param n_labels:
+#        :return: smoothed target distributions, batch x n_labels
+#        """
+#        if n_labels is None:
+#            n_labels = self.n_labels
+# 
+#        # batch x n_labels
+#        smooth_dist = targets.new_zeros((targets.size(0), n_labels)).float()
+#        # fill distribution uniformly with smoothing
+#        smooth_dist.fill_(self.smoothing / (n_labels - 2))
+#        # assign true label the probability of 1-smoothing ("confidence")
+#        smooth_dist.scatter_(1, targets.unsqueeze(1).data, 1.0-self.smoothing)
+# 
+#        return Variable(smooth_dist, requires_grad=False)
+# 
+#     def forward(self, outputs, targets):
+#         """
+#         Compute the cross-entropy between logits and targets.
+#         If label smoothing is used, target distributions are not one-hot, but
+#         "1-smoothing" for the correct target token and the rest of the
+#         probability mass is uniformly spread across the other tokens.
+#         :param outputs: values as predicted by model
+#         :param targets: target indices
+#         :return:
+#         """
+#         log_probs = F.log_softmax(outputs)
+# 
+#         if self.smoothing > 0:
+#             targets = self._smooth_targets(
+#                 targets=targets.contiguous().view(-1),
+#                 n_labels=log_probs.size(-1))
+#             # targets: distributions with batch x n_labels
+#             assert log_probs.contiguous().view(-1, log_probs.size(-1)).shape \
+#                 == targets.shape
+#         else:
+#             # targets: indices with batch
+#             targets = targets.contiguous().view(-1)
+#         loss = self.criterion(
+#                 log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
+#         return loss
 
-    Implementation therein modified from OpenNMT-py.
-    https://github.com/OpenNMT/OpenNMT-py
-    """
-
-    def __init__(self, num_heads: int, dim: int, dropout: float = 0.1):
-        """
-        Create a multi-headed attention layer.
-        :param num_heads: the number of heads
-        :param dim: model dim (must be divisible by num_heads)
-        :param dropout: probability of dropping a unit
-        """
-        super().__init__()
-
-        assert dim % num_heads == 0
-
-        self.head_size = head_size = dim // num_heads
-        self.model_size = dim
-        self.num_heads = num_heads
-
-        self.k_layer = nn.Linear(dim, num_heads * head_size)
-        self.v_layer = nn.Linear(dim, num_heads * head_size)
-        self.q_layer = nn.Linear(dim, num_heads * head_size)
-
-        self.output_layer = nn.Linear(dim, dim)
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Optional[Tensor] = None):
-        """
-        Computes multi-headed attention.
-
-        :param k: keys   [B, W, D] with W being the time window.
-        :param v: values [B, W, D]
-        :param q: query  [B, W, D]
-        :param mask: optional mask [B, 1, W]
-        :return:
-        """
-        batch_size = k.size(0)
-        num_heads = self.num_heads
-
-        # project the queries (q), keys (k), and values (v)
-        k = self.k_layer(k)
-        v = self.v_layer(v)
-        q = self.q_layer(q)
-
-        # reshape q, k, v for our computation to (batch_size, num_heads, ..., ...)
-        k = k.view(batch_size, num_heads, self.head_size, -1)
-        v = v.view(batch_size, num_heads, -1, self.head_size)
-        q = q.view(batch_size, num_heads, -1, self.head_size)
-
-        # compute scores
-        q = q / math.sqrt(self.head_size)
-
-        # batch x num_heads x query_len x key_len
-        scores = q @ k
-
-        # apply the mask (if we have one)
-        # we add a dimension for the heads to it below: [B, 1, 1, W]
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(1)
-            scores = scores.masked_fill(mask==torch.as_tensor(False), float('-inf'))
-            # scores = scores.masked_fill(~mask, -1e10)
-
-        # DONT apply attention dropout and compute context vectors.
-        attention = self.softmax(scores)
-        attention = self.dropout(attention)
-
-        # get context vector (select values with attention) and reshape
-        # back to [B, W, D]
-        context = attention @ v
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, -1, num_heads * self.head_size
-        )
-
-        output = self.output_layer(context)
-
-        return output
-
-# this file contains quantized versions of layers used in tst_pytorch/modules.py
-
-class MaskedMSE(nn.Module):
-    """
-    from stackoverflow:
-    https://discuss.pytorch.org/t/how-to-write-a-loss-function-with-mask/53461/
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-
-    def forward(self, pred, trgt, mask):
-        # mask is
-        # 1 where loss should be considered,
-        # 0 where it should be dropped
-        return (((pred-trgt)*mask)**2).sum() / mask.sum()
-
-class XentLoss(nn.Module):
-    """
-    taken from: https://github.com/joeynmt/joeynmt/blob/master/joeynmt/loss.py
-    Cross-Entropy Loss with optional label smoothing
-    """
-
-    def __init__(self, n_labels: int, smoothing: float = 0.0):
-        super().__init__()
-
-        self.smoothing = smoothing
-        self.n_labels = n_labels
-
-        if self.smoothing <= 0.0:
-            # standard xent loss
-            self.criterion = nn.NLLLoss(reduction='sum')
-        else:
-            # custom label-smoothed loss, computed with KL divergence loss
-            self.criterion = nn.KLDivLoss(reduction='sum')
-
-    def _smooth_targets(self, targets: Tensor, n_labels: int = None):
-       """
-       Smooth target distribution. All non-reference words get uniform
-       probability mass according to "smoothing".
-       :param targets: target indices, batch
-       :param n_labels:
-       :return: smoothed target distributions, batch x n_labels
-       """
-       if n_labels is None:
-           n_labels = self.n_labels
-
-       # batch x n_labels
-       smooth_dist = targets.new_zeros((targets.size(0), n_labels)).float()
-       # fill distribution uniformly with smoothing
-       smooth_dist.fill_(self.smoothing / (n_labels - 2))
-       # assign true label the probability of 1-smoothing ("confidence")
-       smooth_dist.scatter_(1, targets.unsqueeze(1).data, 1.0-self.smoothing)
-
-       return Variable(smooth_dist, requires_grad=False)
-
-    def forward(self, outputs, targets):
-        """
-        Compute the cross-entropy between logits and targets.
-        If label smoothing is used, target distributions are not one-hot, but
-        "1-smoothing" for the correct target token and the rest of the
-        probability mass is uniformly spread across the other tokens.
-        :param outputs: values as predicted by model
-        :param targets: target indices
-        :return:
-        """
-        log_probs = F.log_softmax(outputs)
-
-        if self.smoothing > 0:
-            targets = self._smooth_targets(
-                targets=targets.contiguous().view(-1),
-                n_labels=log_probs.size(-1))
-            # targets: distributions with batch x n_labels
-            assert log_probs.contiguous().view(-1, log_probs.size(-1)).shape \
-                == targets.shape
-        else:
-            # targets: indices with batch
-            targets = targets.contiguous().view(-1)
-        loss = self.criterion(
-                log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
-        return loss
 
 class QMultiHeadedAttention(nn.Module):
     """
@@ -249,7 +250,9 @@ class QMultiHeadedAttention(nn.Module):
 
         qsoft = qkwargs["transformer"]["qsoftmax"]
         if qsoft:
-            self.qsoftmax = QSoftmax(dim=-1, layer_num=layer_num, **qkwargs)
+            self.qsoftmax = QSoftmax(
+                dim=-1, layer_num=layer_num, **qkwargs
+            )
         else:
             self.qsoftmax = NonQuantizableModuleWrap(
                 nn.Softmax(dim=-1), **qkwargs
@@ -300,8 +303,6 @@ class QMultiHeadedAttention(nn.Module):
         if mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(1)
             scores = self.qMask(scores, mask)
-            print(f"Got mask={mask!=0}")
-            print(f"qMaskl was activated! qMaskl.__stats__: {self.qMaskl.__stats__}")
             scores = self.qMaskl(scores)
 
         # # normalize context vectors.
@@ -422,14 +423,15 @@ class QTransformerEncoderLayer(nn.Module):
                 )
             BatchNormMod = wrapped_bn
 
-        mix_output_layer = []
+        mix_output_layer = [] # layer that should be updated by next listener
         if self.has_mix:
             if not self.fft:
                 if self.qattn:
                     self.mixer = QMultiHeadedAttention(
                         num_heads, dim,
                         dropout=dropout,
-                        layer_num=layer_num, **qkwargs)
+                        layer_num=layer_num, **qkwargs
+                    )
                     mix_output_layer = [self.mixer.output_layer]
                 else:
                     self.mixer = NonQuantizableModuleWrap(
@@ -437,8 +439,8 @@ class QTransformerEncoderLayer(nn.Module):
                             num_heads, dim, dropout=dropout
                         ), plot_name=pn("fp softmax"), **qkwargs
                     )
+                    mix_output_layer = []
 
-                    mix_output_layer = [] # layer that should be updated by next listener
                 # mix_output_layer = [self.mixer.fp_module]
                 self.mix = lambda x, mask: self.mixer(x,x,x,mask)
             else:
@@ -541,18 +543,13 @@ class QTransformerEncoderLayer(nn.Module):
         s = "QTransformerEncoderLayer(\n"
         if self.has_mix:
             s += f"\t(mix): {self.mix}\n"
-
         if self.has_res1:
             s += f"\t(res1): {self.add1}\n"
-
         if self.has_bn:
             s += f"\t(bn1): {self.norm1}\n"
-
         s += f"\t(ff): {self.feed_forward}\n"
-
         if self.has_res2:
             s += f"\t(res2): {self.add2}\n"
-
         if self.has_bn:
             s += f"\t(bn2): {self.norm2}\n"
         s += ")"
@@ -604,7 +601,9 @@ class QTransformerEncoder(nn.Module):
 
         self.learnable_label = learnable_label
         if learnable_label:
+            # raise NotImplementedError("not properly implemented for qtransformer: make parameter quantizable")
             self.label = nn.Parameter(torch.randn(1,1,dim))
+            self.qcat = QCat(**qkwargs)
 
         # TODO FIXME add these again
         self.has_pe = qkwargs["transformer"]["has_pe"]
@@ -671,7 +670,7 @@ class QTransformerEncoder(nn.Module):
         x = self.emb_listener(x)
 
         if self.learnable_label:
-            src_embedded = torch.cat([x, self.label.expand(x.shape[0],-1,-1)], dim=1)
+            src_embedded = self.qcat([x, self.label.expand(x.shape[0],-1,-1)], dim=1)
 
         # if self_is_quant:
         #     assert x.quantized
@@ -794,7 +793,7 @@ class QTSTModel(nn.Module):
                 ]
             else:
                 head += [
-                    nn.Linear(dim, n_labels),
+                    linear_cls(dim, n_labels, qkwargs=qkwargs),
                 ]
             head += [
                 QListener(head[-1], plot_name="head", **qkwargs),

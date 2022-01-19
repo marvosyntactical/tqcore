@@ -16,7 +16,7 @@ import os
 is_integer = lambda t: ((t.round()==t).all() if t.shape else t.round()==t)
 
 
-def one_step_lstm(lstm: torch.nn.Module, data: Tensor) -> Tensor:
-    return out
+# def one_step_lstm(lstm: torch.nn.Module, data: Tensor) -> Tensor:
+#     return out
 
 

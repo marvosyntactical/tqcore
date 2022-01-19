@@ -26,9 +26,11 @@ from collections import Counter
 import numpy as np
 from scipy.stats import entropy
 import matplotlib.pyplot as plt
-import warnings
+import logging
 
 import torch
+
+calib_logger = logging.getLogger(name="calib")
 
 class HistogramCalibrator:
     """
@@ -123,7 +125,7 @@ class HistogramCalibrator:
             # add new sample to extended support:
             hist, self._calib_bin_edges = np.histogram(x_np, bins=self._calib_bin_edges)
             # add old histogram to middle part of support
-            print([arr.shape for arr in [hist[begin_old:len(self._calib_hist)], self._calib_hist]])
+            # print([arr.shape for arr in [hist[begin_old:len(self._calib_hist)], self._calib_hist]])
             hist[begin_old:len(self._calib_hist)+begin_old] += self._calib_hist
             # save updated histogram
             self._calib_hist = hist
@@ -206,13 +208,13 @@ class HistogramCalibrator:
         left_hist = hist[left_support[:-1]]
         left_bin_edges = bin_edges[left_support]
 
-        print("~"*20)
-        print("computing range for:", title)
-        print(f"leftmost bin edge={bin_edges[0]}; rightmost bin edge={bin_edges[-1]}")
-        print(f"right support nbins={right_support.sum()}; N={right_hist.sum()}")
-        print(f"mu={mu}")
-        print(f"left support nbins={left_support.sum()}; N={left_hist.sum()}")
-        print("~"*20)
+        calib_logger.info("~"*20)
+        calib_logger.info("computing range for:", title)
+        calib_logger.info(f"leftmost bin edge={bin_edges[0]}; rightmost bin edge={bin_edges[-1]}")
+        calib_logger.info(f"right support nbins={right_support.sum()}; N={right_hist.sum()}")
+        calib_logger.info(f"mu={mu}")
+        calib_logger.info(f"left support nbins={left_support.sum()}; N={left_hist.sum()}")
+        calib_logger.info("~"*20)
 
         # reverse left hist because compute_one_bound computes righthand side threshold
         _, threshold_right = self.compute_one_bound(
@@ -300,7 +302,7 @@ class HistogramCalibrator:
             digitized_space[bin_counts[:i] == 0] = -1
 
             # if not right:
-            #     # print(f"digitized_space={digitized_space}")
+            # print(f"digitized_space={digitized_space}")
 
             for idx, digitized in enumerate(digitized_space):
                 if digitized != -1:
@@ -312,7 +314,7 @@ class HistogramCalibrator:
                     new_density_counts[key] = new_density_counts[key] / val
 
             # if not right:
-            #     # print(f"new_density_counts={new_density_counts}")
+            # print(f"new_density_counts={new_density_counts}")
 
             new_density = np.zeros(i, dtype=np.float64)
             for idx, digitized in enumerate(digitized_space):

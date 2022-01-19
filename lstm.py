@@ -1,12 +1,12 @@
 """
 Implementation of quantized batch-normalized LSTM.
-This file is from
+This file is adapted from
 jinhunchoi's implementation of BNLSTM at
 https://raw.githubusercontent.com/jihunchoi/recurrent-batch-normalization-pytorch/master/bnlstm.py
 and extended with some more LSTM wrapper modules
 
 # NOTE TODO
-Implement QBNLSTM analogously to the below:
+Implement QBNLSTM like the below:
 https://github.com/quic/aimet-model-zoo/blob/develop/zoo_torch/examples/deepspeech2_quanteval.py
 """
 
@@ -570,8 +570,6 @@ class StackedLSTM(nn.Module):
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
 
-        # print(f"LSTM fwd: x.shape={x.shape}")
-
         x, _ = self.rnn0(x)
         x = self.drop0(x)
 
@@ -585,7 +583,6 @@ class StackedLSTM(nn.Module):
 
         out = self.head(x[:,-1,:])
 
-        # print(f"LSTM fwd: out.shape={out.shape}")
         return out
 
 # ------- baselineLSTM 2 --------

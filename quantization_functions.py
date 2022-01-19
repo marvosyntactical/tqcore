@@ -23,6 +23,9 @@ import torch
 from torch import Tensor
 from .qtensor import QTensor
 
+import logging
+quant_logger = logging.getLogger(name="QUANT")
+
 class Quantization():
     def __init__(self, **kwargs):
         pass

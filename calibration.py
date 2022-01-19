@@ -1,13 +1,11 @@
 import torch
 from torch import nn
 
-import warnings
-
 from .quantization_functions import *
-from .quantizable_layer import QuantizableModule
-from .quantized_layer import _factory_convert_layer_forward_impl, \
-        OPS, NONQUANT
-from .qat_convert import *
+from .quantizable_layer import QuantizableModule, qlogger
+# from .quantized_layer import _factory_convert_layer_forward_impl, \
+#         OPS, NONQUANT
+# from .qat_convert import *
 
 def calibration_prepare(
         module: nn.Module,
@@ -24,7 +22,7 @@ def calibration_prepare(
         _module_types: Dict = None, # convenience to search for next activation during conversion
     ) -> (nn.Module, int):
 
-    warnings.warn(f"TODO Implement Calibration preparation")
+    raise NotImplementedError(f"TODO Implement Calibration preparation")
 
     if inplace == False and is_root_module:
         module = copy.deepcopy(module)
@@ -134,8 +132,8 @@ def calibration_convert(
 
     if isinstance(module, QuantizableModule):
         module.quantize()
-    elif is_layer and not dont_quantize:
-        module.forward = _factory_convert_layer_forward_impl(module)
+    # elif is_layer and not dont_quantize:
+    #     module.forward = _factory_convert_layer_forward_impl(module)
     return module
 
 

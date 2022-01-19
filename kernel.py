@@ -7,7 +7,7 @@ import warnings
 import math
 
 from .qtensor import QTensor
-from .quantization_functions import Quantization
+from .quantization_functions import Quantization, quant_logger
 from .utils import is_integer
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul

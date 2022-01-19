@@ -9,23 +9,27 @@ class QuantConfigurationError(Exception):
 
 class QConfig(NamedTuple):
     """
-    Hyperparameters for QAT and Quantization of
-    already trained TSTModel
+    Hyperparameters for QAT and Quantization of TSTModel
     """
     # quantization parameters
-    nudge_zero: bool = True
     num_bits: int = 8
     num_bits_weight: int = 8
     num_bits_bias: int = 32
+
+    qadd_rescale: bool = True # whether to rescale after addition overflow in kernel.qadd; overflow is clamped otherwise
+    nudge_zero: bool = True # whether to nudge a zero point that is not integer
     leave_first_and_last: bool = False # ignore first and last layer during quantization?
     tuning: str = "qat" # qat, calibration, or calibrationthenqat. if using torch.quantization, qat means eager mode, calibration means fx mode
+
     calib_mode: str = "minandmax"
     thresholds: str = "conjugate"
     calib_num_bins: int = 2048
     calib_eps: int = 5
+
+    # record only this many QAT batches before freezing these modules:
     record_n_batches_bn: int =  300
     record_n_batches_qlistener: int =  600
-    qadd_rescale: bool = True # whether to rescale after addition overflow in kernel.qadd
+
     stage_plot_freqs: Dict = {
         "FP32":-1,
         "Calibration":-1,
@@ -38,8 +42,10 @@ class QConfig(NamedTuple):
         "QAT":[],
         "Quantized":[],
     }
+
     transformer: Dict = {}
     lstm: Dict = {}
+
     @classmethod
     def from_json(cls, file):
         cfg = json.load(open(file, "r"))
