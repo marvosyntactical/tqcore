@@ -1,32 +1,11 @@
 from .qtensor import QTensor
 
 from .quantization_functions import *
-
-# from .qat_prepare import *
-# from .qat_convert import *
-
-# from .quantized_layer import *
-
 from .quantizable_layer import *
-
-
-global OPS, NONQUANT
-OPS = [
-    nn.Conv2d,
-    nn.Linear,
-    nn.modules.batchnorm._BatchNorm,
-    nn.MaxPool2d
-]
-
-# ignore subclasses of these:
-NONQUANT = [
-    NonQuantizableModuleWrap
-]
-
-
 from .batchnorm import *
 from .transformer import QTSTModel
 from .lstm import QTSLSTM
+from .modules import *
 from .models import *
 
 from .histogram import *

@@ -7,7 +7,6 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from .quantizable_layer import QuantizableModule, SYMMETRIZING_MODULES, qlogger
 from .kernel import qmul, qadd
 from .qtensor import QTensor
-from .quantization_functions import FakeQuant
 
 import copy
 from typing import Dict, Optional, Union
@@ -360,10 +359,10 @@ class ConvBNfoldable(QuantizableModule):
         # unterer Teil des training graphs in C8:
 
         folded_weight = self.folded_weight()
-        folded_weight.data = self.conv._fakeQ(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None, handling_qtensors=False)
+        folded_weight.data = self.conv.fake_quantize(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None, handling_qtensors=False)
 
         folded_bias = self.folded_bias()
-        folded_bias.data = self.conv._fakeQ(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None, handling_qtensors=False)
+        folded_bias.data = self.conv.fake_quantize(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None, handling_qtensors=False)
 
         assert not torch.isnan(folded_weight).any()
         assert not torch.isnan(folded_bias).any()
@@ -412,7 +411,6 @@ class QBNFoldableTranspose(QuantizableModule):
         super().__init__(**qkwargs)
 
         self.bn = nn.BatchNorm1d(hidden, momentum=momentum, eps=eps)
-        self._fakeQ = FakeQuant.apply_wrapper
 
     def qat_prepare(self, **qkwargs):
         super().qat_prepare(**qkwargs)
@@ -486,10 +484,10 @@ class QBNFoldableTranspose(QuantizableModule):
         # unterer Teil des training graphs in C8:
 
         folded_weight = self.fold_weight()
-        folded_weight.data = self._fakeQ(folded_weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+        folded_weight.data = self.fake_quantize(folded_weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
 
         folded_bias = self.fold_bias(folded_weight)
-        folded_bias.data = self._fakeQ(folded_bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+        folded_bias.data = self.fake_quantize(folded_bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
 
         x = x._t * folded_weight + folded_bias
 

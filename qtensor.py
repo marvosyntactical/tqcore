@@ -235,6 +235,7 @@ HANDLED_FUNCTIONS = {
 PROHIBITED_FUNCTIONS = {
     torch.split: "Use QTensor.split instead",
     torch.stack: "Use tqcore.quantizable_layer.QStack instead",
+    torch.cat: "Use tqcore.quantizable_layer.QCat instead",
     torch.add: "Use tqcore.kernel.qadd instead",
     torch.matmul: "Use tqcore.kernel.qmul instead",
     torch.mul: "Use tqcore.kernel.qmul instead",

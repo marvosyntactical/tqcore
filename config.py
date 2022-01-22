@@ -18,8 +18,9 @@ class QConfig(NamedTuple):
 
     qadd_rescale: bool = True # whether to rescale after addition overflow in kernel.qadd; overflow is clamped otherwise
     nudge_zero: bool = True # whether to nudge a zero point that is not integer
-    leave_first_and_last: bool = False # ignore first and last layer during quantization?
+    leave_first_and_last: bool = False # ignore first and last layer during quantization? # DEPRECATED
     tuning: str = "qat" # qat, calibration, or calibrationthenqat. if using torch.quantization, qat means eager mode, calibration means fx mode
+    clamp_ste: bool = False
 
     calib_mode: str = "minandmax"
     thresholds: str = "conjugate"

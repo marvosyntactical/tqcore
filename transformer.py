@@ -715,7 +715,8 @@ class QTransformerEncoder(nn.Module):
 class QTSTModel(nn.Module):
     """
     Quantizable Classification/regression with Time Series Transformer.
-    Structure from https://github.com/dhlee347/pytorchic-bert/blob/master/classify.py """
+    Structure from https://github.com/dhlee347/pytorchic-bert/blob/master/classify.py
+    """
     def __init__(
             self,
             src_dim: int = 128, # dimensionality of data

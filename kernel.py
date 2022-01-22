@@ -8,7 +8,8 @@ import math
 
 from .qtensor import QTensor
 from .quantization_functions import Quantization, quant_logger
-from .utils import is_integer
+
+is_integer = lambda t: t.allclose(t.round())
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul
 # (the terminology "kernel" is from https://github.com/google/gemmlowp : low bit compute functions)

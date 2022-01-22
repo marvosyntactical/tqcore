@@ -25,11 +25,12 @@ import matplotlib.pyplot as plt
 # from tqcore:
 from .qtensor import QTensor
 from .quantization_functions import Quantization, \
-        UniformQuantization, UniformSymmetricQuantization, FakeQuant
-from .utils import is_integer
+        UniformQuantization, UniformSymmetricQuantization, STE, ClampedSTE
 from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind, QuantConfigurationError
 from .histogram import HistogramCalibrator
 from .kernel import qadd, qmul
+
+is_integer = lambda t: t.all_close(t.round())
 
 qlogger = logging.getLogger(name="QLayer")
 
@@ -38,14 +39,17 @@ __ASSERT__ = 0
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 class QuantizableModule(nn.Module):
     """
-    Interface for quantizable modules to implement.
+    Interface for Modules that should be quantized to implement.
 
     During fp training, this module acts as Identity if forward is not overwritten.
     It also has a Tuning Stage, which can be either
         * Quantization Aware Training (QAT) or
         * Calibration
     and then a fully quantized stage;
-    Each of the stages should be implemented by subclasses.
+    For each of the stages, an Implementation needs to provide the forward method, i.e.:
+        1. forward_fp
+        2. forward_qat
+        3. forward_quantized
     """
     FLOAT_SCALE = 1. # these determine all successive scale / zeros; retrieved by QuantStub
     FLOAT_ZERO = 0.
@@ -80,6 +84,7 @@ class QuantizableModule(nn.Module):
             num_bits_weight: int = 8,
             num_bits_bias: int = 32,
             nudge_zero: bool = False,
+            clamp_ste: bool = False,
             **qkwargs,
         ):
         self.num_bits = num_bits
@@ -87,6 +92,7 @@ class QuantizableModule(nn.Module):
         self.num_bits_weight = num_bits_weight
         self.weight_quantization = weight_quantization()
         self.num_bits_bias = num_bits_bias
+        self.fake_quantize = STE.apply_wrapper if not clamp_ste else ClampedSTE.apply_wrapper
 
     def stage_str(self) -> str:
         return self.stage_dict[self.stage]
@@ -308,8 +314,6 @@ class QLinear(QuantizableModule, nn.Linear):
         nn.Linear.__init__(self, *args, **kwargs)
 
         self.dont_fakeQ = dont_fakeQ
-        if not self.dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply_wrapper
 
     def forward_fp(self, x: Tensor):
         return F.linear(x, self.weight, self.bias)
@@ -480,8 +484,6 @@ class QCat(QuantizableModule):
 
 
 
-
-
 class QFill(QuantizableModule):
     """
     Quantizable version of torch.masked_fill.
@@ -619,15 +621,15 @@ class QSoftmax(QuantizableModule):
         M = exponentiated.scale / norm_scale
         normed_exp = (zeroed_exp * M) # + self.normed_zero
         r = self.quantization.tensor_clamp(x=normed_exp, num_bits=self.num_bits)
-
         return r
+
 
 class NonQuantizableModuleWrap(QuantizableModule):
     """
     NonQuantizableModuleWrap can be used to wrap a module that should stay in floating point after
-    the model is converted to the quantized stage.
+    the model is converted to the quantized stage. It does not need a QListener.
     Example usage:
-        >>>    self.qsoftmax = NonQuantizableModuleWrap(
+        >>> self.qsoftmax = NonQuantizableModuleWrap(
         >>>     nn.Softmax(dim=-1), **qkwargs
         >>> )
 
@@ -739,8 +741,8 @@ class QReLU6(QuantizableModule):
         zero = self.zero
 
         # this should be the case if self's QListener records the previous module
-        # as well. the below rescaling is therefore usually unnecessary
-        # in the case that these lines raise ASsertionError,
+        # as well. the below rescaling is therefore usually unnecessary.
+        # In the case that these lines raise an AssertionError,
         # either:
         # 1. make QListener listen to previous module as well
         # (init w/ e.g. QListener(linear, relu, **qkwargs))
@@ -892,6 +894,9 @@ class QPositionalEncoding(QuantizableModule):
     def forward_qat(self, X: QTensor):
         super().forward_qat()
         assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
+        self.fake_quantize(
+            self.W.data, self.weight_quantization, self.num_bits_bias, None, None, handling_qtensors=False
+        )
         rfloat = self.W + X._t
         r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
@@ -1040,8 +1045,6 @@ by initializing it with clipped_distr: bool given as kwarg.
             raise QuantConfigurationError(f"thresholds={threshs}")
 
         self.dont_fakeQ = dont_fakeQ
-        if not dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply_wrapper
 
         self._qparams_set = False
 
@@ -1419,6 +1422,9 @@ class QPlotter(QuantizableModule):
             self.stage_counters[stage_str] += 1
 
 
+# import these lists to files that define relevant modules (batchnorm.py)
+# and add relevant modules to given list
+
 # for calibration to work
 # these must be updated in every module that adds QuantizableModules in need of a listener
 global CLIPPING_MODULES, SYMMETRIZING_MODULES
@@ -1436,5 +1442,17 @@ SYMMETRIZING_MODULES = [
     QFill,
 ] # ^ comprehensive list of modules that output symmetric distribution
 
-# import these lists to files that define relevant modules (batchnorm.py)
-# and add relevant modules to given list
+
+global OPS, NONQUANT
+OPS = [
+    nn.Conv2d,
+    nn.Linear,
+    nn.modules.batchnorm._BatchNorm,
+    nn.MaxPool2d
+]
+NONQUANT = [
+    NonQuantizableModuleWrap
+]
+
+
+
