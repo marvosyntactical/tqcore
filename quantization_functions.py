@@ -307,7 +307,11 @@ class ClampedSTE(torch.autograd.Function):
         if min_val is None or max_val is None:
             min_val, max_val = x.min().item(), x.max().item()
 
+        assert min_val != max_val, min_val
+
         new_scale, new_zero = quant.calc_params(min_val=min_val, max_val=max_val, num_bits=num_bits)
+
+        assert new_scale != 0.
 
         # affine transformation and round there to simulate error appropriately
         qx = quant.quantize_to_qtensor_given_scale(
@@ -325,13 +329,14 @@ class ClampedSTE(torch.autograd.Function):
     def backward(ctx, grad_output: Tensor, scale: Tensor, zero: Tensor):
         """ Clamped Straight Through Estimator """
         min_val, max_val = ctx.saved_tensors[0]
-        qmin = min_val.item()/scale.item() + zero.item()
-        qmax = max_val.item()/scale.item() + zero.item()
-        return grad_output.clamp(min=qmin, max=qmax), None, None, None, None
+        # qmin = min_val.item()/scale.item() + zero.item()
+        # qmax = max_val.item()/scale.item() + zero.item()
+        # print(f"grad out min/max: {grad_output.min()}/{grad_output.max()}")
+        # print(f"min/max: {min_val}/{max_val}")
+        return grad_output.clamp(min=min_val, max=max_val), None, None, None, None
 
 
 
 
 str2quant = {"uniform": UniformQuantization, "uniform_sym": UniformSymmetricQuantization}
-
 

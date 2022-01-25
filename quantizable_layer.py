@@ -118,8 +118,8 @@ class QuantizableModule(nn.Module):
         self.stage = QuantStage.Calibration
         self.forward = self.forward_calib
 
-    def qat_prepare(self, **qkwargs):
-        self._set_qkwargs(**qkwargs)
+    def qat_prepare(self):
+        # self._set_qkwargs() # DEBUG: sets defaults
 
         self.stage = QuantStage.QAT
         self.forward = self.forward_qat
@@ -458,6 +458,17 @@ class QCat(QuantizableModule):
     Quantizable version of torch.cat;
     May be used with the kwargs "dim" and "out" of torch.cat.
     """
+    def forward_fp(self, *args, **kwargs):
+        return torch.cat(*args, **kwargs)
+
+    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None):
+        super().forward_qat()
+        for qt in qtensors:
+            assert type(qt) == QTensor, type(qt)
+            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
+        r = torch.cat([qt._t for qt in qtensors], dim=dim, out=out)
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
+
     def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None) -> QTensor:
         requantized: List[Tensor] = []
         for qt in qtensors:
@@ -471,16 +482,7 @@ class QCat(QuantizableModule):
         qr: QTensor = QTensor(r, scale=self.scale, zero=self.zero, quantized=True, num_bits=self.num_bits)
         return qr
 
-    def forward_fp(self, *args, **kwargs):
-        return torch.cat(*args, **kwargs)
 
-    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None):
-        super().forward_qat()
-        for qt in qtensors:
-            assert type(qt) == QTensor, type(qt)
-            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
-        r = torch.cat([qt._t for qt in qtensors], dim=dim, out=out)
-        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
 
 
 
@@ -866,6 +868,92 @@ class FFT(QuantizableModule):
         # x = x.real # method 2b:  + x.imag
         return x
 
+
+class QLabel(QuantizableModule):
+    """
+    Learnable Label (https://arxiv.org/abs/2109.10252)
+    appended/prepended to input and fitted to its range
+    """
+    def __init__(self,
+            rank: int = 3,
+            dim: int = 1,
+            hidden_dim: int = 100,
+            prepend: bool = False,
+            init_fn: Callable = torch.randn,
+            plot_name: Optional[str] = None,
+            **qkwargs
+        ):
+        """
+        :param rank: rank of tensor x to concatenate the label to
+        :param cat_dim: which dimension of x to concatenate the label to
+        :param hidden_dim: which dimension of x is the hidden dimension
+        :param hidden_size: hidden dimensionality of label; must match x.shape[hidden_dim]
+        :param prepend: whether to prepend or append the label in given dim
+        :param init_fn:
+        """
+        super().__init__(**qkwargs)
+
+        self.rank = rank
+        self.cat_dim = cat_dim
+        self.hidden_dim = hidden_dim
+
+        dims = [1] * rank
+        dims[hidden_dim]=hidden_size
+
+        self.prepend = prepend
+
+        self.label = nn.Parameter(init_fn(*dims))
+        self.qcat = QCat(**qkwargs)
+
+        self.qcat_listener = QListener(self.qcat, plot_name=plot_name, **qkwargs)
+
+        self.num_bits_label = self.num_bits_weight
+
+    def _fwd(self, X: torch.Tensor):
+
+        expand_args = [-1] * self.rank
+        # expand along all dimensions which arent hidden_dim or cat_dim
+        for d in range(self.rank):
+            if d not in {self.hidden_dim, self.cat_dim}:
+                expand_args[d] = X.shape[d]
+
+        expanded_label = self.label.expand(*expand_args)
+
+        if self.prepend:
+            to_cat = [expanded_label, X]
+        else:
+            to_cat = [X, expanded_label]
+
+        # Add label
+        x_with_label = self.qcat(to_cat, dim=self.cat_dim)
+        return x_with_label
+
+    def forward_fp(self, X: Tensor):
+        return self._fwd(X)
+
+    def forward_qat(self, X: QTensor):
+        super().forward_qat()
+        assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
+        self.fake_quantize(
+            self.label.data, self.weight_quantization, self.num_bits_label, None, None, handling_qtensors=False
+        )
+        x_with_label = self._fwd(x)
+        x_with_label = self.qcat_listener(x_with_label)
+        return x_with_label
+
+    def forward_quantized(self, X: QTensor):
+        return self._fwd(X)
+
+    def quantize(self):
+        super().quantize()
+        # nn.Parameter label is replaced by QTensor
+        self.label = self.weight_quantization.quantize_to_qtensor_using_range(
+            x=self.label.data,
+            num_bits=self.num_bits_label, # _bias # TODO
+            quantized=True
+        )
+
+
 class QPositionalEncoding(QuantizableModule):
     """
     Learnable Position Encoding (A W x D bias matrix that we add to the input)
@@ -962,6 +1050,8 @@ class QListener(QuantizableModule):
 
         super().__init__(**qkwargs)
 
+        # print(f"qlistener {plot_name} setup: qkwargs={qkwargs}\nself.num_bits={self.num_bits}\nself.num_bits_weight={self.num_bits_weight}")
+
         self.function = function # optionally apply function before collecting stats (for softmax)
         self.name = "" if listener_name is None else str(listener_name) # set attribute name_scale_next and so on
         self.ema_decay = ema_decay
@@ -1047,6 +1137,7 @@ by initializing it with clipped_distr: bool given as kwarg.
         self.dont_fakeQ = dont_fakeQ
 
         self._qparams_set = False
+        # print(f"qlistener {plot_name} setup ended;\nself.num_bits={self.num_bits}\nself.num_bits_weight={self.num_bits_weight}")
 
     def freeze(self):
         qlogger.info(f"{self} stopped recording.")
@@ -1080,6 +1171,7 @@ by initializing it with clipped_distr: bool given as kwarg.
         Collect stats, optionally fakequantize;
         per default also set qparams of monitored modules
         """
+        # print(f"ql({self.qplotter.name}) input bits: {x.num_bits}; self.num_bits={self.num_bits}")
         super().forward_qat()
         assert isinstance(x, QTensor), type(x)
         if not self.distribution_kind==DistKind.CLIPPED:
@@ -1103,6 +1195,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             self.freeze()
         assert not x.quantized
         x = self.qplotter(x, dont_plot=dont_plot)
+        # print(f"ql({self.qplotter.name}) output bits: {x.num_bits}; self.num_bits={self.num_bits}")
         return x
 
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
@@ -1163,7 +1256,6 @@ by initializing it with clipped_distr: bool given as kwarg.
             new_val = dict_new_vals[key]
             self.__stats__[key] -= (1 - self.ema_decay) * (ema - new_val)
 
-
     def quantize(self):
         if self.set_qparams_during_quantization:
             self._set_qparams()
@@ -1220,7 +1312,14 @@ by initializing it with clipped_distr: bool given as kwarg.
         self._qparams_set = True
 
     def __repr__(self):
-        s = f"QListener(mods={self.mods}, dist={self.distribution_kind}, calib={self.calibration_mode})"
+        s = f"QListener(\n"
+        if self.name:
+            s += "name={self.name},\n"
+        s += "plot_name={self.plot_name},\n"
+        s += "mods={self.mods},\n"
+        s += "dist={self.distribution_kind},\n"
+        s += "calib={self.calibration_mode})\n"
+        s += ")"
         return s
 
 class QPlotter(QuantizableModule):

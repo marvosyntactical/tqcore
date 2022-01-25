@@ -338,7 +338,6 @@ class QPositionwiseFeedForward(nn.Module):
         """
         super().__init__()
         activation = eval(activ.strip())(**qkwargs)
-        print(f"Initiated QFeedFwd with activation={activation}")
         pn = lambda s: s + " " + str(layer_num)
 
         modules = [
@@ -601,9 +600,8 @@ class QTransformerEncoder(nn.Module):
 
         self.learnable_label = learnable_label
         if learnable_label:
-            # raise NotImplementedError("not properly implemented for qtransformer: make parameter quantizable")
-            self.label = nn.Parameter(torch.randn(1,1,dim))
-            self.qcat = QCat(**qkwargs)
+            self.add_label = QLabel(dim=1, rank=3, **qkwargs)
+            # self.label_listener = QListener(self.add_label, plot_name="label", **qkwargs)
 
         # TODO FIXME add these again
         self.has_pe = qkwargs["transformer"]["has_pe"]
@@ -670,7 +668,8 @@ class QTransformerEncoder(nn.Module):
         x = self.emb_listener(x)
 
         if self.learnable_label:
-            src_embedded = self.qcat([x, self.label.expand(x.shape[0],-1,-1)], dim=1)
+            x = self.add_label(x)
+            # x = self.label_listener(x)
 
         # if self_is_quant:
         #     assert x.quantized
