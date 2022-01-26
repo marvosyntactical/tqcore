@@ -97,7 +97,14 @@ class UniformQuantization(Quantization):
         q_x = self._quantize_tensor_using_params(x, scale=scale, zero=zero, num_bits=num_bits)
         return QTensor(q_x, scale=scale, zero=zero, quantized=quantized, num_bits=num_bits, symmetric=False)
 
-    def calc_params(self, min_val: float, max_val: float, num_bits: int, nudge: bool=True) -> Tuple[float,Union[float, int]]:
+    def calc_params(
+            self,
+            min_val: float,
+            max_val: float,
+            num_bits: int,
+            nudge: bool=True
+        ) -> Tuple[float,Union[float, int]]:
+
         qmin = 0.
         qmax = 2. ** num_bits - 1.
 
@@ -105,14 +112,25 @@ class UniformQuantization(Quantization):
         # max_val = max(max_val, 0.)
         # min_val = min(min_val, 0.)
 
-        # scale ist quasi die unit länge in der quantisierten range
-        scale = (max_val - min_val) / (qmax - qmin)
+        # scale ist die unit länge in der quantisierten range
+        # range_ = max(1.0, max_val - min_val)
+        # eps = 1.0
+        eps = 1e-5
+        range_ = max(eps, max_val - min_val)
+        scale = range_ / (qmax - qmin)
+        # scale = (max_val - min_val) / (qmax - qmin)
+        if range_==eps:
+            log_qfun("max-min was too small:", max_val-min_val)
 
         # r = s * (q - z)
-        initial_zero = qmin - min_val / scale
+        try:
+            initial_zero = qmin - min_val / scale
+        except:
+            log_qfun(f"scale={scale}, max_val={max_val}, min_val={min_val}")
+            raise
 
         """
-        "in both cases (wt, bias), the boundaries [a; b] are nudged so that
+        "in both cases (weight, bias), the boundaries [a; b] are nudged so that
         value 0.0 is exactly representable as an integer z(a, b, n)
         after quantization" ~ benoit et al.
         """

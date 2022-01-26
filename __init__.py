@@ -1,6 +1,14 @@
 from .qtensor import QTensor
 
 from .quantization_functions import *
+<<<<<<< HEAD
+
+# from .qat_prepare import *
+# from .qat_convert import *
+
+# from .quantized_layer import *
+=======
+>>>>>>> 5d0d38620c339bb3dbf4166ed543fbadf66e7b5f
 from .quantizable_layer import *
 from .batchnorm import *
 from .transformer import QTSTModel

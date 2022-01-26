@@ -50,7 +50,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             self.folded_bias,
             x.scale * gamma.scale,
             0,
-            num_bits=32,
+            num_bits=self.num_bits_bias,
         )
 
         # TODO replace below code by quantized_layer.quantized_linear call
@@ -61,6 +61,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         x_zeroed = x._t - x.zero
         gamma_zeroed = gamma._t - gamma.zero
 
+        # print([t.shape for t in [x_zeroed, gamma_zeroed, beta._t]])
         out = x_zeroed * gamma_zeroed + beta._t
 
         multiplier = (x.scale * gamma.scale) / self.scale
@@ -171,6 +172,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         # math see overleaf: quantized calculations
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
+
         folded_weight = (self.weight * inv_running_std) \
                 .unsqueeze(0).unsqueeze(-1)
 
@@ -446,7 +448,7 @@ class QBNFoldableTranspose(QuantizableModule):
             self.folded_bias,
             x.scale * gamma.scale,
             0,
-            num_bits=32,
+            num_bits=self.num_bits_bias,
         )
 
         x_zeroed = x._t - x.zero
