@@ -9,8 +9,7 @@ from copy import deepcopy
 from typing import Callable, List, Dict, Tuple, Optional
 
 import logging
-logging.basicConfig(level="INFO")
-logqt = logging.getLogger("qt")
+logqt = logging.getLogger("QTensor")
 
 __all__ = ["QTensor"]
 
@@ -59,15 +58,14 @@ class QTensor:
         self.zero: int = zero
         self.quantized: bool = bool(quantized)
         self.symmetric: bool = bool(symmetric)
+        # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
         self.shape: Tensor = self._t.shape
 
         if self.quantized and not self._t.dtype==torch.bool:
             assert torch.allclose(self._t, self._t.round()), f"quantized QTensor should only be initialized with already quantized, that is rounded, data, but got: {data}"
-            # TODO remove this costly assertion after testing !!!!! FIXME:
             if not symmetric and __DEBUG__:
                 assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
-        # overwrite attributes here to return Tensor, otherwise __getattr__ attempts to return QTensor
 
     def dequantize(self) -> Tensor:
         assert self.quantized, "may only dequantize QTensor holding quantized values; use qtensor._t instead"
@@ -99,10 +97,10 @@ class QTensor:
                 issubclass(t, (torch.Tensor, QTensor))
                 for t in types
             ):
-                logqt.info("VVVVV Invoked QTensor __torch_function__ with known func VVVVV\n")
-                logqt.info(func)
-                logqt.info(types)
-                logqt.info("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+                logqt.debug("VVVVV Invoked QTensor __torch_function__ with known func VVVVV\n")
+                logqt.debug(func)
+                logqt.debug(types)
+                logqt.debug("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
                 return HANDLED_FUNCTIONS[func](*args, **kwargs)
         elif func in PROHIBITED_FUNCTIONS:
@@ -136,7 +134,7 @@ class QTensor:
                 num_bits=args[0].num_bits
             )
 
-    # ----------------- item methods for slicing ---------------
+    # ----------------- item methods for tensor slicing ---------------
     def __delitem__(self, *args, **kwargs):
         return QTensor(self._t.__delitem__(*args, **kwargs), self.scale, self.zero,
                 quantized=self.quantized, num_bits=self.num_bits)
@@ -152,7 +150,7 @@ class QTensor:
     def __getattr__(self, attr):
         # for transpose(), etc:
         # default behavior: return QTensor.
-        # must implement attrs/methods that shant return QTensors, e.g. .size()
+        # must implement attrs/methods that shouldntt return QTensors, e.g. .size()
         # when they are implemented, __getattr__ is never called for them
         tensor_attr = getattr(self._t, attr)
 
@@ -215,7 +213,7 @@ class QTensor:
         return QTensor(self._t.to(*args, **kwargs), scale=self.scale, zero=self.zero,
                 quantized=self.quantized, symmetric=self.symmetric, num_bits=self.num_bits)
 
-    # ------------------- Then following methods do not return QTensors -------------------
+    # ------------------- The following methods do not return QTensors -------------------
     def size(self, *args, **kwargs) -> Tensor:
         return self._t.size(*args, **kwargs)
 
@@ -237,6 +235,7 @@ HANDLED_FUNCTIONS = {
 PROHIBITED_FUNCTIONS = {
     torch.split: "Use QTensor.split instead",
     torch.stack: "Use tqcore.quantizable_layer.QStack instead",
+    torch.cat: "Use tqcore.quantizable_layer.QCat instead",
     torch.add: "Use tqcore.kernel.qadd instead",
     torch.matmul: "Use tqcore.kernel.qmul instead",
     torch.mul: "Use tqcore.kernel.qmul instead",

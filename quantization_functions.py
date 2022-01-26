@@ -23,8 +23,8 @@ import torch
 from torch import Tensor
 from .qtensor import QTensor
 
-__PRINT__ = 0
-log_qfun = lambda *args: print(*args) if __PRINT__ else None
+import logging
+quant_logger = logging.getLogger(name="QUANT")
 
 class Quantization():
     def __init__(self, **kwargs):
@@ -211,7 +211,7 @@ class UniformSymmetricQuantization(Quantization):
         return QTensor(q_x, scale=scale, zero=zero, symmetric=True, num_bits=num_bits, quantized=quantized)
 
 
-class FakeQuant(torch.autograd.Function):
+class STE(torch.autograd.Function):
     """
     Simulates quantization error, uses STE for backpropagation.
     For forward pass in quantization aware training: fake-quantized weights and activations
@@ -223,7 +223,7 @@ class FakeQuant(torch.autograd.Function):
             num_bits = args[0].num_bits
             args = [args[0]._t] + list(args[1:])
 
-        out, scale, zero = FakeQuant.apply(*args)
+        out, scale, zero = STE.apply(*args)
         scale, zero = scale.item(), zero.item()
 
         if handling_qtensors:
@@ -276,7 +276,85 @@ class FakeQuant(torch.autograd.Function):
         """ Straight Through Estimator """
         return grad_output, None, None, None, None
 
+class ClampedSTE(torch.autograd.Function):
+    """
+    Simulates quantization error, uses STE for backpropagation;
+    clamping it at the quantization boundaries.
+    For forward pass in quantization aware training: fake-quantized weights and activations
+    can then be used normally in dense/conv layer.
+    """
+    @staticmethod
+    def apply_wrapper(*args, handling_qtensors):
+        if handling_qtensors:
+            num_bits = args[0].num_bits
+            args = [args[0]._t] + list(args[1:])
+
+        out, scale, zero = ClampedSTE.apply(*args)
+        scale, zero = scale.item(), zero.item()
+
+        if handling_qtensors:
+            # scale did not actually change, but need to give QTensor these qparams
+            # for them to be accessible by NonQuantized layers
+            out = QTensor(out, scale, zero, quantized=False, num_bits=num_bits)
+        return out
+
+    @staticmethod
+    def forward(
+            ctx,
+            x: Tensor,
+            quant: Quantization,
+            num_bits: int,
+            min_val: float,
+            max_val: float,
+        ) -> Union[QTensor, Tensor]:
+        """
+        :param x: torch tensor to quantize
+        :param quant: quantization class for tensor
+        :param num_bits: number of bits to quantize to
+        :param min_val: EMA min_val, for activation quantization with EMA, don't provide for weight quantization
+        :param max_val: EMA max_val, for activation quantization with EMA, don't provide for weight quantization
+        :return: x: torch tensor
+        """
+        # NOTE:
+        # This forward pass does NOT change the scale or zero point.
+        # it only rounds in after affinely transforming to the new scale, new zero
+        # but affinely transforms back again (dequantize).
+        # The new scale, new zero are given for NonQuantizableModule to access this info
+        # (NonQuantizableModule already needs qparams info during QAT)
+
+        if min_val is None or max_val is None:
+            min_val, max_val = x.min().item(), x.max().item()
+
+        assert min_val != max_val, min_val
+
+        new_scale, new_zero = quant.calc_params(min_val=min_val, max_val=max_val, num_bits=num_bits)
+
+        assert new_scale != 0.
+
+        # affine transformation and round there to simulate error appropriately
+        qx = quant.quantize_to_qtensor_given_scale(
+            x, num_bits=num_bits, scale=new_scale, zero=new_zero, quantized=True
+        )
+        # affinely transform back
+        out = qx.dequantize()
+
+        ctx.save_for_backward(Tensor([min_val, max_val]))
+
+        # autograd function may only return tensors, so create one-element tensors for quantization parameters
+        return out, Tensor([new_scale]), Tensor([new_zero])
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor, scale: Tensor, zero: Tensor):
+        """ Clamped Straight Through Estimator """
+        min_val, max_val = ctx.saved_tensors[0]
+        # qmin = min_val.item()/scale.item() + zero.item()
+        # qmax = max_val.item()/scale.item() + zero.item()
+        # print(f"grad out min/max: {grad_output.min()}/{grad_output.max()}")
+        # print(f"min/max: {min_val}/{max_val}")
+        return grad_output.clamp(min=min_val, max=max_val), None, None, None, None
+
+
+
 
 str2quant = {"uniform": UniformQuantization, "uniform_sym": UniformSymmetricQuantization}
-
 

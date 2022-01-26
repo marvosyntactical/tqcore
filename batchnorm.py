@@ -4,10 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.batchnorm import _BatchNorm
 
-from .quantizable_layer import QuantizableModule, SYMMETRIZING_MODULES
+from .quantizable_layer import QuantizableModule, SYMMETRIZING_MODULES, qlogger
 from .kernel import qmul, qadd
 from .qtensor import QTensor
-from .quantization_functions import FakeQuant
 
 import copy
 from typing import Dict, Optional, Union
@@ -19,8 +18,7 @@ is_integer = lambda t: (t.round()==t).all() if __DEBUG__ else True
 
 # wrapped _BatchNorm interface like in the recommendation of RLisfun:
 # https://github.com/pytorch/pytorch/issues/4741
-
-# compatibility of BN with model.eval() (seems defunct) via:
+# -> compatibility of BN with model.eval() (which seems defunct) via:
 # 1. keeping bn.training == True always
 # 2. changing bn.track_running_stats to False during eval()
 # -> wenn bn.track_running_stats False, setze kurz momentum = 0, sodass kein update passiert
@@ -46,12 +44,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         """
         assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
 
-        # TODO assign these qtensors permanently during .quantize()
-
-        gamma = self.weight_quantization.quantize_to_qtensor_using_range(
-            self.folded_weight,
-            num_bits=self.num_bits_weight # int8 or int32 ? TODO test
-        )
+        gamma = self.gamma
 
         beta = self.quantization.quantize_to_qtensor_given_scale(
             self.folded_bias,
@@ -148,8 +141,8 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
     def forward_qat(self, input: QTensor) -> QTensor:
         assert input.num_bits == self.num_bits, (input.num_bits, self.num_bits)
         super().forward_qat()
-        bn_training, exponential_average_factor = self._do_checks(input)
 
+        bn_training, exponential_average_factor = self._do_checks(input)
         out = F.batch_norm(
             input._t,
             # If buffers are not to be tracked, ensure that they won't be updated
@@ -168,9 +161,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
     def freeze(self):
         # to stop recording running stats;
         # make self never trainable using self.train() again.
-        print("="*30)
-        print(self, " stopped recording.")
-        print("="*30)
+        qlogger.info("{self} stopped recording.")
         self.track_running_stats = True
         self.train = lambda t: warnings.warn(f"{self}.train({t}) got called after it was frozen!"); return self
 
@@ -179,19 +170,20 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
 
         eps = torch.sqrt(torch.Tensor([self.eps])).to(self.running_var.device)
 
+        # math see overleaf: quantized calculations
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
-        # self.folded_weight = (self.weight * inv_running_std) \
-        #         .unsqueeze(0).unsqueeze(-1)
-        self.folded_weight = (self.weight * inv_running_std) \
-                .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
+        folded_weight = (self.weight * inv_running_std) \
+                .unsqueeze(0).unsqueeze(-1)
 
-        # self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
-        #         - (self.running_mean.unsqueeze(0).unsqueeze(-1) \
-        #         * self.folded_weight)
-        self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) \
-                - (self.running_mean.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) \
-                * self.folded_weight)
+        self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
+                - (self.running_mean.unsqueeze(0).unsqueeze(-1) \
+                * folded_weight)
+
+        self.gamma = self.weight_quantization.quantize_to_qtensor_using_range(
+            folded_weight,
+            num_bits=self.num_bits_weight # int8 or int32 ? TODO test
+        )
 
     def train(self, mode:bool):
         # batchnorm can apparently not handle eval mode
@@ -262,7 +254,7 @@ class ConvBNfoldable(QuantizableModule):
             groups=1,
             padding=0,
             momentum=0.1,
-            relu:Union[int, bool]=6,
+            relu: Union[int, bool]=6,
             eps=1e-05,
             Convclass=nn.Conv2d,
             **qkwargs
@@ -291,19 +283,19 @@ class ConvBNfoldable(QuantizableModule):
             if hasattr(module, "last_weights_cache"):
                 # are these ever updated?
                 if not (convweight == module.last_weights_cache[0]).all():
-                    print("conv weight updated!")
+                    qlogger.debug("conv weight updated!")
                 if not (bnweight == module.last_weights_cache[1]).all():
-                    print("bn weight updated!")
+                    qlogger.debug("bn weight updated!")
                 if not (bnbias == module.last_weights_cache[2]).all():
-                    print("bn bias updated")
+                    qlogger.debug("bn bias updated")
 
             module.last_weights_cache = [convweight]
             module.last_weights_cache += [bnweight]
             module.last_weights_cache += [bnbias]
 
         # self.register_backward_hook(
-        #        debug_fold_backward
-        #        )
+        #     debug_fold_backward
+        # )
 
     def forward_fp(self, x):
         # forward used during fp32 pretraining
@@ -369,10 +361,10 @@ class ConvBNfoldable(QuantizableModule):
         # unterer Teil des training graphs in C8:
 
         folded_weight = self.folded_weight()
-        folded_weight.data = self.conv._fakeQ(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None, handling_qtensors=False)
+        folded_weight.data = self.conv.fake_quantize(folded_weight.data, self.conv._Qwt, self.conv._num_bits_wt, None, None, handling_qtensors=False)
 
         folded_bias = self.folded_bias()
-        folded_bias.data = self.conv._fakeQ(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None, handling_qtensors=False)
+        folded_bias.data = self.conv.fake_quantize(folded_bias.data, self.conv._Qwt, self.conv._num_bits_bias, None, None, handling_qtensors=False)
 
         assert not torch.isnan(folded_weight).any()
         assert not torch.isnan(folded_bias).any()
@@ -421,7 +413,6 @@ class QBNFoldableTranspose(QuantizableModule):
         super().__init__(**qkwargs)
 
         self.bn = nn.BatchNorm1d(hidden, momentum=momentum, eps=eps)
-        self._fakeQ = FakeQuant.apply_wrapper
 
     def qat_prepare(self, **qkwargs):
         super().qat_prepare(**qkwargs)
@@ -433,9 +424,9 @@ class QBNFoldableTranspose(QuantizableModule):
                 if hasattr(module, "last_weights_cache"):
                     # are these ever updated?
                     if not (bnweight == module.last_weights_cache[0]).all():
-                        print("bn weight updated!")
+                        qlogger.debug("bn weight updated!")
                     if not (bnbias == module.last_weights_cache[1]).all():
-                        print("bn bias updated")
+                        qlogger.debug("bn bias updated")
 
                 module.last_weights_cache = [bnweight]
                 module.last_weights_cache += [bnbias]
@@ -495,10 +486,10 @@ class QBNFoldableTranspose(QuantizableModule):
         # unterer Teil des training graphs in C8:
 
         folded_weight = self.fold_weight()
-        folded_weight.data = self._fakeQ(folded_weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+        folded_weight.data = self.fake_quantize(folded_weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
 
         folded_bias = self.fold_bias(folded_weight)
-        folded_bias.data = self._fakeQ(folded_bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
+        folded_bias.data = self.fake_quantize(folded_bias.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False)
 
         x = x._t * folded_weight + folded_bias
 

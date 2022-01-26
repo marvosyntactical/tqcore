@@ -7,8 +7,9 @@ import warnings
 import math
 
 from .qtensor import QTensor
-from .quantization_functions import Quantization
-from .utils import is_integer
+from .quantization_functions import Quantization, quant_logger
+
+is_integer = lambda t: t.allclose(t.round())
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul
 # (the terminology "kernel" is from https://github.com/google/gemmlowp : low bit compute functions)
@@ -111,14 +112,17 @@ def qadd(
     zero=zero_next
 
     if rescale:
-        if (r > (2.**num_bits_out)-1.).any(): # NOTE rescale only if necessary
-            print(f"\nquantized addition exceeded upper bound\n")
-
+        # rescale if necessary:
+        qmax = (2.**num_bits_out)-1.
+        if (r > qmax).any():
             # lin et al 2020 "towards fully 8-bit integer inference for the transformer model" sec 3.3
-            re_scale = r.max().item() / ((2.**num_bits_out)-1.)
+            re_scale = r.max().item() / qmax
             r = r / re_scale
             # r = r.round().clamp(0, (2.**num_bits_out)-1.)
             r = quant_out.tensor_clamp(r, num_bits_out)
+
+            # Q = (R / S + Z) / re_scale
+            # =>
 
             # NOTE adjust parameters after scaling
             zero = zero / re_scale

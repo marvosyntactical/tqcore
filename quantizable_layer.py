@@ -14,7 +14,7 @@ import copy
 from enum import Enum
 from typing import Optional, Union, Tuple, Dict, Union, Callable, List
 from collections import defaultdict
-import warnings
+import logging
 
 # for Plotter only:
 import os
@@ -25,28 +25,31 @@ import matplotlib.pyplot as plt
 # from tqcore:
 from .qtensor import QTensor
 from .quantization_functions import Quantization, \
-        UniformQuantization, UniformSymmetricQuantization, FakeQuant
-from .utils import is_integer
+        UniformQuantization, UniformSymmetricQuantization, STE, ClampedSTE
 from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind, QuantConfigurationError
 from .histogram import HistogramCalibrator
 from .kernel import qadd, qmul
 
+is_integer = lambda t: t.all_close(t.round())
+
+qlogger = logging.getLogger(name="QLayer")
+
 __ASSERT__ = 0
-__PRINT__ = 0
-# log_qlayer = lambda *args: None
-log_qlayer = lambda *args: print(*args) if __PRINT__ else None
 
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 class QuantizableModule(nn.Module):
     """
-    Interface for quantizable modules to implement.
+    Interface for Modules that should be quantized to implement.
 
     During fp training, this module acts as Identity if forward is not overwritten.
     It also has a Tuning Stage, which can be either
         * Quantization Aware Training (QAT) or
         * Calibration
     and then a fully quantized stage;
-    Each of the stages should be implemented by subclasses.
+    For each of the stages, an Implementation needs to provide the forward method, i.e.:
+        1. forward_fp
+        2. forward_qat
+        3. forward_quantized
     """
     FLOAT_SCALE = 1. # these determine all successive scale / zeros; retrieved by QuantStub
     FLOAT_ZERO = 0.
@@ -70,7 +73,7 @@ class QuantizableModule(nn.Module):
 
         self.n_qat_batches = 0
 
-        self.stage = QuantStage.FP32
+        self.stage = QuantStage.FP32 # stage starts out at floating point
         self.forward = self.forward_fp # changes from stage to stage
 
     def _set_qkwargs(
@@ -81,6 +84,7 @@ class QuantizableModule(nn.Module):
             num_bits_weight: int = 8,
             num_bits_bias: int = 32,
             nudge_zero: bool = False,
+            clamp_ste: bool = False,
             **qkwargs,
         ):
         self.num_bits = num_bits
@@ -88,15 +92,19 @@ class QuantizableModule(nn.Module):
         self.num_bits_weight = num_bits_weight
         self.weight_quantization = weight_quantization()
         self.num_bits_bias = num_bits_bias
+        self.fake_quantize = STE.apply_wrapper if not clamp_ste else ClampedSTE.apply_wrapper
 
     def stage_str(self) -> str:
         return self.stage_dict[self.stage]
+
+    # OVERWRITE THESE: =======>
 
     def forward_fp(self, x: Tensor) -> Tensor:
         return x
 
     def forward_qat(self, x: Optional[QTensor] = None,) -> QTensor:
         self.n_qat_batches += 1
+        return x
 
     def forward_quantized(self, x: QTensor) -> QTensor:
         raise NotImplementedError(f"{type(self)}.forward_quantized")
@@ -104,14 +112,14 @@ class QuantizableModule(nn.Module):
     def forward_calib(self, *args, **kwargs):
         return self.forward_fp(*args, **kwargs)
 
+    # <======== OVERWRITE THESE
+
     def calibration_prepare(self):
         self.stage = QuantStage.Calibration
         self.forward = self.forward_calib
 
-    def qat_prepare(self, **qkwargs):
-        if qkwargs:
-            warnings.warn(f"Replacing quantization parameters of {self} with {qkwargs}, and resetting other parameters to defaults!")
-            self._set_qkwargs(**qkwargs)
+    def qat_prepare(self):
+        # self._set_qkwargs() # DEBUG: sets defaults
 
         self.stage = QuantStage.QAT
         self.forward = self.forward_qat
@@ -122,10 +130,10 @@ class QuantizableModule(nn.Module):
         self.forward = self.forward_quantized
 
         if self.scale==self.FLOAT_SCALE:
-            warnings.warn(f"Quantized {self} has unchanged scale {self.scale}!")
+            qlogger.warn(f"Quantized {self} has unchanged scale {self.scale}!")
 
         if not [attr for attr in dir(self) if "scale" in attr or "zero" in attr]:
-            warnings.warn(
+            qlogger.warn(
 f"""
 During {self}.quantize(), no scale or zero attribute were found.
 These should be set for this instance of {type(self)}
@@ -134,6 +142,8 @@ during either entropy calibration (calibration.py) or QAT (qat_*.py).
 Could be due to calling super().quantize() before setting self.zero/self.scale.
 """
             )
+
+
 
 class QuantStub(QuantizableModule):
     """
@@ -230,10 +240,10 @@ class QMul(QuantizableModule):
         return a * b
 
     def forward_qat(self, a: QTensor, b: QTensor):
+        # NO affine transformation; multiply in float but keep track of scale
+        super().forward_qat()
         assert a.num_bits==self.num_bits_a, (a.num_bits, self.num_bits_a)
         assert b.num_bits==self.num_bits_b, (b.num_bits, self.num_bits_b)
-        super().forward_qat()
-        # NO affine transformation; multiply in float but keep track of scale
         rfloat = a._t * b._t
         r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
@@ -386,21 +396,23 @@ class QConv2d(QuantizableModule, nn.Conv2d):
 
 
 class QLinear(QuantizableModule, nn.Linear):
+    """
+    Quantizable Version of torch.nn.Linear
+    """
     def __init__(self, *args, qkwargs: Dict, dont_fakeQ: bool=False, **kwargs):
         # super().__init__(**qkwargs)
         QuantizableModule.__init__(self, **qkwargs)
         nn.Linear.__init__(self, *args, **kwargs)
+
         self.dont_fakeQ = dont_fakeQ
-        if not self.dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply_wrapper
 
     def forward_fp(self, x: Tensor):
         return F.linear(x, self.weight, self.bias)
 
     def forward_qat(self, x: QTensor):
         assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
-        # fake quantize w&b
         if not self.dont_fakeQ:
+            # fake quantize w&b using min, max of the parameters as range
             self.weight.data = self.fake_quantize(
                 self.weight.data, self.weight_quantization, self.num_bits_weight, None, None, handling_qtensors=False
             )
@@ -427,7 +439,7 @@ class QLinear(QuantizableModule, nn.Linear):
 
         if self.bias is not None:
             b = self.weight_quantization.quantize_to_qtensor_given_scale(
-                x=self.bias.data,
+                x=self.bias,
                 scale=w.scale * x.scale,
                 zero=0,
                 num_bits=self.num_bits_bias,
@@ -443,7 +455,7 @@ class QLinear(QuantizableModule, nn.Linear):
         # low bitwidth w @ x + b forward pass
         out = F.linear(x_zeroed, w_zeroed, bias=b)
 
-        # distributivity (see jacob et al 2018, sec 2.2)
+        # rescale (see jacob et al 2018, sec 2.2)
         multiplier = (x.scale * w.scale) / self.scale
 
         # scale result tensor back to given bit width
@@ -497,15 +509,23 @@ class QAdd(QuantizableModule):
     def forward_quantized(self, a: QTensor, b:QTensor) -> QTensor:
         return qadd(
             a=a, b=b,
-            scale_next=self.scale, zero_next=self.zero, op=torch.add,
-            quant_a=self.quant_a, quant_b=self.quant_b,
+            scale_next=self.scale,
+            zero_next=self.zero,
+            op=torch.add,
+            quant_a=self.quant_a,
+            quant_b=self.quant_b,
             quant_out=self.quantization,
-            num_bits_a=self.num_bits_a, num_bits_b=self.num_bits_b,
+            num_bits_a=self.num_bits_a,
+            num_bits_b=self.num_bits_b,
             num_bits_out=self.num_bits,
             rescale=self.rescale
         )
 
 class QStack(QuantizableModule):
+    """
+    Quantizable version of torch.stack; for LSTM..
+    May be used with the kwargs "dim" and "out" of torch.stack.
+    """
     def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None) -> QTensor:
         requantized: List[Tensor] = []
         for qt in qtensors:
@@ -530,7 +550,45 @@ class QStack(QuantizableModule):
         r = torch.stack([qt._t for qt in qtensors], dim=dim, out=out)
         return QTensor(r, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
 
+
+class QCat(QuantizableModule):
+    """
+    Quantizable version of torch.cat;
+    May be used with the kwargs "dim" and "out" of torch.cat.
+    """
+    def forward_fp(self, *args, **kwargs):
+        return torch.cat(*args, **kwargs)
+
+    def forward_qat(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None):
+        super().forward_qat()
+        for qt in qtensors:
+            assert type(qt) == QTensor, type(qt)
+            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
+        r = torch.cat([qt._t for qt in qtensors], dim=dim, out=out)
+        return QTensor(r, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
+
+    def forward_quantized(self, qtensors: List[QTensor], dim: int=0, out: Tensor=None) -> QTensor:
+        requantized: List[Tensor] = []
+        for qt in qtensors:
+            assert type(qt) == QTensor, type(qt)
+            assert qt.num_bits == self.num_bits, (qt.num_bits, self.num_bits)
+            fp_tensor = qt.dequantize()
+            rq = fp_tensor / self.scale + self.zero
+            rq = self.quantization.tensor_clamp(x=rq, num_bits=self.num_bits)
+            requantized += [rq]
+        r: Tensor = torch.cat(requantized, dim=dim, out=out)
+        qr: QTensor = QTensor(r, scale=self.scale, zero=self.zero, quantized=True, num_bits=self.num_bits)
+        return qr
+
+
+
+
+
 class QFill(QuantizableModule):
+    """
+    Quantizable version of torch.masked_fill.
+    fp_neg_val: negative value to fill with in floating point instead of negative infinity; to keep EMA range bounded
+    """
     def __init__(self, fp_neg_val: float=-1e5, **qkwargs):
         super().__init__(**qkwargs)
         self.fp_neg_val = float(fp_neg_val)
@@ -570,8 +628,8 @@ class QBoolMask(QuantizableModule):
         return QTensor(r, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
 class QSoftmax(QuantizableModule):
-
     def __init__(self, dim: int=-1, time_window: int = 144, alpha: float = None, layer_num: int=0, **qkwargs):
+        raise DeprecationWarning("QSoftmax is deprecated, use NonQuantizableModuleWrap to wrap a normal softmax instead")
 
         super().__init__(**qkwargs)
         self.dim = int(dim)
@@ -663,9 +721,19 @@ class QSoftmax(QuantizableModule):
         M = exponentiated.scale / norm_scale
         normed_exp = (zeroed_exp * M) # + self.normed_zero
         r = self.quantization.tensor_clamp(x=normed_exp, num_bits=self.num_bits)
-
         return r
 
+
+class NonQuantizableModuleWrap(QuantizableModule):
+    """
+    NonQuantizableModuleWrap can be used to wrap a module that should stay in floating point after
+    the model is converted to the quantized stage. It does not need a QListener.
+    Example usage:
+        >>> self.qsoftmax = NonQuantizableModuleWrap(
+        >>>     nn.Softmax(dim=-1), **qkwargs
+        >>> )
+
+    """
 
 class QuantModuleWrap(QuantizableModule):
     """
@@ -750,20 +818,6 @@ class NonQuantizableModuleWrap(QuantizableModule):
         if not isinstance(fp_out, tuple):
             fp_out = (fp_out,)
 
-        # fakeq_out = [
-        #             self.out_listener(
-        #                     self.quantization.quantize_to_qtensor_using_params(
-        #                         fp_o,
-        #                         scale=self.scale,
-        #                         zero=self.zero,
-        #                         num_bits=self.num_bits,
-        #                         quantized=False
-        #                     ))
-        #         if not isinstance(fp_o, (QTensor, type(None)))
-        #         else fp_o
-        #     for fp_o in fp_out
-        # ]
-
         fakeq_out = [
                     self.out_listener(
                         QTensor(fp_o, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
@@ -802,6 +856,11 @@ class NonQuantizableModuleWrap(QuantizableModule):
         return tuple(q_outs) if len(q_outs) > 1 else q_outs[0]
 
 class QReLU6(QuantizableModule):
+    """
+    Quantizable version of ReLU6.
+    To be used instead of ReLU to provide natural range during FP32 already
+    According to tensorflow guide: TODO
+    """
     def __init__(self, *args, **kwargs):
         super().__init__(**kwargs)
 
@@ -823,8 +882,8 @@ class QReLU6(QuantizableModule):
         zero = self.zero
 
         # this should be the case if self's QListener records the previous module
-        # as well. the below rescaling is therefore usually unnecessary
-        # in the case that these lines raise ASsertionError,
+        # as well. the below rescaling is therefore usually unnecessary.
+        # In the case that these lines raise an AssertionError,
         # either:
         # 1. make QListener listen to previous module as well
         # (init w/ e.g. QListener(linear, relu, **qkwargs))
@@ -834,8 +893,10 @@ class QReLU6(QuantizableModule):
         # assert round(zero, 5) == round(x.zero, 5), \
         #         (zero, x.zero)
 
+        # requantize
         inp = x.dequantize()
         inp = inp / scale + zero
+        # clamp
         six = round(6. / scale + zero)
         out = inp.round().clamp(min=zero, max=six)
 
@@ -920,7 +981,7 @@ class QHardTanH(QuantizableModule):
 
 def DiscreteHartleyTransform(input):
     # from https://github.com/AlbertZhangHIT/Hartley-spectral-pooling/blob/master/spectralpool.py
-    # TODO test as alternative
+    # TODO test as alternative to FFT
     fft = torch.rfft(input, 2, normalized=True, onesided=False)
     dht = fft[:, :, :, :, -2] - fft[:, :, :, :, -1]
     return dht
@@ -937,9 +998,7 @@ class FFT(QuantizableModule):
 
     def forward_fp(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         if mask is not None:
-            log_qlayer("="*20)
-            log_qlayer("Warning: FFT mask not yet implemented!")
-            log_qlayer("="*20)
+            qlogger.warn(f"FFT mask not yet implemented!")
 
         # method 1 (paper):
         x = fft(fft(x, dim=-1), dim=-2).real
@@ -947,6 +1006,92 @@ class FFT(QuantizableModule):
         # x = fft2(x)
         # x = x.real # method 2b:  + x.imag
         return x
+
+
+class QLabel(QuantizableModule):
+    """
+    Learnable Label (https://arxiv.org/abs/2109.10252)
+    appended/prepended to input and fitted to its range
+    """
+    def __init__(self,
+            rank: int = 3,
+            dim: int = 1,
+            hidden_dim: int = 100,
+            prepend: bool = False,
+            init_fn: Callable = torch.randn,
+            plot_name: Optional[str] = None,
+            **qkwargs
+        ):
+        """
+        :param rank: rank of tensor x to concatenate the label to
+        :param cat_dim: which dimension of x to concatenate the label to
+        :param hidden_dim: which dimension of x is the hidden dimension
+        :param hidden_size: hidden dimensionality of label; must match x.shape[hidden_dim]
+        :param prepend: whether to prepend or append the label in given dim
+        :param init_fn:
+        """
+        super().__init__(**qkwargs)
+
+        self.rank = rank
+        self.cat_dim = cat_dim
+        self.hidden_dim = hidden_dim
+
+        dims = [1] * rank
+        dims[hidden_dim]=hidden_size
+
+        self.prepend = prepend
+
+        self.label = nn.Parameter(init_fn(*dims))
+        self.qcat = QCat(**qkwargs)
+
+        self.qcat_listener = QListener(self.qcat, plot_name=plot_name, **qkwargs)
+
+        self.num_bits_label = self.num_bits_weight
+
+    def _fwd(self, X: torch.Tensor):
+
+        expand_args = [-1] * self.rank
+        # expand along all dimensions which arent hidden_dim or cat_dim
+        for d in range(self.rank):
+            if d not in {self.hidden_dim, self.cat_dim}:
+                expand_args[d] = X.shape[d]
+
+        expanded_label = self.label.expand(*expand_args)
+
+        if self.prepend:
+            to_cat = [expanded_label, X]
+        else:
+            to_cat = [X, expanded_label]
+
+        # Add label
+        x_with_label = self.qcat(to_cat, dim=self.cat_dim)
+        return x_with_label
+
+    def forward_fp(self, X: Tensor):
+        return self._fwd(X)
+
+    def forward_qat(self, X: QTensor):
+        super().forward_qat()
+        assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
+        self.fake_quantize(
+            self.label.data, self.weight_quantization, self.num_bits_label, None, None, handling_qtensors=False
+        )
+        x_with_label = self._fwd(x)
+        x_with_label = self.qcat_listener(x_with_label)
+        return x_with_label
+
+    def forward_quantized(self, X: QTensor):
+        return self._fwd(X)
+
+    def quantize(self):
+        super().quantize()
+        # nn.Parameter label is replaced by QTensor
+        self.label = self.weight_quantization.quantize_to_qtensor_using_range(
+            x=self.label.data,
+            num_bits=self.num_bits_label, # _bias # TODO
+            quantized=True
+        )
+
 
 class QPositionalEncoding(QuantizableModule):
     """
@@ -976,6 +1121,9 @@ class QPositionalEncoding(QuantizableModule):
     def forward_qat(self, X: QTensor):
         super().forward_qat()
         assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
+        self.fake_quantize(
+            self.W.data, self.weight_quantization, self.num_bits_bias, None, None, handling_qtensors=False
+        )
         rfloat = self.W + X._t
         r = QTensor(rfloat, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
         return r
@@ -1003,13 +1151,13 @@ class QPositionalEncoding(QuantizableModule):
 
 class QListener(QuantizableModule):
     """
-    During tuning (calibration or QAT),
-    this module records (min and max) or (mean) or (a histogram)
-    of values of torch.Tensors passing through.
+    During tuning (Calibration or QAT),
+    this module records either of (min and max) or (mean) or (a histogram)
+    of torch.Tensors passing through.
     (no other module records stats)
     Constructed with n nn.Modules "modules", for each of which the QListener sets the attributes:
-        - module.scale_next
-        - module.zero_next
+        - module.scale
+        - module.zero
     and either
         - module.min
         - module.max
@@ -1020,7 +1168,9 @@ class QListener(QuantizableModule):
     or
         - Nothing else
     (if self.distribution_kind == DistKind.CLIPPED)
-    If name is given, this module sets the attributes  module.{self.name}_scale, and so on.
+    If name is given, this module sets the attributes module.{self.name}_scale, and so on, instead.
+    Each QuantizableModule needs to be updated by some QListener, that should manually be placed
+    after the module.
     """
     def __init__(
             self,
@@ -1039,10 +1189,12 @@ class QListener(QuantizableModule):
 
         super().__init__(**qkwargs)
 
+        # print(f"qlistener {plot_name} setup: qkwargs={qkwargs}\nself.num_bits={self.num_bits}\nself.num_bits_weight={self.num_bits_weight}")
+
         self.function = function # optionally apply function before collecting stats (for softmax)
         self.name = "" if listener_name is None else str(listener_name) # set attribute name_scale_next and so on
         self.ema_decay = ema_decay
-        self.set_qparams_during_quantization = False # updates range after every tuning forward call
+        self.set_qparams_during_quantization = False # updates qparams after every tuning forward call if False; otherwise only updates qparams Once during conversion
         self.mods = list(modules)
         self.record_n_batches = qkwargs["record_n_batches_qlistener"]
 
@@ -1097,22 +1249,19 @@ by initializing it with clipped_distr: bool given as kwarg.
                         raise QuantConfigurationError(errmsg)
                     else:
                         # errmsg += "(The problem is due to some input modules producing a symmetric, others a clipped distribution.)"
-                        # NOTE assume clipping is applied to everything
-                        warnings.warn(f"QListener encountered some clipping, some symmetrizing input modules. Assuming everything is clipped.")
+                        # NOTE assume clipping is applied to everything; this occurs in a qlistener that listens to a relu after a batchnorm
+                        qlogger.warn(f"QListener encountered some clipping, some symmetrizing input modules. Assuming everything is clipped.")
                         self.distribution_kind = DistKind.CLIPPED
                         distkind = "clipped"
-                warnings.warn(f"QListener listening to\n{self.mods}\ndecided on {distkind}")
+                qlogger.warn(f"QListener listening to\n{self.mods}\ndecided on {distkind}")
         else:
             # distribution does not matter if we just estimate EMA min/max
             if clipped_distr is not None:
-                warnings.warn(f"QListener listening to\n{self.mods}\nignores given kwarg clipped_distr={clipped_distr} because it calibrates with EMA only")
+                qlogger.warn(f"QListener listening to\n{self.mods}\nignores given kwarg clipped_distr={clipped_distr} because it calibrates with EMA only")
             self.distribution_kind = DistKind.IGNORE
 
         if self.distribution_kind != DistKind.CLIPPED:
             self.__stats__ = defaultdict()
-            # # TODO FIXME is this still necessary?
-            # for module in self.mods:
-            #     setattr(module, self.name+'__stats__', self.__stats__)
 
         threshs = qkwargs["thresholds"].lower()
         if "symm" in threshs:
@@ -1125,21 +1274,18 @@ by initializing it with clipped_distr: bool given as kwarg.
             raise QuantConfigurationError(f"thresholds={threshs}")
 
         self.dont_fakeQ = dont_fakeQ
-        if not dont_fakeQ:
-            self.fake_quantize = FakeQuant.apply_wrapper
 
         self._qparams_set = False
+        # print(f"qlistener {plot_name} setup ended;\nself.num_bits={self.num_bits}\nself.num_bits_weight={self.num_bits_weight}")
 
     def freeze(self):
-        log_qlayer("="*30)
-        log_qlayer(self, " stopped recording.")
-        log_qlayer("="*30)
+        qlogger.info(f"{self} stopped recording.")
         assert not self.set_qparams_during_quantization, "stats must have been set during qat to freeze"
 
         # TODO call super().forward_qat .. how can I use self in method?
         self.forward_qat = lambda x: x
 
-    def forward_fp(self, x:Tensor, dont_plot=False):
+    def forward_fp(self, x: Tensor, dont_plot=False):
         x = self.qplotter(x, dont_plot=dont_plot)
         return x
 
@@ -1164,6 +1310,7 @@ by initializing it with clipped_distr: bool given as kwarg.
         Collect stats, optionally fakequantize;
         per default also set qparams of monitored modules
         """
+        # print(f"ql({self.qplotter.name}) input bits: {x.num_bits}; self.num_bits={self.num_bits}")
         super().forward_qat()
         assert isinstance(x, QTensor), type(x)
         if not self.distribution_kind==DistKind.CLIPPED:
@@ -1187,6 +1334,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             self.freeze()
         assert not x.quantized
         x = self.qplotter(x, dont_plot=dont_plot)
+        # print(f"ql({self.qplotter.name}) output bits: {x.num_bits}; self.num_bits={self.num_bits}")
         return x
 
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
@@ -1246,17 +1394,14 @@ by initializing it with clipped_distr: bool given as kwarg.
 
         if not self.__stats__:
             self.__stats__ = dict_new_vals
-        else:
-            for key, new_val in dict_new_vals.items():
-                curr_val = self.__stats__[key]
-                self.__stats__[key] = max(new_val, curr_val) if curr_val is not None else new_val
+        # else:
+        #     for key, new_val in dict_new_vals.items():
+        #         curr_val = self.__stats__[key]
+        #         self.__stats__[key] = max(new_val, curr_val) if curr_val is not None else new_val
 
         for key, ema in self.__stats__.items():
             new_val = dict_new_vals[key]
             self.__stats__[key] -= (1 - self.ema_decay) * (ema - new_val)
-
-        # for module in self.mods:
-        #     setattr(module, self.name+'__stats__', self.__stats__)
 
     def quantize(self):
         if self.set_qparams_during_quantization:
@@ -1310,24 +1455,35 @@ by initializing it with clipped_distr: bool given as kwarg.
                 msg += f", {list(stats.keys())}"
                 for key, ema in stats.items():
                     setattr(mod, prefix+key, ema)
-            # log_qlayer(msg+"\n"+("="*20))
+            # qlogger.debug(msg+"\n"+("="*20))
         self._qparams_set = True
 
     def __repr__(self):
-        s = f"QListener(mods={self.mods}, dist={self.distribution_kind}, calib={self.calibration_mode})"
+        s = f"QListener(\n"
+        if self.name:
+            s += "name={self.name},\n"
+        s += "plot_name={self.plot_name},\n"
+        s += "mods={self.mods},\n"
+        s += "dist={self.distribution_kind},\n"
+        s += "calib={self.calibration_mode})\n"
+        s += ")"
         return s
 
 class QPlotter(QuantizableModule):
+    """
+    Module to save histograms of forwarded Tensors;
+    saving with different frequencies/indices per quantization stage.
+    """
     def __init__(
             self,
-            plot_name,
-            stage_plot_freqs: Dict[str,int] = {
+            plot_name, # title of matplotlib plot
+            stage_plot_freqs: Dict[str,int] = { # for each quantization stage, save a histogram every so often?
                 "FP32": -1,
                 "Calibration": -1,
                 "QAT": -1,
                 "Quantized": -1,
             },
-            stage_plot_indices: Dict[str, List[int]] = {
+            stage_plot_indices: Dict[str, List[int]] = { # for each quantization stage, save a histogram of the ith Tensor passing through?
                 "FP32":[],
                 "Calibration":[],
                 "QAT":[],
@@ -1336,15 +1492,16 @@ class QPlotter(QuantizableModule):
             **qkwargs
         ):
         super().__init__(**qkwargs)
-        ext = "png"
+        ext = "png" # save histogram as png files
 
-        self.float_bins = qkwargs.get("calib_num_bins", 1000)
+        self.float_bins = qkwargs.get("calib_num_bins", 1000) # x axis resolution during floating point/calibration
 
         self.name = plot_name.replace(" ","_")
         self.stage_plot_freqs = stage_plot_freqs if \
                 not "stage_plot_freqs" in qkwargs else qkwargs["stage_plot_freqs"]
         self.stage_plot_indices = stage_plot_indices if not "stage_plot_indices" in qkwargs else qkwargs["stage_plot_indices"]
 
+        # create plot directory under name
         # FIXME TODO NOTE get log directory name and run name from TrainMan
         plots_dir = os.path.join("logs", qkwargs["name"], "plots")
         if not os.path.exists(plots_dir):
@@ -1352,17 +1509,17 @@ class QPlotter(QuantizableModule):
 
         plot_dir = os.path.join(plots_dir, self.name)
         self.plot_dir = plot_dir # TODO add to cfg/CLI or read from datetime
-
         self.plot_tmpl = "{}_{}_{}."+ext
 
+        # create a sub-plotdirectory for each quantization stage
         sub_dirs = [os.path.join(self.plot_dir, stage) for stage in list(self.stage_dict.values())]
         if not os.path.exists(self.plot_dir):
             os.mkdir(self.plot_dir)
-            # log_qlayer(f"Created directory {self.plot_dir}!")
+            # qlogger.debug(f"Created directory {self.plot_dir}!")
         for sub_dir in sub_dirs:
             if not os.path.exists(sub_dir):
                 os.mkdir(sub_dir)
-                # log_qlayer(f"Created directory {sub_dir}!")
+                # qlogger.debug(f"Created directory {sub_dir}!")
 
         self.logger = logging.getLogger(name=self.name)
         # increase when dont_plot is not True in forward call
@@ -1377,7 +1534,8 @@ class QPlotter(QuantizableModule):
         latests_dir = os.path.join(plots_dir, "LATEST_PLOTS")
         if not os.path.exists(latests_dir):
             os.mkdir(latests_dir)
-        # will create copy of file when plotting:
+
+        # will create copy of file when plotting and write it to this file always:
         latest_copy = self.name+"_latest_{}." + ext
         self.latest_path = lambda: os.path.join(latests_dir, latest_copy.format(self.stage_str()))
 
@@ -1412,24 +1570,29 @@ class QPlotter(QuantizableModule):
         return self.plot_hack_fn(x)
 
     def forward_qat(self, x: Optional[QTensor] = None, dont_plot = False) -> QTensor:
+
         assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         self._log(x, dont_plot=dont_plot)
         out = self.plot_hack_fn(x._t)
+
         return QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=False)
 
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
+
         assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
         self._log(x, dont_plot=dont_plot)
         out = self.plot_hack_fn(x._t)
+
         return QTensor(out, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
     def _log(self, x: Union[Tensor, QTensor], dont_plot=False):
+        """
+        """
+
         bins = None
         if isinstance(x, QTensor):
             data, scale, zero = x._t, x.scale, x.zero
             if self.stage == QuantStage.QAT:
-                # log_qlayer(data)
-                # log_qlayer(f"Tensor unique values ^")
                 # assert not x.quantized
                 a = ( 0 - zero) * scale
                 b = ((2**self.num_bits-1) - zero) * scale
@@ -1448,13 +1611,16 @@ class QPlotter(QuantizableModule):
                 fstr += f"\nNELEM\t= {data.nelement()}"
                 fstr += f"\nUNIQ\t= {data.unique()}"
                 fstr += f"\n#UNIQ\t= {through} ({through_ratio}% of {mini})"
+
                 self.logger.debug("="*20)
                 self.logger.debug(fstr)
 
                 assert x.quantized
+
                 a = 0
                 b = 2**self.num_bits-1
                 size = 1
+
             # get bins
             bins = np.arange(a,b+size,size)
             info = f";\nscale={round(scale,3)}, zero={round(zero,3)}"
@@ -1462,6 +1628,7 @@ class QPlotter(QuantizableModule):
             bins = self.float_bins
             data = x
             info = ""
+
         if hasattr(self, "min"):
             assert hasattr(self, "max")
             info += f";\nmin={round(self.min, 2)}, max={round(self.max,2)}"
@@ -1470,22 +1637,20 @@ class QPlotter(QuantizableModule):
             # sorted_data = data.reshape(-1).sort()[0]
             # shifts = (sorted_data - sorted_data.roll(1))
             # weighted_var = shifts.var()/(data.max()-data.min())
-            # log_qlayer(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
+            # qlogger.debug(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
+        # if idx matches either of the two plotting criteria, store matplotlib histogram
         stage_str = self.stage_str()
         count = self.stage_counters[stage_str]
-        # sometimes store matplotlib histogram
-        plot_because_idx = count in self.stage_plot_indices[stage_str]
         freq = self.stage_plot_freqs[stage_str]
         plot_because_freq = False if freq <= 0 else count % freq == 0
-        should_plot = not dont_plot and (plot_because_idx or plot_because_freq)
+        plot_because_idx = count in self.stage_plot_indices[stage_str]
 
-        # log_qlayer(freq, count, self.stage_plot_indices[stage_str])
-        # log_qlayer(f"{self.name} should plot? {should_plot}")
-        # log_qlayer(f"to {self.latest_path()}")
+        if not dont_plot and (plot_because_idx or plot_because_freq):
+            # plot data
 
-        if should_plot: # and stage==QuantStage.Quantized:
             plot_data = data.detach().reshape(-1).cpu().numpy()
+
             plt.hist(plot_data, bins=bins)
             plt.ylabel("Frequency of bin")
             plt.title(stage_str+f" hist ({self.name}), batch #{count}"+info, fontsize=10)
@@ -1504,6 +1669,10 @@ class QPlotter(QuantizableModule):
             self.stage_counters[stage_str] += 1
 
 
+# import these lists to files that define relevant modules (batchnorm.py)
+# and add relevant modules to given list
+
+# for calibration to work
 # these must be updated in every module that adds QuantizableModules in need of a listener
 global CLIPPING_MODULES, SYMMETRIZING_MODULES
 CLIPPING_MODULES = [
@@ -1520,5 +1689,17 @@ SYMMETRIZING_MODULES = [
     QFill,
 ] # ^ comprehensive list of modules that output symmetric distribution
 
-# import these lists to files that define relevant modules (batchnorm.py)
-# and add relevant modules to given list
+
+global OPS, NONQUANT
+OPS = [
+    nn.Conv2d,
+    nn.Linear,
+    nn.modules.batchnorm._BatchNorm,
+    nn.MaxPool2d
+]
+NONQUANT = [
+    NonQuantizableModuleWrap
+]
+
+
+
