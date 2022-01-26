@@ -20,6 +20,7 @@ from .quantizable_layer import \
     QPositionalEncoding, \
     QFill, \
     QCat, \
+    QLabel, \
     QReLU6, \
     QLinear, \
     FFT, \
@@ -600,8 +601,8 @@ class QTransformerEncoder(nn.Module):
 
         self.learnable_label = learnable_label
         if learnable_label:
-            self.add_label = QLabel(dim=1, rank=3, **qkwargs)
-            # self.label_listener = QListener(self.add_label, plot_name="label", **qkwargs)
+            self.add_label = QLabel(rank=3, cat_dim=1, hidden_dim=2, hidden_size=dim, **qkwargs)
+            time_window += 1
 
         # TODO FIXME add these again
         self.has_pe = qkwargs["transformer"]["has_pe"]

@@ -3,13 +3,16 @@ from torch import Tensor
 from torch.nn import Parameter
 
 from typing import Union, Callable, Tuple
-import warnings
+import logging
 import math
 
 from .qtensor import QTensor
 from .quantization_functions import Quantization, quant_logger
 
 is_integer = lambda t: t.allclose(t.round())
+
+
+kernel_logger = logging.getLogger(name="KERNEL")
 
 # This module contains "kernels" that simulate low bit addition, multiplication, and matmul
 # (the terminology "kernel" is from https://github.com/google/gemmlowp : low bit compute functions)
@@ -173,10 +176,10 @@ def qmul(
     # DEBUG: Make sure we didnt move outside of EMA range:
     if r.min() == r.max():
         expressions = ["scale_next", "zero_next", "r.min()", "a._t.min()", "a._t.max()", "b._t.min()", "b._t.max()", "r_float.min()", "r_float.max()", "r_unclamped.min()", "r_unclamped.max()", "multiplier", "factor"]
-        msg = "\n"
+        msg = "Output of Kernel qmul is singular!\n"
         for expression in expressions:
             msg += expression+ "\t = \t"+ str(eval(expression)) + "\n"
-        warnings.warn(msg)
+        kernel_logger.warn(msg)
 
     assert is_integer(r), r
 

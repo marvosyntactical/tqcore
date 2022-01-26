@@ -876,8 +876,9 @@ class QLabel(QuantizableModule):
     """
     def __init__(self,
             rank: int = 3,
-            dim: int = 1,
-            hidden_dim: int = 100,
+            cat_dim: int = 1,
+            hidden_dim: int = 1,
+            hidden_size: int = 100,
             prepend: bool = False,
             init_fn: Callable = torch.randn,
             plot_name: Optional[str] = None,
@@ -889,46 +890,58 @@ class QLabel(QuantizableModule):
         :param hidden_dim: which dimension of x is the hidden dimension
         :param hidden_size: hidden dimensionality of label; must match x.shape[hidden_dim]
         :param prepend: whether to prepend or append the label in given dim
-        :param init_fn:
+        :param init_fn: torch.randn, torch.rand, torch.zeros, etc
         """
         super().__init__(**qkwargs)
 
         self.rank = rank
         self.cat_dim = cat_dim
         self.hidden_dim = hidden_dim
+        self.prepend = prepend
 
         dims = [1] * rank
         dims[hidden_dim]=hidden_size
-
-        self.prepend = prepend
-
         self.label = nn.Parameter(init_fn(*dims))
-        self.qcat = QCat(**qkwargs)
 
-        self.qcat_listener = QListener(self.qcat, plot_name=plot_name, **qkwargs)
+        lbl_pn = "" if not plot_name else lbl_pn + " lbl"
+        self.lbl_quant_stub = QuantStub(**qkwargs)
+        self.lbl_listener = QListener(self.lbl_quant_stub, plot_name=lbl_pn, **qkwargs)
+
+        cat_pn = "" if not plot_name else lbl_pn + " cat"
+        self.qcat = QCat(**qkwargs)
+        self.qcat_listener = QListener(self.qcat, plot_name=cat_pn, **qkwargs)
 
         self.num_bits_label = self.num_bits_weight
 
-    def _fwd(self, X: torch.Tensor):
-
+    def _fwd(self, X: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
+        raise NotImplementedError("TODO: implement QLabel, for now: set cfg's 'learnable_label': false")
         expand_args = [-1] * self.rank
         # expand along all dimensions which arent hidden_dim or cat_dim
         for d in range(self.rank):
             if d not in {self.hidden_dim, self.cat_dim}:
                 expand_args[d] = X.shape[d]
 
-        expanded_label = self.label.expand(*expand_args)
+        lbl = self.label.expand(*expand_args),
+        lbl = self.lbl_quant_stub(lbl)
+        lbl = self.lbl_listener(lbl)
+
+        if self.stage == QuantStage.Quantized:
+            # requantize
+            dq_lbl: Tensor = lbl.dequantize()
+            lbl: Tensor = self.lbl_listener.weight_quantization.tensor_clamp(dq_lbl / X.scale + x.zero, num_bits=self.num_bits_label)
+            lbl: QTensor = QTensor(lbl, scale=X.scale, zero=X.zero, num_bits=self.num_bits)
 
         if self.prepend:
-            to_cat = [expanded_label, X]
+            to_cat = [lbl, X]
         else:
-            to_cat = [X, expanded_label]
+            to_cat = [X, lbl]
 
         # Add label
         x_with_label = self.qcat(to_cat, dim=self.cat_dim)
+        x_with_label = self.qcat_listener(to_cat)
         return x_with_label
 
-    def forward_fp(self, X: Tensor):
+    def forward_fp(self, X: Tensor) -> Tensor:
         return self._fwd(X)
 
     def forward_qat(self, X: QTensor):
@@ -937,17 +950,19 @@ class QLabel(QuantizableModule):
         self.fake_quantize(
             self.label.data, self.weight_quantization, self.num_bits_label, None, None, handling_qtensors=False
         )
-        x_with_label = self._fwd(x)
-        x_with_label = self.qcat_listener(x_with_label)
+        x_with_label = self._fwd(X)
+
         return x_with_label
 
-    def forward_quantized(self, X: QTensor):
+    def forward_quantized(self, X: QTensor) -> QTensor:
+        # access quantized self.lbl and rescale incoming X to to its scale
         return self._fwd(X)
+
 
     def quantize(self):
         super().quantize()
         # nn.Parameter label is replaced by QTensor
-        self.label = self.weight_quantization.quantize_to_qtensor_using_range(
+        self.lbl = self.weight_quantization.quantize_to_qtensor_using_range(
             x=self.label.data,
             num_bits=self.num_bits_label, # _bias # TODO
             quantized=True
@@ -1242,7 +1257,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             assert self.calibration_mode == CalibMode.EMA
             min_val = torch.min(x).item()
             max_val = torch.max(x).item()
-            assert max_val != min_val, (max_val, (x==max_val).all())
+            assert max_val != min_val, (max_val, x.unique())
             dict_new_vals = {"min": min_val, "max": max_val}
 
         if not self.__stats__:
