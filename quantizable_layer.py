@@ -31,7 +31,10 @@ from .config import TuningMode, CalibMode, ThresholdMode, QuantStage, DistKind, 
 from .histogram import HistogramCalibrator
 from .kernel import qadd, qmul
 
-__ASSERT__ = 1
+__ASSERT__ = 0
+__PRINT__ = 0
+# log_qlayer = lambda *args: None
+log_qlayer = lambda *args: print(*args) if __PRINT__ else None
 
 # this module contains quantizable versions of basic nn.Modules, as well as some helper modules
 class QuantizableModule(nn.Module):
@@ -106,7 +109,9 @@ class QuantizableModule(nn.Module):
         self.forward = self.forward_calib
 
     def qat_prepare(self, **qkwargs):
-        self._set_qkwargs(**qkwargs)
+        if qkwargs:
+            warnings.warn(f"Replacing quantization parameters of {self} with {qkwargs}, and resetting other parameters to defaults!")
+            self._set_qkwargs(**qkwargs)
 
         self.stage = QuantStage.QAT
         self.forward = self.forward_qat
@@ -309,7 +314,20 @@ class QConv2d(QuantizableModule, nn.Conv2d):
             self.bias.data = self.fake_quantize(
                 self.bias.data, self.weight_quantization, self.num_bits_bias, None, None, handling_qtensors=False
             )
-        return QTensor(nn.Conv2d.forward(self, x._t), scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
+        r = QTensor(nn.Conv2d.forward(self, x._t), scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=False)
+        log_qlayer("vvvvvvv CONVOLUTION QAT vvvvvvv")
+        log_qlayer(f"x min: {x._t.min()}")
+        log_qlayer(f"x max: {x._t.max()}")
+        log_qlayer(f"r min: {r._t.min()}")
+        log_qlayer(f"r max: {r._t.max()}")
+        log_qlayer("="*10)
+        # log_qlayer(r)
+        log_qlayer(((r._t==0).sum()/r._t.nelement()).item())
+        log_qlayer(r._t.unique().nelement())
+        log_qlayer("^^^^^^^ CONVOLUTION QAT ^^^^^^^")
+        # if r._t.min() == r._t.max():
+        return r
+
 
     def quantize(self):
         super().quantize()
@@ -326,7 +344,7 @@ class QConv2d(QuantizableModule, nn.Conv2d):
         """
         assert x.num_bits==self.num_bits, (x.num_bits, self.num_bits)
 
-        if layer.bias is not None:
+        if self.bias is not None:
             b = self.weight_quantization.quantize_to_qtensor_given_scale(
                 self.bias.data,
                 self.w.scale * x.scale,
@@ -337,7 +355,7 @@ class QConv2d(QuantizableModule, nn.Conv2d):
         else:
             b = None
 
-        w_zeroed = self.w._t - w.zero
+        w_zeroed = self.w._t - self.w.zero
         x_zeroed = x._t - x.zero
 
         pad = self._reversed_padding_repeated_twice if hasattr(self, "_reversed_padding_repeated_twice") else tuple(x for x in reversed(self.padding) for _ in range(2))
@@ -362,7 +380,7 @@ class QConv2d(QuantizableModule, nn.Conv2d):
         # scale result tensor back to given bit width, saturate to uint if unsigned is used
         out = out * multiplier + self.zero
 
-        out = quant_input.tensor_clamp(out, num_bits=self.num_bits)
+        out = self.quantization.tensor_clamp(out, num_bits=self.num_bits)
 
         return QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
 
@@ -435,6 +453,13 @@ class QLinear(QuantizableModule, nn.Linear):
         out = self.quantization.tensor_clamp(x=out, num_bits=self.num_bits)
 
         return QTensor(out, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
+
+class Add(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a, b):
+        return a + b
 
 
 class QAdd(QuantizableModule):
@@ -641,23 +666,29 @@ class QSoftmax(QuantizableModule):
 
         return r
 
+
 class QuantModuleWrap(QuantizableModule):
     """
     Wraps a given QuantizableModule with QuantStub, DeQuantStub, and QListener.
     For quantizing only one or few modules in a given architecture.
     See models/resnet.py in branch 'wrapped'.
     """
-    def __init__(self, qmodule, plot_name=None, **qkwargs):
+    def __init__(self, qmodule: Optional[QuantizableModule]=None, plot_name="", **qkwargs):
         super().__init__(**qkwargs)
 
-        assert isinstance(qmodule, QuantizableModule), qmodule
 
         self.quantStub = QuantStub(**qkwargs)
         # overwrite calibration for input listener incase of KL calibration
         self.input_listener = QListener(self.quantStub, calibration="minmax", plot_name=plot_name + " input", **qkwargs)
 
-        self.qmodule = qmodule
-        self.out_listener = QListener(self.qmodule, plot_name=plot_name, **qkwargs)
+        if qmodule is not None:
+            assert isinstance(qmodule, QuantizableModule), qmodule
+            self.qmodule = qmodule
+            qmod = [self.qmodule]
+        else:
+            self.qmodule = lambda x: x
+            qmod = []
+        self.out_listener = QListener(*qmod, plot_name=plot_name, **qkwargs)
         self.deQuantStub = DeQuantStub(**qkwargs)
 
     def forward_fp(self, x) -> torch.Tensor:
@@ -669,20 +700,19 @@ class QuantModuleWrap(QuantizableModule):
 
     def forward_qat(self, x) -> QTensor:
         inp: QTensor = self.quantStub(x)
-        out: QTensor = self.qmodule(x)
-        outl: QTensor = self.out_listener(x)
-        outd: QTensor = self.deQuantStub(x)
+        out: QTensor = self.qmodule(inp)
+        outl: QTensor = self.out_listener(out)
+        outd: QTensor = self.deQuantStub(outl)
         return outd
 
     def forward_quantized(self, x) -> QTensor:
         inp: QTensor = self.quantStub(x)
-        out: QTensor = self.qmodule(x)
-        outl: QTensor = self.out_listener(x)
-        outd: QTensor = self.deQuantStub(x)
+        out: QTensor = self.qmodule(inp)
+        outl: QTensor = self.out_listener(out)
+        outd: QTensor = self.deQuantStub(outl)
         return outd
 
 class NonQuantizableModuleWrap(QuantizableModule):
-
     def __init__(self, module, plot_name=None, **qkwargs):
         super().__init__(**qkwargs)
 
@@ -700,8 +730,8 @@ class NonQuantizableModuleWrap(QuantizableModule):
         r = self.fp_module(*args, **kwargs)
         return r
 
-    def forward_calib(self, x, *args, **kwargs):
-        r = self.fp_module(x, *args, **kwargs)
+    def forward_calib(self, *args, **kwargs):
+        r = self.fp_module(*args, **kwargs)
         return self.out_listener(r)
 
     def forward_qat(self, *args, **kwargs) -> QTensor:
@@ -771,7 +801,6 @@ class NonQuantizableModuleWrap(QuantizableModule):
 
         return tuple(q_outs) if len(q_outs) > 1 else q_outs[0]
 
-
 class QReLU6(QuantizableModule):
     def __init__(self, *args, **kwargs):
         super().__init__(**kwargs)
@@ -800,10 +829,10 @@ class QReLU6(QuantizableModule):
         # 1. make QListener listen to previous module as well
         # (init w/ e.g. QListener(linear, relu, **qkwargs))
         # 2. comment out these assertions
-        assert round(scale, 5) == round(x.scale, 5), \
-                (scale, x.scale)
-        assert round(zero, 5) == round(x.zero, 5), \
-                (zero, x.zero)
+        # assert round(scale, 5) == round(x.scale, 5), \
+        #         (scale, x.scale)
+        # assert round(zero, 5) == round(x.zero, 5), \
+        #         (zero, x.zero)
 
         inp = x.dequantize()
         inp = inp / scale + zero
@@ -908,9 +937,9 @@ class FFT(QuantizableModule):
 
     def forward_fp(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         if mask is not None:
-            print("="*20)
-            print("Warning: FFT mask not yet implemented!")
-            print("="*20)
+            log_qlayer("="*20)
+            log_qlayer("Warning: FFT mask not yet implemented!")
+            log_qlayer("="*20)
 
         # method 1 (paper):
         x = fft(fft(x, dim=-1), dim=-2).real
@@ -1102,9 +1131,9 @@ by initializing it with clipped_distr: bool given as kwarg.
         self._qparams_set = False
 
     def freeze(self):
-        print("="*30)
-        print(self, " stopped recording.")
-        print("="*30)
+        log_qlayer("="*30)
+        log_qlayer(self, " stopped recording.")
+        log_qlayer("="*30)
         assert not self.set_qparams_during_quantization, "stats must have been set during qat to freeze"
 
         # TODO call super().forward_qat .. how can I use self in method?
@@ -1163,12 +1192,13 @@ by initializing it with clipped_distr: bool given as kwarg.
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
 
         if __ASSERT__:
-            # costly! remove these! TODO FIXME
+            # costly!
             assert isinstance(x, QTensor)
             assert x.quantized
             assert is_integer(x._t)
             assert x._t.min() != x._t.max(), (x._t.min(), self.__stats__)
             assert len(torch.unique(x._t)) > 1, torch.unique(x._t)
+
         x = self.qplotter(x, dont_plot=dont_plot)
         return x
 
@@ -1204,7 +1234,14 @@ by initializing it with clipped_distr: bool given as kwarg.
             assert self.calibration_mode == CalibMode.EMA
             min_val = torch.min(x).item()
             max_val = torch.max(x).item()
-            assert max_val != min_val, (max_val, (x==max_val).all())
+            log_qlayer("update ema ---v")
+            log_qlayer("max_val: ", (max_val))
+            log_qlayer("min_val: ", (min_val))
+            log_qlayer("update ema ---^")
+            if max_val == min_val:
+                # assert False, (min_val, max_val)
+                pass
+
             dict_new_vals = {"min": min_val, "max": max_val}
 
         if not self.__stats__:
@@ -1273,7 +1310,7 @@ by initializing it with clipped_distr: bool given as kwarg.
                 msg += f", {list(stats.keys())}"
                 for key, ema in stats.items():
                     setattr(mod, prefix+key, ema)
-            # print(msg+"\n"+("="*20))
+            # log_qlayer(msg+"\n"+("="*20))
         self._qparams_set = True
 
     def __repr__(self):
@@ -1321,11 +1358,11 @@ class QPlotter(QuantizableModule):
         sub_dirs = [os.path.join(self.plot_dir, stage) for stage in list(self.stage_dict.values())]
         if not os.path.exists(self.plot_dir):
             os.mkdir(self.plot_dir)
-            # print(f"Created directory {self.plot_dir}!")
+            # log_qlayer(f"Created directory {self.plot_dir}!")
         for sub_dir in sub_dirs:
             if not os.path.exists(sub_dir):
                 os.mkdir(sub_dir)
-                # print(f"Created directory {sub_dir}!")
+                # log_qlayer(f"Created directory {sub_dir}!")
 
         self.logger = logging.getLogger(name=self.name)
         # increase when dont_plot is not True in forward call
@@ -1352,6 +1389,7 @@ class QPlotter(QuantizableModule):
             Hacky torch.autograd.Function used by tst_pytorch.QPlotter
             to save the path of the latest saved image.
             For visualizing the activations with pytorchviz
+            Retrieved by torchviz.make_dot
             """
             @staticmethod
             def forward(ctx, x: torch.Tensor):
@@ -1390,8 +1428,8 @@ class QPlotter(QuantizableModule):
         if isinstance(x, QTensor):
             data, scale, zero = x._t, x.scale, x.zero
             if self.stage == QuantStage.QAT:
-                # print(data)
-                # print(f"Tensor unique values ^")
+                # log_qlayer(data)
+                # log_qlayer(f"Tensor unique values ^")
                 # assert not x.quantized
                 a = ( 0 - zero) * scale
                 b = ((2**self.num_bits-1) - zero) * scale
@@ -1432,7 +1470,7 @@ class QPlotter(QuantizableModule):
             # sorted_data = data.reshape(-1).sort()[0]
             # shifts = (sorted_data - sorted_data.roll(1))
             # weighted_var = shifts.var()/(data.max()-data.min())
-            # print(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
+            # log_qlayer(f"WEIGHTED_VAR({name}): {weighted_var.item()}")
 
         stage_str = self.stage_str()
         count = self.stage_counters[stage_str]
@@ -1440,8 +1478,13 @@ class QPlotter(QuantizableModule):
         plot_because_idx = count in self.stage_plot_indices[stage_str]
         freq = self.stage_plot_freqs[stage_str]
         plot_because_freq = False if freq <= 0 else count % freq == 0
+        should_plot = not dont_plot and (plot_because_idx or plot_because_freq)
 
-        if not dont_plot and (plot_because_idx or plot_because_freq): # and stage==QuantStage.Quantized:
+        # log_qlayer(freq, count, self.stage_plot_indices[stage_str])
+        # log_qlayer(f"{self.name} should plot? {should_plot}")
+        # log_qlayer(f"to {self.latest_path()}")
+
+        if should_plot: # and stage==QuantStage.Quantized:
             plot_data = data.detach().reshape(-1).cpu().numpy()
             plt.hist(plot_data, bins=bins)
             plt.ylabel("Frequency of bin")
