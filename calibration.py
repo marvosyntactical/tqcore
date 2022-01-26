@@ -5,9 +5,9 @@ import warnings
 
 from .quantization_functions import *
 from .quantizable_layer import QuantizableModule
-from .quantized_layer import _factory_convert_layer_forward_impl, \
-        OPS, NONQUANT
-from .qat_convert import *
+# from .quantized_layer import _factory_convert_layer_forward_impl, \
+#        OPS, NONQUANT
+# from .qat_convert import *
 
 def calibration_prepare(
         module: nn.Module,

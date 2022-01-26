@@ -57,7 +57,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
             self.folded_bias,
             x.scale * gamma.scale,
             0,
-            num_bits=32,
+            num_bits=self.num_bits_bias,
         )
 
         # TODO replace below code by quantized_layer.quantized_linear call
@@ -68,6 +68,7 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         x_zeroed = x._t - x.zero
         gamma_zeroed = gamma._t - gamma.zero
 
+        # print([t.shape for t in [x_zeroed, gamma_zeroed, beta._t]])
         out = x_zeroed * gamma_zeroed + beta._t
 
         multiplier = (x.scale * gamma.scale) / self.scale
@@ -179,11 +180,17 @@ class _QBatchNorm(QuantizableModule, _BatchNorm):
         eps = torch.sqrt(torch.Tensor([self.eps])).to(self.running_var.device)
 
         inv_running_std = 1/torch.sqrt(self.running_var + eps)
+        # self.folded_weight = (self.weight * inv_running_std) \
+        #         .unsqueeze(0).unsqueeze(-1)
         self.folded_weight = (self.weight * inv_running_std) \
-                .unsqueeze(0).unsqueeze(-1)
+                .unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
-        self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
-                - (self.running_mean.unsqueeze(0).unsqueeze(-1) \
+
+        # self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1) \
+        #         - (self.running_mean.unsqueeze(0).unsqueeze(-1) \
+        #         * self.folded_weight)
+        self.folded_bias = self.bias.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) \
+                - (self.running_mean.unsqueeze(0).unsqueeze(-1).unsqueeze(-1) \
                 * self.folded_weight)
 
     def train(self, mode:bool):
@@ -450,7 +457,7 @@ class QBNFoldableTranspose(QuantizableModule):
             self.folded_bias,
             x.scale * gamma.scale,
             0,
-            num_bits=32,
+            num_bits=self.num_bits_bias,
         )
 
         x_zeroed = x._t - x.zero
