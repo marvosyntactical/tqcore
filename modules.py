@@ -1,10 +1,19 @@
 from .quantizable_layer import *
 
+from typing import Dict
+
 # some simple example modules
 
 class QResTest(nn.Module):
 
-    def __init__(self, src_dim, dim, n_labels, qkwargs, **kwargs):
+    def __init__(
+            self,
+            src_dim: int = 1,
+            dim: int = 1,
+            n_labels: int = 1,
+            time_window:int = 1,
+            qkwargs: Dict = {},
+            **kwargs):
 
         super().__init__()
 
@@ -17,12 +26,17 @@ class QResTest(nn.Module):
 
         self.linear = QLinear(dim, dim, qkwargs=qkwargs)
         self.relu2 = QReLU6(**qkwargs)
-        self.ql2 = QListener(self.embedding, self.relu2, plot_name="relu2", **qkwargs)
+        self.ql2 = QListener(self.linear, self.relu2, plot_name="relu2", **qkwargs)
 
         self.res = QAdd(**qkwargs)
         self.resl = QListener(self.res, plot_name="res", **qkwargs)
 
+        self.flatten = nn.Flatten(1)
+        self.output = QLinear(dim * time_window, n_labels, qkwargs=qkwargs)
+        self.outputl = QListener(self.output, plot_name="output", **qkwargs)
+
         self.dequant = DeQuantStub(**qkwargs)
+        self.logsoftmax = nn.LogSoftmax(dim=-1)
 
 
     def forward(self, x, *args):
@@ -43,9 +57,12 @@ class QResTest(nn.Module):
         x = self.res(x, skip)
         x = self.resl(x)
 
+        x = self.flatten(x)
+        x = self.output(x)
+        x = self.outputl(x)
         x = self.dequant(x)
-        print("qrestest output:")
-        print(x.shape)
+
+        x = self.logsoftmax(x)
 
         return x
 
