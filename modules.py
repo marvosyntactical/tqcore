@@ -2,10 +2,9 @@ from .quantizable_layer import *
 
 from typing import Dict
 
-# some simple example modules
+# some simple example modules (TODO add more)
 
 class QResTest(nn.Module):
-
     def __init__(
             self,
             src_dim: int = 1,
@@ -13,7 +12,8 @@ class QResTest(nn.Module):
             n_labels: int = 1,
             time_window:int = 1,
             qkwargs: Dict = {},
-            **kwargs):
+            **kwargs
+        ):
 
         super().__init__()
 

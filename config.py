@@ -44,7 +44,7 @@ class QConfig(NamedTuple):
         "Quantized":[],
     }
 
-    transformer: Dict = {}
+    transformer: Dict = {} # see example configs/transformer encoder layer
     lstm: Dict = {}
 
     @classmethod

@@ -10,6 +10,7 @@ Implement QBNLSTM like the below:
 https://github.com/quic/aimet-model-zoo/blob/develop/zoo_torch/examples/deepspeech2_quanteval.py
 """
 
+import math
 import functools
 from typing import Dict, Optional, Tuple
 
@@ -17,6 +18,7 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.nn import functional, init
+from torch.nn.init import _calculate_fan_in_and_fan_out
 from .quantizable_layer import \
     QuantStub, DeQuantStub, \
     QListener, \
@@ -73,8 +75,6 @@ def xavier_uniform(
     a = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
 
     return _no_grad_uniform_symmetric_(tensor, a)
-
-
 
 
 
@@ -168,8 +168,8 @@ class QLSTMCell(nn.Module):
         self.hidden_size = hidden_size
         self.use_bias = use_bias
 
-        self.has_qsigm = 1
-        self.has_qtanh = 1
+        self.has_qsigm = qkwargs["lstm"]["has_qsigm"]
+        self.has_qtanh = qkwargs["lstm"]["has_qtanh"]
 
         sigmoid_cls = QHardSigmoid if self.has_qsigm else \
                 functools.partial(NonQuantizableModuleWrap, nn.Hardsigmoid())
@@ -458,9 +458,9 @@ class QLSTM(nn.Module):
 
             h_next = self.addhl(self.addh(hnextmasked, hprevmasked), dont_plot=dont_plot)
             c_next = self.addcl(self.addc(cnextmasked, cprevmasked), dont_plot=dont_plot)
-            hc_next = (h_next, c_next)
+
             output.append(h_next)
-            hc = hc_next
+            hc = (h_next, c_next)
 
         output = self.qstack(output, 0)
         output = self.qstack_l(output)

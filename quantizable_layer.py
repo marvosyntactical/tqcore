@@ -594,18 +594,18 @@ class QFill(QuantizableModule):
         self.fp_neg_val = float(fp_neg_val)
 
     def forward_fp(self, scores, mask):
-        scores = scores.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
+        scores = scores.masked_fill(mask==mask, self.fp_neg_val)
         return scores
 
     def forward_qat(self, scores, mask):
         super().forward_qat()
         assert scores.num_bits == self.num_bits, (scores.num_bits, self.num_bits)
-        scores = scores._t.masked_fill(mask==torch.as_tensor(False), self.fp_neg_val)
+        scores = scores._t.masked_fill(mask==mask, self.fp_neg_val)
         return QTensor(scores, scale=self.scale, zero=self.zero, quantized=False, num_bits=self.num_bits)
 
     def forward_quantized(self, scores, mask):
         assert scores.num_bits == self.num_bits, (scores.num_bits, self.num_bits)
-        scores = scores.masked_fill(mask==torch.as_tensor(False), self.zero)
+        scores = scores.masked_fill(mask==mask, self.zero)
         return QTensor(scores, scale=self.scale, zero=self.zero, num_bits=self.num_bits, quantized=True)
 
 class QBoolMask(QuantizableModule):
@@ -624,7 +624,7 @@ class QBoolMask(QuantizableModule):
 
     def forward_quantized(self, x: QTensor, mask: torch.BoolTensor):
         assert x.num_bits == self.num_bits, (x.num_bits, self.num_bits)
-        r = x._t.masked_fill(mask==torch.as_tensor(False), x.zero)
+        r = x._t.masked_fill(mask==mask, x.zero)
         return QTensor(r, scale=x.scale, zero=x.zero, num_bits=self.num_bits, quantized=True)
 
 class QSoftmax(QuantizableModule):
@@ -659,11 +659,13 @@ class QSoftmax(QuantizableModule):
 
     def _scaled_exp(self, inp: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
         # (differentiable)
+
         if isinstance(inp, Tensor):
             exponent = inp * self.alpha
         else:
             assert inp.num_bits==self.num_bits
             exponent = inp._t * self.alpha
+
         # out = torch.exp(exponent.clamp(max=78.))
         out = torch.exp(exponent)
 
@@ -724,16 +726,6 @@ class QSoftmax(QuantizableModule):
         return r
 
 
-class NonQuantizableModuleWrap(QuantizableModule):
-    """
-    NonQuantizableModuleWrap can be used to wrap a module that should stay in floating point after
-    the model is converted to the quantized stage. It does not need a QListener.
-    Example usage:
-        >>> self.qsoftmax = NonQuantizableModuleWrap(
-        >>>     nn.Softmax(dim=-1), **qkwargs
-        >>> )
-
-    """
 
 class QuantModuleWrap(QuantizableModule):
     """
@@ -766,21 +758,30 @@ class QuantModuleWrap(QuantizableModule):
     def forward_calib(self, x):
         raise NotImplementedError(f"{self}.forward_calib")
 
-    def forward_qat(self, x) -> QTensor:
-        inp: QTensor = self.quantStub(x)
+    def forward_qat(self, x: Tensor) -> Tensor:
+        inp: Tensor = self.quantStub(x)
         out: QTensor = self.qmodule(inp)
         outl: QTensor = self.out_listener(out)
-        outd: QTensor = self.deQuantStub(outl)
+        outd: Tensor = self.deQuantStub(outl)
         return outd
 
-    def forward_quantized(self, x) -> QTensor:
-        inp: QTensor = self.quantStub(x)
+    def forward_quantized(self, x: Tensor) -> Tensor:
+        inp: Tensor = self.quantStub(x)
         out: QTensor = self.qmodule(inp)
         outl: QTensor = self.out_listener(out)
-        outd: QTensor = self.deQuantStub(outl)
+        outd: Tensor = self.deQuantStub(outl)
         return outd
 
 class NonQuantizableModuleWrap(QuantizableModule):
+    """
+    NonQuantizableModuleWrap can be used to wrap a module that should stay in floating point after
+    the model is converted to the quantized stage. It does not need a QListener.
+    Example usage:
+        >>> self.qsoftmax = NonQuantizableModuleWrap(
+        >>>     nn.Softmax(dim=-1), **qkwargs
+        >>> )
+
+    """
     def __init__(self, module, plot_name=None, **qkwargs):
         super().__init__(**qkwargs)
 
@@ -923,21 +924,24 @@ class QHardSigmoid(QuantizableModule):
 
         # omit zero here and add it at the end
         one = round(1. / scale )
-        minus_three = round(-3. / scale )
-        plus_three = round(3. / scale )
-        a_half = round(.5 / scale)
+        minus_three = round(-3. / scale ) # + 0
+        plus_three = round(3. / scale ) # + 0
+        a_half = round(.5 / scale) # + 0
 
         out = x.dequantize()
-        out = out / scale # + zero
+        out = out / scale # + 0
 
-        index_smaller = out <= minus_three + zero
-        index_larger = out >= plus_three + zero
+        index_smaller = out <= minus_three
+        index_larger = out >= plus_three
         idx_middle = ~(index_smaller | index_larger)
 
-        out[index_smaller] = zero
-        out[index_larger] = one + zero
-        out[idx_middle] *= 1/.6
-        out[idx_middle] += a_half + zero
+        out[index_smaller] = minus_three # + 0
+        out[index_larger] = one # + 0
+        out[idx_middle] *= scale /.6
+        out[idx_middle] += a_half # + 0
+
+        # omitted zero in above computations, adding it only now
+        out += zero
 
         # TODO plot and see if ceil or floor is better!
         out.round_()
@@ -962,18 +966,21 @@ class QHardTanH(QuantizableModule):
         zero = self.zero
 
         # omit zeros here and add it at the end
-        minus_one = round(-1. / scale ) + zero
-        plus_one = round(1. / scale ) + zero
+        minus_one = round(-1. / scale ) # + 0
+        plus_one = round(1. / scale ) # + 0
 
         out = x.dequantize()
-        out = out / scale + zero
+        out = out / scale # + 0
 
         index_smaller = out <= minus_one
         index_larger = out >= plus_one
         idx_middle = ~(index_smaller | index_larger)
 
-        out[index_smaller] = minus_one
-        out[index_larger] = plus_one
+        out[index_smaller] = minus_one # + 0
+        out[index_larger] = plus_one # + 0
+
+        # omitted zero in above computations, adding it only now
+        out += zero
 
         out.round_()
 
@@ -1011,14 +1018,13 @@ class FFT(QuantizableModule):
 class QLabel(QuantizableModule):
     """
     Learnable Label (https://arxiv.org/abs/2109.10252)
-    appended/prepended to input and fitted to its range
+    appended to input and fitted to its range
     """
     def __init__(self,
             rank: int = 3,
             cat_dim: int = 1,
             hidden_dim: int = 1,
             hidden_size: int = 100,
-            prepend: bool = False,
             init_fn: Callable = torch.randn,
             plot_name: Optional[str] = None,
             **qkwargs
@@ -1028,7 +1034,6 @@ class QLabel(QuantizableModule):
         :param cat_dim: which dimension of x to concatenate the label to
         :param hidden_dim: which dimension of x is the hidden dimension
         :param hidden_size: hidden dimensionality of label; must match x.shape[hidden_dim]
-        :param prepend: whether to prepend or append the label in given dim
         :param init_fn: torch.randn, torch.rand, torch.zeros, etc
         """
         super().__init__(**qkwargs)
@@ -1036,48 +1041,49 @@ class QLabel(QuantizableModule):
         self.rank = rank
         self.cat_dim = cat_dim
         self.hidden_dim = hidden_dim
-        self.prepend = prepend
 
         dims = [1] * rank
-        dims[hidden_dim]=hidden_size
+        dims[hidden_dim] = hidden_size
         self.label = nn.Parameter(init_fn(*dims))
 
-        lbl_pn = "" if not plot_name else lbl_pn + " lbl"
+        lbl_pn = "" if not plot_name else plot_name + " lbl"
         self.lbl_quant_stub = QuantStub(**qkwargs)
         self.lbl_listener = QListener(self.lbl_quant_stub, plot_name=lbl_pn, **qkwargs)
 
-        cat_pn = "" if not plot_name else lbl_pn + " cat"
+        cat_pn = "" if not plot_name else plot_name + " cat"
         self.qcat = QCat(**qkwargs)
         self.qcat_listener = QListener(self.qcat, plot_name=cat_pn, **qkwargs)
 
-        self.num_bits_label = self.num_bits_weight
+        self.num_bits_label = self.num_bits
 
     def _fwd(self, X: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
-        raise NotImplementedError("TODO: implement QLabel, for now: set cfg's 'learnable_label': false")
+        # TODO test
+
+        # expand label according to input and append it in sequence dimension
         expand_args = [-1] * self.rank
         # expand along all dimensions which arent hidden_dim or cat_dim
         for d in range(self.rank):
             if d not in {self.hidden_dim, self.cat_dim}:
                 expand_args[d] = X.shape[d]
 
-        lbl = self.label.expand(*expand_args),
+        lbl = self.label.expand(*expand_args)
+
         lbl = self.lbl_quant_stub(lbl)
         lbl = self.lbl_listener(lbl)
 
-        if self.stage == QuantStage.Quantized:
-            # requantize
-            dq_lbl: Tensor = lbl.dequantize()
-            lbl: Tensor = self.lbl_listener.weight_quantization.tensor_clamp(dq_lbl / X.scale + x.zero, num_bits=self.num_bits_label)
-            lbl: QTensor = QTensor(lbl, scale=X.scale, zero=X.zero, num_bits=self.num_bits)
+        # if self.stage == QuantStage.Quantized:
+        #     # requantize
+        #     dq_lbl: Tensor = lbl.dequantize()
+        #     lbl: QTensor = self.lbl_listener.weight_quantization.quantize_to_qtensor_given_scale(
+        #         dq_lbl, X.scale, X.zero, num_bits=self.num_bits_label, quantized=True
+        #     )
 
-        if self.prepend:
-            to_cat = [lbl, X]
-        else:
-            to_cat = [X, lbl]
+        to_cat = [X, lbl]
 
         # Add label
         x_with_label = self.qcat(to_cat, dim=self.cat_dim)
-        x_with_label = self.qcat_listener(to_cat)
+        x_with_label = self.qcat_listener(x_with_label)
+
         return x_with_label
 
     def forward_fp(self, X: Tensor) -> Tensor:
@@ -1085,7 +1091,8 @@ class QLabel(QuantizableModule):
 
     def forward_qat(self, X: QTensor):
         super().forward_qat()
-        assert X.num_bits == self.num_bits, (X.num_bits, self.num_bits)
+
+        assert X.num_bits == self.num_bits_label, (X.num_bits, self.num_bits_label)
         self.fake_quantize(
             self.label.data, self.weight_quantization, self.num_bits_label, None, None, handling_qtensors=False
         )
@@ -1291,14 +1298,12 @@ by initializing it with clipped_distr: bool given as kwarg.
         self.dont_fakeQ = dont_fakeQ
 
         self._qparams_set = False
-        # print(f"qlistener {plot_name} setup ended;\nself.num_bits={self.num_bits}\nself.num_bits_weight={self.num_bits_weight}")
 
     def freeze(self):
         qlogger.info(f"{self} stopped recording.")
         assert not self.set_qparams_during_quantization, "stats must have been set during qat to freeze"
 
-        # TODO call super().forward_qat .. how can I use self in method?
-        self.forward_qat = lambda x: x
+        self.forward_qat = super().forward_qat
 
     def forward_fp(self, x: Tensor, dont_plot=False):
         x = self.qplotter(x, dont_plot=dont_plot)
@@ -1349,7 +1354,6 @@ by initializing it with clipped_distr: bool given as kwarg.
             self.freeze()
         assert not x.quantized
         x = self.qplotter(x, dont_plot=dont_plot)
-        # print(f"ql({self.qplotter.name}) output bits: {x.num_bits}; self.num_bits={self.num_bits}")
         return x
 
     def forward_quantized(self, x: QTensor, dont_plot=False) -> QTensor:
@@ -1395,6 +1399,7 @@ by initializing it with clipped_distr: bool given as kwarg.
             dict_new_vals = {"mu": mu}
         else:
             assert self.calibration_mode == CalibMode.EMA
+
             min_val = torch.min(x).item()
             max_val = torch.max(x).item()
 

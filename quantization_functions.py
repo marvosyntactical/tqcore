@@ -120,13 +120,14 @@ class UniformQuantization(Quantization):
         scale = range_ / (qmax - qmin)
         # scale = (max_val - min_val) / (qmax - qmin)
         if range_==eps:
-            log_qfun("max-min was too small:", max_val-min_val)
+            print("max-min was too small:", max_val-min_val)
 
         # r = s * (q - z)
+        # => z = q - (r / s)
         try:
             initial_zero = qmin - min_val / scale
         except:
-            log_qfun(f"scale={scale}, max_val={max_val}, min_val={min_val}")
+            print(f"scale={scale}, max_val={max_val}, min_val={min_val}")
             raise
 
         """
@@ -184,11 +185,6 @@ class UniformSymmetricQuantization(Quantization):
 
         return q_x, scale, 0
 
-    def quantize_to_qtensor_using_range(self, x: Tensor, num_bits: int, min_val: Optional[float]=None, max_val: Optional[float]=None, quantized: bool=True) -> QTensor:
-
-        q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
-        return QTensor(q_x, scale=scale, zero=zero, symmetric=True, num_bits=num_bits, quantized=quantized)
-
     def calc_params(self, min_val: float, max_val: float, num_bits: int):
         # Calc Scale
         max_val = max(abs(min_val), abs(max_val))
@@ -200,7 +196,12 @@ class UniformSymmetricQuantization(Quantization):
         return scale, 0
 
     def tensor_clamp(self, x: Tensor, num_bits: int):
-        return x.round().clamp(-(2. ** (num_bits - 1) - 1), 2. ** (num_bits - 1) - 1)
+        return x.round().clamp(-(2. ** (num_bits - 1)), 2. ** (num_bits - 1) - 1)
+
+    def quantize_to_qtensor_using_range(self, x: Tensor, num_bits: int, min_val: Optional[float]=None, max_val: Optional[float]=None, quantized: bool=True) -> QTensor:
+
+        q_x, scale, zero = self._quantize_tensor(x, min_val=min_val, max_val=max_val, num_bits=num_bits)
+        return QTensor(q_x, scale=scale, zero=zero, symmetric=True, num_bits=num_bits, quantized=quantized)
 
     def quantize_to_qtensor_given_scale(self, x: Tensor, scale: float, zero: int, num_bits: int, quantized: bool=True):
         """Bias Quantization"""
@@ -331,14 +332,14 @@ class ClampedSTE(torch.autograd.Function):
 
         assert new_scale != 0.
 
-        # affine transformation and round there to simulate error appropriately
+        # affine transform and rounding to simulate error appropriately
         qx = quant.quantize_to_qtensor_given_scale(
             x, num_bits=num_bits, scale=new_scale, zero=new_zero, quantized=True
         )
         # affinely transform back
         out = qx.dequantize()
 
-        ctx.save_for_backward(Tensor([min_val, max_val]))
+        ctx.save_for_backward(Tensor([out.min().item(), out.max().item()]))
 
         # autograd function may only return tensors, so create one-element tensors for quantization parameters
         return out, Tensor([new_scale]), Tensor([new_zero])
@@ -347,14 +348,11 @@ class ClampedSTE(torch.autograd.Function):
     def backward(ctx, grad_output: Tensor, scale: Tensor, zero: Tensor):
         """ Clamped Straight Through Estimator """
         min_val, max_val = ctx.saved_tensors[0]
-        # qmin = min_val.item()/scale.item() + zero.item()
-        # qmax = max_val.item()/scale.item() + zero.item()
-        # print(f"grad out min/max: {grad_output.min()}/{grad_output.max()}")
-        # print(f"min/max: {min_val}/{max_val}")
         return grad_output.clamp(min=min_val, max=max_val), None, None, None, None
 
 
-
-
-str2quant = {"uniform": UniformQuantization, "uniform_sym": UniformSymmetricQuantization}
+str2quant = {
+    "uniform": UniformQuantization,
+    "uniform_sym": UniformSymmetricQuantization
+}
 

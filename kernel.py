@@ -159,8 +159,8 @@ def qmul(
     assert a.num_bits==num_bits_a
     assert b.num_bits==num_bits_b
 
-    a_zeroed = a._t - round(a.zero)
-    b_zeroed = b._t - round(b.zero)
+    a_zeroed = a._t - a.zero
+    b_zeroed = b._t - b.zero
 
     r: torch.Tensor = op(a_zeroed, b_zeroed)
     r_float = r

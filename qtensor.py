@@ -15,6 +15,7 @@ __all__ = ["QTensor"]
 
 __DEBUG__ = 0
 __LOG__ = 0
+
 if __LOG__:
     logqt.info("QTensor logging started")
 else:
@@ -66,7 +67,6 @@ class QTensor:
             if not symmetric and __DEBUG__:
                 assert (self._t >= self.zero).all(), (self._t.min(), self.zero)
 
-
     def dequantize(self) -> Tensor:
         assert self.quantized, "may only dequantize QTensor holding quantized values; use qtensor._t instead"
         return (self._t - self.zero) * self.scale
@@ -103,13 +103,16 @@ class QTensor:
                 logqt.debug("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
 
                 return HANDLED_FUNCTIONS[func](*args, **kwargs)
+
         elif func in PROHIBITED_FUNCTIONS:
+
             logqt.warning("VVVVV Invoked QTensor __torch_function__ with prohibited func VVVVV\n")
             logqt.warning(func)
             logqt.warning(types)
             logqt.warning("There is another way to accomplish this operation:")
             logqt.warning(PROHIBITED_FUNCTIONS[func])
             logqt.error("\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+
         else:
 
             logqt.warning("VVVVV Invoked QTensor __torch_function__ with unkown func VVVVV\n")
@@ -196,7 +199,7 @@ class QTensor:
         string += f", quantized={self.quantized}"
         string += f", num_bits={self.num_bits}"
         string += ")"
-        return  string
+        return string
 
     def split(self, *args, **kwargs):
         tup_out: Tuple[Tensor] = self._t.split(*args, **kwargs)
@@ -232,6 +235,7 @@ class QTensor:
 
 HANDLED_FUNCTIONS = {
 }
+
 PROHIBITED_FUNCTIONS = {
     torch.split: "Use QTensor.split instead",
     torch.stack: "Use tqcore.quantizable_layer.QStack instead",
