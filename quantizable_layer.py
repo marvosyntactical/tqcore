@@ -87,6 +87,8 @@ class QuantizableModule(nn.Module):
             clamp_ste: bool = False,
             **qkwargs,
         ):
+        # if num_bits_weight == 1:
+        #     print("Using uniform quantization for weights as num bits == 1")
         self.num_bits = num_bits
         self.quantization = quantization(nudge_zero=nudge_zero)
         self.num_bits_weight = num_bits_weight
@@ -582,8 +584,6 @@ class QCat(QuantizableModule):
 
 
 
-
-
 class QFill(QuantizableModule):
     """
     Quantizable version of torch.masked_fill.
@@ -1055,6 +1055,7 @@ class QLabel(QuantizableModule):
         self.qcat_listener = QListener(self.qcat, plot_name=cat_pn, **qkwargs)
 
         self.num_bits_label = self.num_bits
+        # self.num_bits_label = self.num_bits_bias
 
     def _fwd(self, X: Union[Tensor, QTensor]) -> Union[Tensor, QTensor]:
         # TODO test
@@ -1092,7 +1093,7 @@ class QLabel(QuantizableModule):
     def forward_qat(self, X: QTensor):
         super().forward_qat()
 
-        assert X.num_bits == self.num_bits_label, (X.num_bits, self.num_bits_label)
+        # assert X.num_bits == self.num_bits_label, (X.num_bits, self.num_bits_label)
         self.fake_quantize(
             self.label.data, self.weight_quantization, self.num_bits_label, None, None, handling_qtensors=False
         )
@@ -1103,7 +1104,6 @@ class QLabel(QuantizableModule):
     def forward_quantized(self, X: QTensor) -> QTensor:
         # access quantized self.lbl and rescale incoming X to to its scale
         return self._fwd(X)
-
 
     def quantize(self):
         super().quantize()
@@ -1200,7 +1200,7 @@ class QListener(QuantizableModule):
             listener_name = None,
             function = None,
             dont_fakeQ: bool = False,
-            ema_decay: float = .9999,
+            ema_decay: float = .8,
             nudge_zero: bool = False,
             calibration: Optional[str] = None, # manually override qkwargs["calib_mode"]
             clipped_distr: Optional[bool] = None, # manually override distribution type

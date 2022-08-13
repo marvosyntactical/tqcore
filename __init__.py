@@ -14,4 +14,3 @@ from .calibration import *
 
 qat_prepare = lambda m: m.apply(lambda mod: mod.qat_prepare() if isinstance(mod, QuantizableModule) else mod)
 qat_convert = lambda m: m.apply(lambda mod: mod.quantize() if isinstance(mod, QuantizableModule) else mod)
-

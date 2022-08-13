@@ -181,7 +181,14 @@ class QPositionwiseFeedForward(nn.Module):
         """
         super().__init__()
         self.has_output_layer = has_output_layer
-        activation = eval(activ.strip())(**qkwargs)
+
+        if "nn" not in activ:
+            activation = eval(activ.strip())(**qkwargs)
+        else:
+            activation = NonQuantizableModuleWrap(
+                eval(activ)(), plot_name=pn("pwff "+activ), **qkwargs
+            )
+
         pn = lambda s: s + " " + str(layer_num)
 
         modules = [
@@ -189,9 +196,10 @@ class QPositionwiseFeedForward(nn.Module):
             activation,
             nn.Dropout(dropout)
         ]
-        modules += [
-            QListener(*modules[:2], clipped_distribution=True, plot_name=pn("pwff "+activ), **qkwargs),
-        ]
+        if "nn" not in activ:
+            modules += [
+                QListener(*modules[:2], clipped_distribution=True, plot_name=pn("pwff "+activ), **qkwargs),
+            ]
         if self.has_output_layer:
             # output layer precedes a batch norm; bias is redundant in this case
             modules += [
@@ -504,8 +512,8 @@ class QTransformerEncoder(nn.Module):
         if self.has_pe:
             if not self.qpe:
                 self.pe = NonQuantizableModuleWrap(
-                    QPositionalEncoding(dim, time_window)
-                    ,**qkwargs
+                    QPositionalEncoding(dim, time_window),
+                    **qkwargs
                 )
             else:
                 self.pe = QPositionalEncoding(dim, time_window, **qkwargs)
